@@ -1,0 +1,4 @@
+services:
+  grthub-bclconvert:
+    volumes:
+      - /path/to/local/data:/workspace/data

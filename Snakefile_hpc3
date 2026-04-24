@@ -1,0 +1,2125 @@
+
+import os
+import re
+import subprocess
+import glob
+import yaml
+import pandas as pd
+import xml.etree.ElementTree as ET
+from io import StringIO
+
+# HPC3 stripped-down version: no email, no Nextcloud.
+# Run with: snakemake --snakefile Snakefile_hpc3 --configfile snakemake_config_hpc3.yaml
+#           --use-singularity --singularity-args "-B /staging,/dfs6"
+#           --cores 16
+
+container: "docker://ghcr.io/whtns/grthub_bclconvert:latest"
+
+configfile: "snakemake_config_hpc3.yaml"
+
+# Load project-specific config if it exists (higher priority than default)
+_PROJECT_CONFIG = f"snakemake_config_project.yaml"
+
+if os.path.exists(_PROJECT_CONFIG):
+    import yaml as _yaml
+    with open(_PROJECT_CONFIG, 'r') as _f:
+        _project_config = _yaml.safe_load(_f) or {}
+    config.update(_project_config)
+
+# Fail fast if required config values are missing or empty
+_required = {"library_name", "metadata", "data_dir"}
+_missing = [k for k in _required if not config.get(k, "")]
+if _missing:
+    raise SystemExit(f"Error: required config value(s) are empty or missing: {', '.join(sorted(_missing))}")
+
+SAMPLE_SHEET = config.get("sample_sheet", "src/SampleSheet_default.csv")
+NUM_READS = config.get("num_reads", 2)
+LIBRARY = config.get("library_name", "")
+START_S = config.get("start_s", 1)
+DRYRUN = config.get("dryrun", False)
+DATA_DIR = config.get("data_dir", "")
+TILES = config.get("tiles", "")
+FLEXBAR_BIN = config.get("flexbar_bin", "")
+USE_ANCIENT = config.get("use_ancient", True)
+
+def maybe_ancient(path):
+    return ancient(path) if USE_ANCIENT else path
+
+SCRATCH_DIR = config.get("scratch_dir", "")
+
+BCL_CONVERSION_THREADS = config.get("bcl_conversion_threads", 16)
+BCL_COMPRESSION_THREADS = config.get("bcl_compression_threads", 8)
+BCL_DECOMPRESSION_THREADS = config.get("bcl_decompression_threads", 8)
+
+include: "src/workflow_defs.smk"
+
+# Sanitize Masking strings for filenames
+def sanitize_masking(masking):
+    if not masking:
+        return masking
+    s = str(masking).strip()
+    try:
+        m = re.search(r'(\s|_)(SwarV[^\s_]*)', s, flags=re.IGNORECASE)
+        if m:
+            s = s[:m.start()].rstrip(' _-')
+        m2 = re.search(r'(_|\s)[A-Z0-9]+_L\d', s)
+        if m2:
+            s = s[:m2.start()].rstrip(' _-')
+    except Exception:
+        pass
+    s = s.replace(":", "-").replace(", ", "_").replace(",", "_").replace(" ", "")
+    return s
+
+
+# Auto-detect lanes from data/Data/Intensities/BaseCalls
+detected_lanes = []
+
+basecalls_path = DATA_DIR + "/Data/Intensities/BaseCalls"
+if os.path.exists(basecalls_path):
+    detected_lanes = sorted([
+        int(d[1:]) for d in os.listdir(basecalls_path)
+        if d.startswith("L") and d[1:].isdigit() and os.path.isdir(os.path.join(basecalls_path, d))
+    ])
+
+metadata = config.get("metadata", "metadata/SampleSheet.xlsx")
+METADATA_FILE = config.get("metadata")
+VALIDATION_XLSX = f"metadata/metadata_validation_{os.path.basename(metadata)}.xlsx" if metadata else None
+LANE_CONFIGS = []
+PROJECT_LOOKUP = {}
+MASKING_LOOKUP = {}
+PROJECT_LINKS = {}
+PROJECT_LINKS_BY_LANE = {}
+ORDER_ID_LOOKUP = {}
+LAB_ID_LOOKUP = {}
+PROJECT_ORDER_ID = {}
+PROJECT_LAB_ID = {}
+IS_MISEQ_FORMAT = False
+
+if METADATA_FILE and os.path.exists(METADATA_FILE):
+    try:
+        xl = pd.ExcelFile(METADATA_FILE)
+        is_miseq_format = 'Barcode Entries' in xl.sheet_names and 'Summary' not in xl.sheet_names
+        IS_MISEQ_FORMAT = is_miseq_format
+
+        if is_miseq_format:
+            print("Detected MiSeq metadata format")
+            try:
+                first_tab = xl.sheet_names[0]
+                df_first = pd.read_excel(METADATA_FILE, sheet_name=first_tab, header=None)
+                header_row = None
+                lab_id_col = None
+                project_col = None
+
+                for i, row in df_first.iterrows():
+                    vals = [str(v).strip() for v in row.tolist() if str(v).strip() and str(v).strip().lower() != 'nan']
+                    if not vals:
+                        continue
+                    for j, v in enumerate(row.tolist()):
+                        if str(v).strip().lower() == 'lab id':
+                            header_row = i
+                            lab_id_col = j
+                            break
+                    if lab_id_col is not None:
+                        break
+
+                if lab_id_col is not None:
+                    for j, v in enumerate(df_first.iloc[header_row].tolist()):
+                        h = str(v).strip().lower()
+                        if h in {
+                            'project', 'project name', 'sample_project',
+                            'sample project', 'sample name', 'sample_name'
+                        }:
+                            project_col = j
+                            break
+
+                    def _uniq_keep_order(items):
+                        seen = set()
+                        out = []
+                        for x in items:
+                            if x in seen:
+                                continue
+                            seen.add(x)
+                            out.append(x)
+                        return out
+
+                    order_ids = []
+                    project_candidates = []
+
+                    for v in df_first.iloc[header_row + 1:, lab_id_col].tolist():
+                        s = str(v).strip()
+                        if not s or s.lower() == 'nan':
+                            continue
+                        m = re.match(r'^\d+[iI]-\d+$', s)
+                        if m:
+                            order_ids.append(s.replace('i', 'I'))
+                        else:
+                            project_candidates.append(s.replace(' ', '_'))
+
+                    if project_col is not None:
+                        for v in df_first.iloc[header_row + 1:, project_col].tolist():
+                            s = str(v).strip()
+                            if not s or s.lower() == 'nan':
+                                continue
+                            project_candidates.append(s.replace(' ', '_'))
+
+                    order_ids = _uniq_keep_order(order_ids)
+                    project_candidates = _uniq_keep_order(project_candidates)
+
+                    for oid in order_ids:
+                        PROJECT_ORDER_ID[(f"__MISEQ_ORDERID_{oid}", 0)] = oid
+
+                    if len(order_ids) == 1:
+                        oid = order_ids[0]
+                        for proj in project_candidates:
+                            PROJECT_ORDER_ID[(proj, 1)] = oid
+                        if project_candidates:
+                            ORDER_ID_LOOKUP[(1, 1)] = oid
+                    elif len(order_ids) > 1 and len(order_ids) == len(project_candidates):
+                        for proj, oid in zip(project_candidates, order_ids):
+                            PROJECT_ORDER_ID[(proj, 1)] = oid
+            except Exception as _e:
+                print(f"Note: Could not infer MiSeq order IDs from Lab ID column: {_e}")
+        else:
+            df = pd.read_excel(METADATA_FILE, sheet_name="Summary", header=2)
+
+            if 'Lane' in df.columns and 'Gr' in df.columns:
+                for index, row in df.iterrows():
+                    try:
+                        l = int(float(row['Lane']))
+                        g = int(float(row['Gr']))
+
+                        if 'Project Name' in df.columns:
+                            p = str(row['Project Name']).strip().replace(' ', '_')
+                            PROJECT_LOOKUP[(l, g)] = p
+
+                            link_col = None
+                            for col in ['Fastq Link', 'fastq link', 'Fastq link', 'Download Link', 'download link']:
+                                if col in df.columns:
+                                    link_col = col
+                                    break
+
+                            if link_col:
+                                link = str(row[link_col]).strip()
+                                if link and link.lower() != 'nan':
+                                    PROJECT_LINKS.setdefault(p, []).append(link)
+                                    PROJECT_LINKS_BY_LANE.setdefault((p, l), []).append(link)
+
+                        if 'Masking' in df.columns:
+                            m = str(row['Masking']).strip()
+                            MASKING_LOOKUP[(l, g)] = m
+
+                        if 'Order ID' in df.columns:
+                            order_id = str(row['Order ID']).strip().replace(' ', '_')
+                            if order_id and order_id.lower() != 'nan':
+                                order_id = order_id.replace('i', 'I')
+                                ORDER_ID_LOOKUP[(l, g)] = order_id
+                                if p and p.lower() != 'nan':
+                                    PROJECT_ORDER_ID[(p, l)] = order_id
+
+                        if 'Lab ID' in df.columns:
+                            lab_id_val = str(row['Lab ID']).strip()
+                            if lab_id_val and lab_id_val.lower() != 'nan':
+                                LAB_ID_LOOKUP[(l, g)] = lab_id_val
+                                if p and p.lower() != 'nan':
+                                    PROJECT_LAB_ID[(p, l)] = lab_id_val
+                    except:
+                        pass
+
+            if 'Lane' in df.columns:
+                unique_lanes = sorted(df['Lane'].dropna().apply(lambda x: int(float(x))).unique())
+                for lane in unique_lanes:
+                    LANE_CONFIGS.append({
+                        'lane': lane,
+                        'id': f"lane{lane}"
+                    })
+    except Exception as e:
+        print(f"Error reading metadata: {e}")
+
+try:
+    if METADATA_FILE and os.path.exists(METADATA_FILE):
+        xl = pd.ExcelFile(METADATA_FILE)
+        if 'Barcode List' in xl.sheet_names:
+            df_barcode = pd.read_excel(METADATA_FILE, sheet_name='Barcode List', header=1)
+            for idx, row in df_barcode.iterrows():
+                try:
+                    project = str(row.get('Project name', '')).strip().replace(' ', '_')
+                    order_id = str(row.get('Order ID', '')).strip().replace(' ', '_')
+                    lane_val = row.get('Lane', None)
+                    if project and project.lower() != 'nan' and order_id and order_id.lower() != 'nan':
+                        order_id = order_id.replace('i', 'I')
+                        try:
+                            lane_int = int(float(lane_val))
+                        except (ValueError, TypeError):
+                            lane_int = 0
+                        if (project, lane_int) not in PROJECT_ORDER_ID:
+                            PROJECT_ORDER_ID[(project, lane_int)] = order_id
+                except:
+                    pass
+except Exception as e:
+    print(f"Note: Could not read Barcode List for order IDs: {e}")
+
+ORDER_ID_TO_LANE = {}
+for (_lane, _group), _oid in ORDER_ID_LOOKUP.items():
+    if _oid not in ORDER_ID_TO_LANE:
+        ORDER_ID_TO_LANE[_oid] = []
+    if _lane not in ORDER_ID_TO_LANE[_oid]:
+        ORDER_ID_TO_LANE[_oid].append(_lane)
+
+VALIDATE_CONFIG_ID_PATTERN = "[^/]+" if IS_MISEQ_FORMAT else r"lane\d+"
+
+ruleorder: validate_barcode_hamming_distances_rc > validate_barcode_hamming_distances
+ruleorder: flexbar_stage_project > bcl_project_done
+ruleorder: flexbar_stage_project > normalize_project_fastq_names
+
+PROJECT_RENAME_MAP = {}
+PROJECT_RENAME_MAP_INV = {}
+for (lane, group), project in PROJECT_LOOKUP.items():
+    config_id = f"lane{lane}"
+    order_id = ORDER_ID_LOOKUP.get((lane, group), "") or PROJECT_ORDER_ID.get((project, lane), "")
+    lab_id = LAB_ID_LOOKUP.get((lane, group), "") or PROJECT_LAB_ID.get((project, lane), "")
+    if lab_id and order_id:
+        new_name = f"{lab_id}_{order_id}_{LIBRARY}_L{lane}_G{group}"
+        PROJECT_RENAME_MAP[(config_id, project)] = new_name
+        PROJECT_RENAME_MAP_INV[(config_id, new_name)] = project
+
+
+def fix_runinfo_reverse_complement():
+    import re, os
+    src = os.path.join(DATA_DIR, "RunInfo.xml")
+    dest = "src/RunInfo_nn.xml"
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"Source RunInfo.xml not found: {src}")
+    with open(src, "r") as f:
+        content = f.read()
+    pattern = r'(<Read[^>]*Number="3"[^>]*IsReverseComplement=")[YN]"'
+    replacement = r'\1N"'
+    new_content = re.sub(pattern, replacement, content)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w") as f:
+        f.write(new_content)
+    with open("logs/fix_runinfo_reverse_complement.log", "w") as lf:
+        lf.write("RunInfo.xml copied and IsReverseComplement set to N for Read Number=3\n")
+
+_src_runinfo = os.path.join(DATA_DIR, "RunInfo.xml")
+_dest_runinfo = "src/RunInfo_nn.xml"
+if not os.path.exists(_dest_runinfo) or (os.path.exists(_src_runinfo) and os.path.getmtime(_src_runinfo) > os.path.getmtime(_dest_runinfo)):
+    fix_runinfo_reverse_complement()
+
+SAMPLE_SHEETS_DICT = generate_lane_samplesheets(METADATA_FILE, LANE_CONFIGS, PROJECT_LOOKUP, MASKING_LOOKUP, "results", "src/RunInfo_nn.xml", LIBRARY)
+
+CONFIG_IDS = list(SAMPLE_SHEETS_DICT.keys()) if SAMPLE_SHEETS_DICT else []
+if not CONFIG_IDS and detected_lanes:
+    CONFIG_IDS = [f"lane{l}" for l in detected_lanes]
+
+_preferred_bcl_order = [str(x) for x in config.get("bcl_convert_order", [])]
+_preferred_bcl_order = [cid for cid in _preferred_bcl_order if cid in CONFIG_IDS]
+BCL_CONVERT_ORDER = _preferred_bcl_order + [cid for cid in CONFIG_IDS if cid not in _preferred_bcl_order]
+BCL_CONVERT_PREV = {
+    cid: (BCL_CONVERT_ORDER[i - 1] if i > 0 else None)
+    for i, cid in enumerate(BCL_CONVERT_ORDER)
+}
+
+def get_prev_bcl_done(wildcards):
+    prev_cid = BCL_CONVERT_PREV.get(wildcards.config_id)
+    if not prev_cid:
+        return []
+    return [maybe_ancient(f".output/{prev_cid}/.done")]
+
+FASTP_THREADS = config.get("fastp_threads", 4)
+
+PROJECTS = get_all_projects(SAMPLE_SHEETS_DICT)
+
+ORDER_ID_CONFIGS = get_order_id_configs(SAMPLE_SHEETS_DICT)
+
+if not ORDER_ID_CONFIGS or all(not v for v in ORDER_ID_CONFIGS.values()):
+    inferred_order_ids = sorted({oid for oid in PROJECT_ORDER_ID.values() if oid and str(oid).strip()})
+    if inferred_order_ids:
+        ORDER_ID_CONFIGS = {oid: list(PROJECTS) for oid in inferred_order_ids}
+    else:
+        ORDER_ID_CONFIGS = {"default": PROJECTS}
+
+if PROJECT_ORDER_ID:
+    all_order_ids = set(PROJECT_ORDER_ID.values())
+    for oid in all_order_ids:
+        if oid and oid not in ORDER_ID_CONFIGS:
+            ORDER_ID_CONFIGS[oid] = []
+
+ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ORDER_ID_CONFIGS.keys()]
+ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ORDER_ID_CONFIGS.keys()]
+
+PROJECT_LANES = get_project_lane_pairs(SAMPLE_SHEETS_DICT)
+PROJECT_LANE_REPORTS = [f"Reports/{p}/lane{l}/index.html" for p, l in PROJECT_LANES]
+PROJECT_LANE_MD5S = [f"Reports/{p}/lane{l}/md5sums.txt" for p, l in PROJECT_LANES]
+
+FLEXBAR_CONFIGS = []
+for config in LANE_CONFIGS:
+    if config['id'] not in CONFIG_IDS:
+        continue
+    barcode_path = os.path.join("metadata", f"flexbar_barcodes_{config['id']}.txt")
+    if os.path.exists(barcode_path):
+        FLEXBAR_CONFIGS.append(config['id'])
+
+_CONFIG_PROJECT_PAIRS_RAW = get_config_project_pairs(SAMPLE_SHEETS_DICT)
+
+CONFIG_PROJECT_PAIRS = []
+for _cid, _p in _CONFIG_PROJECT_PAIRS_RAW:
+    _lm = re.match(r'lane(\d+)', _cid)
+    if _lm:
+        _lane = int(_lm.group(1))
+        _groups = [g for (l, g), proj in PROJECT_LOOKUP.items() if l == _lane and proj == _p]
+        if len(_groups) > 1:
+            for _g in _groups:
+                _oid = ORDER_ID_LOOKUP.get((_lane, _g), "")
+                _lid = LAB_ID_LOOKUP.get((_lane, _g), "")
+                if _lid and _oid:
+                    CONFIG_PROJECT_PAIRS.append((_cid, f"{_lid}_{_oid}_{LIBRARY}_L{_lane}_G{_g}"))
+            continue
+    CONFIG_PROJECT_PAIRS.append((_cid, PROJECT_RENAME_MAP.get((_cid, _p), _p)))
+
+for _oid in list(ORDER_ID_CONFIGS.keys()):
+    _old_projects = set(ORDER_ID_CONFIGS[_oid])
+    _new_projects = set()
+    for _cid, _renamed in CONFIG_PROJECT_PAIRS:
+        _old_p = PROJECT_RENAME_MAP_INV.get((_cid, _renamed), _renamed)
+        if _old_p not in _old_projects:
+            continue
+        _lm = re.match(r'lane(\d+)', _cid)
+        _gm = re.search(r'_G(\d+)$', _renamed)
+        if _lm and _gm:
+            _actual_oid = ORDER_ID_LOOKUP.get((int(_lm.group(1)), int(_gm.group(1))), "")
+            if _actual_oid and _actual_oid != _oid:
+                continue
+        _new_projects.add(_renamed)
+    if _new_projects:
+        ORDER_ID_CONFIGS[_oid] = _new_projects
+
+_projects_in_pairs = {p for _, p in CONFIG_PROJECT_PAIRS}
+ACTIVE_ORDER_IDS = [
+    oid for oid, projects in ORDER_ID_CONFIGS.items()
+    if set(projects or []).intersection(_projects_in_pairs)
+]
+ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
+ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
+
+EXCLUDE_ORDER_IDS = set(config.get("exclude_order_ids", []))
+if EXCLUDE_ORDER_IDS:
+    _exclude_projects = set()
+    for _oid in EXCLUDE_ORDER_IDS:
+        _exclude_projects.update(ORDER_ID_CONFIGS.pop(_oid, []))
+    ACTIVE_ORDER_IDS = [oid for oid in ACTIVE_ORDER_IDS if oid not in EXCLUDE_ORDER_IDS]
+    ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
+    ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
+    CONFIG_PROJECT_PAIRS = [(c, p) for c, p in CONFIG_PROJECT_PAIRS if p not in _exclude_projects]
+    PROJECTS = [p for p in PROJECTS if p not in _exclude_projects]
+
+FLEXBAR_ORDER_ID_MAP = {}
+FLEXBAR_ORDER_ID_PROJECT = {}
+_bcl_raw_projects_by_config = {}
+for _cid, _p in _CONFIG_PROJECT_PAIRS_RAW:
+    _bcl_raw_projects_by_config.setdefault(_cid, set()).add(_p)
+for _fconfig in FLEXBAR_CONFIGS:
+    _lane = int(_fconfig.replace('lane', ''))
+    _bcl_projs = _bcl_raw_projects_by_config.get(_fconfig, set())
+    for (_l, _), _proj in PROJECT_LOOKUP.items():
+        if _l == _lane and _proj not in _bcl_projs:
+            _oid = PROJECT_ORDER_ID.get((_proj, _lane), '')
+            if _oid and _oid not in EXCLUDE_ORDER_IDS:
+                FLEXBAR_ORDER_ID_MAP[_fconfig] = _oid
+                FLEXBAR_ORDER_ID_PROJECT[_fconfig] = _proj
+FLEXBAR_CONFIG_BY_ORDER_ID = {v: k for k, v in FLEXBAR_ORDER_ID_MAP.items()}
+FLEXBAR_ACTIVE_ORDER_IDS = list(FLEXBAR_ORDER_ID_MAP.values())
+FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_ACTIVE_ORDER_IDS]
+
+FLEXBAR_CONFIG_RENAMING_MAP = {}
+for _fconfig, _forder_id in FLEXBAR_ORDER_ID_MAP.items():
+    _flane = int(_fconfig.replace('lane', ''))
+    _fbarcode_path = f"metadata/flexbar_barcodes_{_fconfig}.txt"
+    if not os.path.exists(_fbarcode_path):
+        continue
+    _fproj = FLEXBAR_ORDER_ID_PROJECT.get(_fconfig)
+    if not _fproj:
+        continue
+    _fgroup = None
+    for (_fl, _fg), _fp in PROJECT_LOOKUP.items():
+        if _fl == _flane and _fp == _fproj:
+            _fgroup = _fg
+            break
+    if _fgroup is None:
+        continue
+    _frows = []
+    with open(_fbarcode_path) as _fbf:
+        for _fi, _fbline in enumerate(_fbf):
+            _fparts = _fbline.strip().split('\t')
+            if len(_fparts) >= 2 and _fparts[0].strip() and _fparts[1].strip():
+                _frows.append({
+                    'Sample_Project': _fproj,
+                    'Sample_Name': _fparts[0].strip(),
+                    'Run': LIBRARY,
+                    'Lane': _flane,
+                    'Group': _fgroup,
+                    'index': _fparts[1].strip(),
+                    'index2': '',
+                    'Position': f'P{_fi+1:03d}',
+                })
+    if _frows:
+        FLEXBAR_CONFIG_RENAMING_MAP[_fconfig] = _frows
+
+for _fconfig, _frows in FLEXBAR_CONFIG_RENAMING_MAP.items():
+    _forig_proj = _frows[0]['Sample_Project']
+    _frenamed_proj = PROJECT_RENAME_MAP.get((_fconfig, _forig_proj), _forig_proj)
+    _fpair = (_fconfig, _frenamed_proj)
+    if _fpair not in CONFIG_PROJECT_PAIRS:
+        CONFIG_PROJECT_PAIRS.append(_fpair)
+    _projects_in_pairs.add(_frenamed_proj)
+    _forder_id = FLEXBAR_ORDER_ID_MAP[_fconfig]
+    if _forder_id not in ORDER_ID_CONFIGS:
+        ORDER_ID_CONFIGS[_forder_id] = set()
+    elif not isinstance(ORDER_ID_CONFIGS.get(_forder_id), set):
+        ORDER_ID_CONFIGS[_forder_id] = set(ORDER_ID_CONFIGS.get(_forder_id, []))
+    ORDER_ID_CONFIGS[_forder_id].add(_frenamed_proj)
+    if _forder_id not in ACTIVE_ORDER_IDS:
+        ACTIVE_ORDER_IDS.append(_forder_id)
+
+FLEXBAR_ACTIVE_ORDER_IDS = [oid for oid in FLEXBAR_ACTIVE_ORDER_IDS if oid not in ACTIVE_ORDER_IDS]
+FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_ACTIVE_ORDER_IDS]
+
+ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
+ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
+
+rule all:
+    input:
+        expand("results/fastp_plots_{config_id}.done", config_id=CONFIG_IDS),
+        expand(".output/{config_id}/.done", config_id=CONFIG_IDS),
+        expand("output/{config_id}/{project}/md5sums.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        ORDER_ID_REPORTS,
+        ORDER_ID_MD5S,
+        expand("results/fastp_plots_summary_lane{lane}.done", lane=detected_lanes),
+        expand("results/undetermined_indices/{config_id}.csv", config_id=CONFIG_IDS),
+        expand("results/read_counts_{project}.csv", project=PROJECTS),
+        f"results/{LIBRARY}-count.csv",
+        ([VALIDATION_XLSX] if VALIDATION_XLSX else []),
+        expand("results/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
+    benchmark:
+        "benchmarks/all.bench"
+
+rule bcl_convert_only:
+    input:
+        expand(".output/{config_id}/.done", config_id=CONFIG_IDS)
+    benchmark:
+        "benchmarks/bcl_convert_only.bench"
+
+rule report_order_id:
+    input:
+        fastp_plots = lambda wildcards: get_order_id_plot_targets(wildcards.order_id),
+        md5_files = lambda wildcards: [
+            f"output/{c}/{p}/md5sums.txt" for c, p in CONFIG_PROJECT_PAIRS
+            if p in ORDER_ID_CONFIGS.get(wildcards.order_id, [])
+            and (
+                not ORDER_ID_TO_LANE.get(wildcards.order_id)
+                or (re.match(r'lane(\d+)', c) and int(re.match(r'lane(\d+)', c).group(1)) in ORDER_ID_TO_LANE.get(wildcards.order_id, []))
+            )
+        ],
+    output:
+        html = "Reports/order_{order_id}/index.html",
+        md5 = "Reports/order_{order_id}/md5sums.txt",
+    log:
+        "logs/report_order_{order_id}.log"
+    benchmark:
+        "benchmarks/report_order_id_{order_id}.bench"
+    params:
+        order_id = "{order_id}",
+        output_base = "output",
+        fastp_plots_base = "results/fastp_plots",
+        fastp_base = "results/fastp",
+        report_dir = "Reports/order_{order_id}"
+    run:
+        import subprocess
+        import sys
+        import os
+        sys.path.insert(0, workflow.basedir)
+
+        order_id = params.order_id
+        report_dir = params.report_dir
+        log_file = log[0]
+
+        _lanes_for_order = ORDER_ID_TO_LANE.get(order_id, [])
+        lane_arg = ",".join(str(l) for l in _lanes_for_order) if _lanes_for_order else "None"
+
+        os.makedirs(report_dir, exist_ok=True)
+
+        projects = sorted(set(
+            p for c, p in CONFIG_PROJECT_PAIRS
+            if p in ORDER_ID_CONFIGS.get(order_id, [])
+        ))
+
+        import json as _json
+        project_name_map = {}
+        for _proj in projects:
+            _orig = next(
+                (p for cid, p in _CONFIG_PROJECT_PAIRS_RAW
+                 if PROJECT_RENAME_MAP.get((cid, p), p) == _proj),
+                None
+            )
+            if _orig is None:
+                _orig = next(
+                    (orig for (_, _rn), orig in PROJECT_RENAME_MAP_INV.items()
+                     if _rn == _proj),
+                    _proj
+                )
+            project_name_map[_proj] = _orig
+
+        for _fconfig in FLEXBAR_CONFIGS:
+            _forig = FLEXBAR_ORDER_ID_PROJECT.get(_fconfig)
+            if not _forig:
+                continue
+            _frenamed = PROJECT_RENAME_MAP.get((_fconfig, _forig), _forig)
+            if _frenamed in projects:
+                project_name_map[_frenamed] = _forig
+        project_name_map_json = _json.dumps(project_name_map)
+
+        with open(log_file, 'w') as lf:
+            lf.write(f"Generating report for order_id: {order_id}\n")
+            lf.write(f"Projects: {projects}\n")
+            lf.write(f"Project name map: {project_name_map}\n\n")
+
+        for project in projects:
+            orig_project = project_name_map.get(project, project)
+
+            cmd = [
+                "python3", "src/generate_report.py",
+                project,
+                params.output_base,
+                params.fastp_plots_base,
+                params.fastp_base,
+                report_dir,
+                "",          # fastq_links: empty (no Nextcloud in HPC3 mode)
+                lane_arg,
+                "",          # merged_yaml_path: empty
+                order_id,
+                LIBRARY,
+                str(config.get('plots_total_width', 900)),
+                str(config.get('plots_quality', 35)),
+                orig_project,
+                project_name_map_json,
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            with open(log_file, 'a') as f:
+                f.write(f"\n=== Report generation for project {project} ===\n")
+                f.write(result.stdout)
+                if result.stderr:
+                    f.write(f"STDERR: {result.stderr}\n")
+
+        all_md5s = []
+        for md5_file in input.md5_files:
+            try:
+                with open(md5_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            all_md5s.append(line)
+            except Exception as e:
+                with open(log_file, 'a') as f:
+                    f.write(f"Warning: Could not read {md5_file}: {e}\n")
+
+        all_md5s.sort(key=lambda x: x.split()[1] if len(x.split()) > 1 else x)
+
+        md5_file = os.path.join(report_dir, "md5sums.txt")
+        with open(md5_file, 'w') as f:
+            for line in all_md5s:
+                f.write(line + '\n')
+
+        with open(log_file, 'a') as f:
+            f.write(f"\nConsolidated {len(all_md5s)} md5 entries into {md5_file}\n")
+
+        if not os.path.exists(output.html):
+            with open(output.html, 'w') as f:
+                f.write(f"<html><body><h1>Order {order_id}</h1><p>No project report entries were generated.</p></body></html>\n")
+
+rule fastp_sample:
+    input:
+        done = lambda wildcards: (
+            lambda orig: f"output/{wildcards.config_id}/{PROJECT_RENAME_MAP.get((wildcards.config_id, orig), orig)}/.fastq_names_done"
+        )(wildcards.sample_path.split('/')[0])
+    output:
+        json = "results/fastp/{config_id}/{sample_path}.json",
+        html = "results/fastp/{config_id}/{sample_path}.html"
+    log:
+        "logs/fastp_sample/{config_id}/{sample_path}.log"
+    benchmark:
+        "benchmarks/fastp_sample_{config_id}_{sample_path}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+",
+        sample_path = ".*"
+    params:
+        fastqs = get_fastp_sample_input,
+    threads: 2
+    shell:
+        """
+        (
+        mkdir -p $(dirname {output.json})
+
+        files=({params.fastqs})
+        r1="${{files[0]}}"
+
+        if [ ${{#files[@]}} -gt 1 ]; then
+            r2="${{files[1]}}"
+            fastp -i "$r1" -I "$r2" -A -Q -L --reads_to_process 2000000 --json "{output.json}" --html "{output.html}" -w {threads}
+        else
+            fastp -i "$r1" -A -Q -L --reads_to_process 2000000 --json "{output.json}" --html "{output.html}" -w {threads}
+        fi
+        ) > {log} 2>&1
+        """
+
+rule normalize_project_fastq_names:
+    input:
+        done = "output/{config_id}/{project}/.project_done",
+        renaming_map = "results/renaming_map_{config_id}.csv"
+    output:
+        sentinel = touch("output/{config_id}/{project}/.fastq_names_done")
+    wildcard_constraints:
+        config_id = "[^/]+",
+        project = ".+"
+    run:
+        import os
+
+        config_id = wildcards.config_id
+        new_project = wildcards.project
+        old_project = PROJECT_RENAME_MAP_INV.get((config_id, new_project), new_project)
+        project_dir = os.path.abspath(f"output/{config_id}/{new_project}")
+
+        if not os.path.isdir(project_dir):
+            os.makedirs(project_dir, exist_ok=True)
+            return
+
+        check_name = old_project or new_project
+        lowered = check_name.lower()
+        if any(token in lowered for token in ["10x", "parse", "bd"]):
+            return
+
+        df = pd.read_csv(input.renaming_map)
+        project_rows = df[df["Sample_Project"].astype(str).str.strip() == old_project]
+
+        for idx, row in project_rows.iterrows():
+            sample_name = str(row.get("Sample_Name", "")).strip()
+            if not sample_name or sample_name.lower() == "nan":
+                continue
+
+            try:
+                lane = int(float(row.get("Lane", 0)))
+            except Exception:
+                lane = 0
+
+            try:
+                group = str(int(float(row.get("Group", 0))))
+            except Exception:
+                group = str(row.get("Group", "")).strip()
+            if not group or group.lower() == "nan":
+                group = "Undetermined"
+
+            run_name = str(row.get("Run", "")).strip()
+            index1 = str(row.get("index", "")).strip()
+            if index1.lower() == "nan":
+                index1 = ""
+            index2 = str(row.get("index2", "")).strip()
+            if index2.lower() == "nan":
+                index2 = ""
+            barcode = f"{index1}-{index2}" if index2 else index1
+            position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
+            s_num = idx + 1
+            stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
+
+            for read_type in ["R1", "R2", "I1", "I2"]:
+                legacy_name = f"{sample_name}_S{s_num}_L{lane:03d}_{read_type}_001.fastq.gz"
+                canonical_name = f"{stem}-{read_type}.fastq.gz"
+                legacy_path = os.path.join(project_dir, legacy_name)
+                canonical_path = os.path.join(project_dir, canonical_name)
+
+                if os.path.exists(canonical_path):
+                    continue
+                if not os.path.exists(legacy_path):
+                    continue
+                os.rename(legacy_path, canonical_path)
+
+rule fastp_per_config:
+    input:
+        get_fastp_targets
+    output:
+        touch("results/fastp_{config_id}.done")
+    log:
+        "logs/fastp_per_config_{config_id}.log"
+    benchmark:
+        "benchmarks/fastp_per_config_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "lane.*"
+
+rule fastp_plots_sample:
+    input:
+        json = "results/fastp/{config_id}/{sample_path}.json"
+    output:
+        mean = "results/fastp_plots/{config_id}/{sample_path}-mean_phred.png",
+        base = "results/fastp_plots/{config_id}/{sample_path}-base_comp.png"
+    log:
+        "logs/fastp_plots_sample/{config_id}/{sample_path}.log"
+    benchmark:
+        "benchmarks/fastp_plots_sample_{config_id}_{sample_path}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+",
+        sample_path = ".*"
+    params:
+        mean_script = "src/mean_phred_plot_fastp.py",
+        base_script = "src/base_composition_plot_fastp.py",
+        sample_name = lambda wildcards: wildcards.sample_path
+    threads: 1
+    shell:
+        """
+        mkdir -p $(dirname {output.mean})
+        (
+        python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
+        python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
+        ) > {log} 2>&1
+        """
+
+rule fastp_plots_per_config:
+    input:
+        get_fastp_plots_targets
+    output:
+        touch("results/fastp_plots_{config_id}.done")
+    log:
+        "logs/fastp_plots_per_config_{config_id}.log"
+    benchmark:
+        "benchmarks/fastp_plots_per_config_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "lane.*"
+
+def get_project_done_sentinels(wildcards):
+    target_projects = {wildcards.project}
+    for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
+        if old_project == wildcards.project:
+            target_projects.add(new_project)
+        elif new_project == wildcards.project:
+            target_projects.add(old_project)
+
+    return [
+        f"output/{config_id}/{project}/.project_done"
+        for config_id, project in CONFIG_PROJECT_PAIRS
+        if project in target_projects
+    ]
+
+def get_project_bcl_done_sentinels(wildcards):
+    target_projects = {wildcards.project}
+    for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
+        if old_project == wildcards.project:
+            target_projects.add(new_project)
+        elif new_project == wildcards.project:
+            target_projects.add(old_project)
+
+    return [
+        f".output/{config_id}/.done"
+        for config_id, project in CONFIG_PROJECT_PAIRS
+        if project in target_projects
+    ]
+
+rule summarize_project_reads:
+    input:
+        project_done = get_project_done_sentinels,
+        bcl_done = get_project_bcl_done_sentinels
+    output:
+        "results/read_counts_{project}.csv"
+    log:
+        "logs/summarize_project_reads_{project}.log"
+    benchmark:
+        "benchmarks/summarize_project_reads_{project}.bench"
+    run:
+        import sys
+        sys.stderr = sys.stdout = open(log[0], 'w')
+        import pandas as pd
+        import os
+
+        target_projects = {wildcards.project}
+        for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
+            if old_project == wildcards.project:
+                target_projects.add(new_project)
+            elif new_project == wildcards.project:
+                target_projects.add(old_project)
+
+        data = []
+        for done_marker in input.bcl_done:
+            parts = str(done_marker).split('/')
+            if len(parts) < 3:
+                print(f"Skipping unexpected done marker path: {done_marker}")
+                continue
+
+            config_id = parts[1]
+            demux_path = f"output/{config_id}/Reports/Demultiplex_Stats.csv"
+
+            if not os.path.exists(demux_path):
+                print(f"Skipping missing {demux_path}")
+                continue
+
+            try:
+                demux_df = pd.read_csv(demux_path)
+            except Exception as e:
+                print(f"Error reading {demux_path}: {e}")
+                continue
+
+            if 'Sample_Project' not in demux_df.columns:
+                print(f"Missing Sample_Project column in {demux_path}")
+                continue
+
+            matches = demux_df[demux_df['Sample_Project'].astype(str).isin(target_projects)]
+            for _, row in matches.iterrows():
+                sample_name = str(row.get('SampleID', row.get('Sample_ID', ''))).strip()
+                read_pairs = int(row.get('# Reads', 0))
+                data.append({
+                    'Config': config_id,
+                    'Project': wildcards.project,
+                    'Sample': sample_name,
+                    'Total_Reads': read_pairs,
+                    'Passed_Reads': read_pairs,
+                })
+
+        df = pd.DataFrame(data)
+        if not df.empty:
+            df = df.sort_values(['Config', 'Sample'])
+        df.to_csv(output[0], index=False)
+
+rule compile_read_counts:
+    input:
+        done = expand(".output/{config_id}/.done", config_id=CONFIG_IDS),
+        projects_done = expand(
+            "output/{config_id}/{project}/.project_done",
+            zip,
+            config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
+            project=[p for c, p in CONFIG_PROJECT_PAIRS],
+        ),
+        maps = expand("results/renaming_map_{config_id}.csv", config_id=CONFIG_IDS),
+        flexbar_done = expand("results/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS)
+    output:
+        csv = f"results/{LIBRARY}-count.csv"
+    log:
+        "logs/compile_read_counts.log"
+    benchmark:
+        "benchmarks/compile_read_counts.bench"
+    run:
+        import sys
+        sys.stderr = sys.stdout = open(log[0], 'w')
+        import csv
+        import os
+        import re as _re
+
+        lane_group_counts = {}
+
+        for config_id in CONFIG_IDS:
+            demux_path = f"output/{config_id}/Reports/Demultiplex_Stats.csv"
+            renaming_map_path = f"results/renaming_map_{config_id}.csv"
+
+            if not os.path.exists(demux_path):
+                print(f"Skipping missing {demux_path}")
+                continue
+
+            try:
+                demux_df = pd.read_csv(demux_path)
+            except Exception as e:
+                print(f"Error reading {demux_path}: {e}")
+                continue
+
+            try:
+                map_df = pd.read_csv(renaming_map_path)
+            except Exception as e:
+                print(f"Error reading {renaming_map_path}: {e}")
+                map_df = pd.DataFrame()
+
+            for idx, row in demux_df.iterrows():
+                project = str(row.get('Sample_Project', '')).strip()
+                sample_name = str(row.get('SampleID', row.get('Sample_ID', ''))).strip()
+                read_pairs = int(row.get('# Reads', 0))
+
+                if not project or project.lower() in ('nan', 'undetermined'):
+                    continue
+
+                lane_num = None
+                group = "1"
+                stem = sample_name
+
+                if not map_df.empty:
+                    match_rows = map_df[map_df['Sample_Name'].astype(str).str.strip() == sample_name]
+                    if not match_rows.empty:
+                        mr = match_rows.iloc[0]
+                        try:
+                            lane_num = int(float(mr.get('Lane', 0)))
+                        except Exception:
+                            lane_num = None
+                        try:
+                            group = str(int(float(mr.get('Group', 1))))
+                        except Exception:
+                            group = str(mr.get('Group', '1')).strip()
+                        run_name = str(mr.get('Run', '')).strip()
+                        index1 = str(mr.get('index', '')).strip()
+                        if index1.lower() == 'nan':
+                            index1 = ''
+                        index2 = str(mr.get('index2', '')).strip()
+                        if index2.lower() == 'nan':
+                            index2 = ''
+                        barcode = f"{index1}-{index2}" if index2 else index1
+                        position = str(mr.get('Position', f'P{idx+1:03d}')).strip()
+                        stem = f"{run_name}-L{lane_num}-G{group}-{position}-{barcode}"
+
+                if lane_num is None:
+                    lm = _re.match(r'lane(\d+)', config_id)
+                    lane_num = int(lm.group(1)) if lm else 0
+
+                lane_group_key = (lane_num, group)
+                lane_group_counts.setdefault(lane_group_key, {})
+
+                try:
+                    is_special = is_parse_or_10x(project)
+                except Exception:
+                    is_special = False
+                label = sample_name if is_special else stem
+
+                if label not in lane_group_counts[lane_group_key]:
+                    lane_group_counts[lane_group_key][label] = [0, idx, group, 0]
+                lane_group_counts[lane_group_key][label][3] += read_pairs
+
+        for config_id in FLEXBAR_CONFIGS:
+            lane_num = None
+            try:
+                m = _re.match(r'lane(\d+)', config_id)
+                if m:
+                    lane_num = int(m.group(1))
+            except Exception:
+                pass
+            if lane_num is None:
+                continue
+
+            flexbar_log = os.path.join("output", config_id, "flexbar", "flexbarOut.log")
+            if not os.path.exists(flexbar_log):
+                print(f"Skipping missing flexbar log: {flexbar_log}")
+                continue
+
+            lane_group_key = (lane_num, "flexbar")
+            lane_group_counts.setdefault(lane_group_key, {})
+
+            current_barcode = None
+            with open(flexbar_log) as _fh:
+                for _line in _fh:
+                    _line = _line.strip()
+                    m_file = _re.search(r'flexbarOut_barcode_(.+)\.fastq\.gz$', _line)
+                    if m_file:
+                        current_barcode = m_file.group(1)
+                        continue
+                    m_reads = _re.match(r'written reads\s+(\d+)', _line)
+                    if m_reads and current_barcode and current_barcode != "unassigned":
+                        reads = int(m_reads.group(1))
+                        label = current_barcode
+                        if label not in lane_group_counts[lane_group_key]:
+                            lane_group_counts[lane_group_key][label] = [0, 0, "flexbar", 0]
+                        lane_group_counts[lane_group_key][label][3] += reads
+                        current_barcode = None
+
+        lane_group_pairs_sorted = sorted(lane_group_counts.keys())
+
+        if not lane_group_pairs_sorted:
+            raise ValueError(
+                "No read counts were compiled. Final Demultiplex_Stats.csv files were missing or contained no matching rows."
+            )
+
+        per_lane_group = {}
+        for (lane, group), samples in lane_group_counts.items():
+            ordered = sorted(samples.items(), key=lambda x: (x[1][0], x[1][1]))
+            per_lane_group[(lane, group)] = [(name, group, total) for name, (_, _, group, total) in ordered]
+
+        max_rows = max(len(v) for v in per_lane_group.values())
+
+        header = [""]
+        for (lane, group) in lane_group_pairs_sorted:
+            header.extend(["lane", "group", "sample", "counts"])
+
+        rows = []
+        for i in range(max_rows):
+            row = [""]
+            for (lane, group) in lane_group_pairs_sorted:
+                entries = per_lane_group.get((lane, group), [])
+                if i < len(entries):
+                    name, grp, count = entries[i]
+                    row.extend([str(lane), grp, name, f"{int(count):,}"])
+                else:
+                    row.extend(["", "", "", ""])
+            rows.append(row)
+
+        os.makedirs(os.path.dirname(output.csv), exist_ok=True)
+        with open(output.csv, "w", newline="") as out_handle:
+            writer = csv.writer(out_handle)
+            writer.writerow(header)
+            writer.writerows(rows)
+
+rule fastp_plots_lane:
+    input:
+        get_fastp_plots_lane_inputs
+    output:
+        touch("results/fastp_plots_summary_lane{lane}.done")
+    log:
+        "logs/fastp_plots_lane{lane}.log"
+    wildcard_constraints:
+        lane = r"\d+"
+
+rule flexbar_per_config:
+    input:
+        bcl_done = ".output/{config_id}/.done",
+        raw_barcodes = "metadata/flexbar_barcodes_{config_id}.txt",
+        adapter = "src/flexbar/adapter.3.fa"
+    threads: 16
+    priority: 99
+    output:
+        touch("results/flexbar_{config_id}.done")
+    log:
+        "logs/flexbar_{config_id}.log"
+    benchmark:
+        "benchmarks/flexbar_per_config_{config_id}.bench"
+    params:
+        outdir = "output/{config_id}/flexbar",
+        lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
+        r1 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz",
+        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz",
+        raw_barcodes_abs = lambda wildcards, input: os.path.abspath(input.raw_barcodes),
+        barcodes_abs = lambda wildcards: os.path.abspath(f"metadata/flexbar_barcodes_{wildcards.config_id}.fasta"),
+        adapter_abs = lambda wildcards, input: os.path.abspath(input.adapter),
+        r1_abs = lambda wildcards, input: os.path.abspath(f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz"),
+        flexbar_bin = FLEXBAR_BIN
+    shell:
+        """
+        (
+        mkdir -p {params.outdir}
+
+        echo "Starting Flexbar processing for {wildcards.config_id}"
+
+        flexbar_cmd="{params.flexbar_bin}"
+        if [ -z "$flexbar_cmd" ]; then
+            flexbar_cmd="flexbar"
+            if ! command -v "$flexbar_cmd" >/dev/null 2>&1; then
+                echo "ERROR: flexbar not found in PATH and config.flexbar_bin is empty"
+                exit 1
+            fi
+        else
+            if [ ! -x "$flexbar_cmd" ]; then
+                echo "ERROR: configured flexbar_bin is not executable: $flexbar_cmd"
+                exit 1
+            fi
+        fi
+
+        awk '
+        {{
+            name = $1
+            barcode = $2
+            gsub(/\r/, "", name)
+            gsub(/\r/, "", barcode)
+            gsub(/A/, "X", barcode)
+            gsub(/T/, "A", barcode)
+            gsub(/X/, "T", barcode)
+            gsub(/C/, "Y", barcode)
+            gsub(/G/, "C", barcode)
+            gsub(/Y/, "G", barcode)
+            reversed = ""
+            for (i = length(barcode); i >= 1; i--) {{
+                reversed = reversed substr(barcode, i, 1)
+            }}
+            print ">" name
+            print "NNNNN" reversed "NNNN"
+        }}
+        ' {params.raw_barcodes_abs} > {params.barcodes_abs}
+
+        "$flexbar_cmd" -r {params.r1_abs} -b {params.barcodes_abs} \
+            --barcode-trim-end LTAIL \
+            --barcode-error-rate 0 \
+            --zip-output GZ \
+            --threads {threads} \
+            --output-directory {params.outdir} 2>&1
+
+        for r1_out in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
+            [ -e "$r1_out" ] || continue
+
+            base_name=$(basename "$r1_out" .fastq.gz)
+
+            if [[ "$base_name" == *"unassigned"* ]]; then
+                echo "Skipping R2 conversion for unassigned: $base_name"
+                continue
+            fi
+
+            echo "Processing R2 for $base_name..."
+
+            zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 > "{params.outdir}/${{base_name}}_headers.txt"
+
+            if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
+                seqtk subseq {params.r2} "{params.outdir}/${{base_name}}_headers.txt" | gzip > "{params.outdir}/${{base_name}}_R2.fastq.gz"
+            else
+                echo "No reads found for $base_name"
+            fi
+
+            rm "{params.outdir}/${{base_name}}_headers.txt"
+        done
+
+        curr_dir=$PWD
+        cd {params.outdir}
+        md5sum *.fastq.gz > md5sum.txt
+        count=$(wc -l < md5sum.txt)
+        echo "Generated md5sum.txt with $count entries for {wildcards.config_id}"
+        if [ "$count" -eq 0 ]; then
+            echo "ERROR: md5sum.txt is empty, no .fastq.gz files found in {params.outdir}" >&2
+            exit 1
+        fi
+        du -h *.fastq.gz > size.txt
+        cd $curr_dir
+        ) > {log} 2>&1
+
+        touch {output}
+        """
+
+def _make_flexbar_stage_constraints():
+    if not FLEXBAR_CONFIG_RENAMING_MAP:
+        return "NOMATCH", "NOMATCH"
+    cfg = "|".join(re.escape(fc) for fc in FLEXBAR_CONFIG_RENAMING_MAP)
+    projs = "|".join(
+        re.escape(PROJECT_RENAME_MAP.get((fc, FLEXBAR_ORDER_ID_PROJECT[fc]), FLEXBAR_ORDER_ID_PROJECT[fc]))
+        for fc in FLEXBAR_CONFIG_RENAMING_MAP
+        if fc in FLEXBAR_ORDER_ID_PROJECT
+    )
+    return cfg, projs or "NOMATCH"
+_FLEXBAR_STAGE_CONFIG_CONSTRAINT, _FLEXBAR_STAGE_PROJECT_CONSTRAINT = _make_flexbar_stage_constraints()
+
+rule flexbar_stage_project:
+    input:
+        done = "results/flexbar_{config_id}.done"
+    output:
+        project_done = "output/{config_id}/{project}/.project_done",
+        names_done   = "output/{config_id}/{project}/.fastq_names_done"
+    log:
+        "logs/flexbar_stage_project_{config_id}_{project}.log"
+    wildcard_constraints:
+        config_id = _FLEXBAR_STAGE_CONFIG_CONSTRAINT,
+        project   = _FLEXBAR_STAGE_PROJECT_CONSTRAINT
+    run:
+        import os
+        import shutil
+        config_id = wildcards.config_id
+        project   = wildcards.project
+        rows      = FLEXBAR_CONFIG_RENAMING_MAP.get(config_id, [])
+        proj_dir  = f"output/{config_id}/{project}"
+        os.makedirs(proj_dir, exist_ok=True)
+        log_lines = [f"Staging flexbar project {project} for {config_id}\n"]
+
+        def _materialize_and_backlink(src_abs, dst_abs):
+            if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
+                os.unlink(dst_abs)
+
+            if not os.path.exists(dst_abs):
+                try:
+                    os.link(src_abs, dst_abs)
+                    log_lines.append(f"Hardlinked {dst_abs} <- {src_abs}\n")
+                except Exception:
+                    shutil.copy2(src_abs, dst_abs)
+                    log_lines.append(f"Copied {src_abs} -> {dst_abs}\n")
+            else:
+                log_lines.append(f"Kept existing destination {dst_abs}\n")
+
+            if os.path.lexists(src_abs):
+                try:
+                    if os.path.islink(src_abs):
+                        _cur = os.path.realpath(src_abs)
+                        if os.path.realpath(dst_abs) == _cur:
+                            return
+                    os.unlink(src_abs)
+                except Exception:
+                    pass
+            os.symlink(os.path.abspath(dst_abs), src_abs)
+            log_lines.append(f"Linked {src_abs} -> {dst_abs}\n")
+
+        for row in rows:
+            name    = row['Sample_Name']
+            run     = row['Run']
+            lane    = row['Lane']
+            group   = str(row['Group'])
+            pos     = row['Position']
+            barcode = row['index']
+            stem    = f"{run}-L{lane}-G{group}-{pos}-{barcode}"
+            src_r1  = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{name}.fastq.gz")
+            dst_r1  = os.path.abspath(f"{proj_dir}/{stem}-R1.fastq.gz")
+            if os.path.exists(src_r1) or os.path.islink(src_r1):
+                _materialize_and_backlink(src_r1, dst_r1)
+            if NUM_READS > 1:
+                src_r2 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{name}_R2.fastq.gz")
+                dst_r2 = os.path.abspath(f"{proj_dir}/{stem}-R2.fastq.gz")
+                if os.path.exists(src_r2) or os.path.islink(src_r2):
+                    _materialize_and_backlink(src_r2, dst_r2)
+        with open(log[0], 'w') as lf:
+            lf.writelines(log_lines)
+        with open(output.project_done, 'w') as f:
+            f.write("flexbar project staged\n")
+        with open(output.names_done, 'w') as f:
+            f.write("flexbar canonical names done\n")
+
+rule generate_samplesheets:
+    input:
+        metadata = METADATA_FILE if METADATA_FILE else [],
+        run_info = "src/RunInfo_nn.xml"
+    output:
+        expand("results/SampleSheet_{config_id}.csv", config_id=CONFIG_IDS),
+        expand("logs/generate_samplesheets_{config_id}.done", config_id=CONFIG_IDS)
+    log:
+        "logs/generate_samplesheets.log"
+    benchmark:
+        "benchmarks/generate_samplesheets.bench"
+    params:
+        lane_configs = LANE_CONFIGS,
+        project_lookup = PROJECT_LOOKUP,
+        masking_lookup = MASKING_LOOKUP,
+        output_dir = "results",
+        library = LIBRARY
+    run:
+        import sys
+        sys.stderr = sys.stdout = open(log[0], 'w')
+        import hashlib
+
+        metadata_mtime = os.path.getmtime(input.metadata) if input.metadata and os.path.exists(input.metadata) else 0
+
+        def get_file_hash(filepath):
+            if not os.path.exists(filepath):
+                return None
+            hasher = hashlib.md5()
+            with open(filepath, 'rb') as f:
+                hasher.update(f.read())
+            return hasher.hexdigest()
+
+        lane_configs = params.lane_configs or [{"id": cid} for cid in CONFIG_IDS]
+
+        print(f"Checking sample sheets and updating only changed configs...")
+
+        configs_to_generate = []
+
+        for config in lane_configs:
+            config_id = config['id']
+            samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+            done_marker = f"logs/generate_samplesheets_{config_id}.done"
+
+            needs_generation = False
+
+            if not os.path.exists(samplesheet_path):
+                print(f"Missing sample sheet: {samplesheet_path}")
+                needs_generation = True
+            else:
+                if not os.path.exists(done_marker):
+                    print(f"Missing done marker: {done_marker}")
+                    needs_generation = True
+                else:
+                    done_marker_mtime = os.path.getmtime(done_marker)
+                    if metadata_mtime > done_marker_mtime:
+                        print(f"Metadata newer than done marker for {config_id}")
+                        needs_generation = True
+
+            if needs_generation:
+                configs_to_generate.append(config)
+
+        if not configs_to_generate:
+            print(f"All sample sheets up to date, ensuring done markers exist...")
+            for config in lane_configs:
+                config_id = config['id']
+                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                if not os.path.exists(done_marker):
+                    os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                    open(done_marker, 'w').close()
+                    print(f"Created done marker: {done_marker}")
+            sys.exit(0)
+
+        if not input.metadata or not os.path.exists(input.metadata):
+            print(f"No metadata file found, creating placeholder sample sheets")
+            for config in configs_to_generate:
+                config_id = config['id']
+                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
+                open(samplesheet_path, 'w').close()
+                os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                open(done_marker, 'w').close()
+            sys.exit(0)
+
+        try:
+            print(f"Generating sample sheets for {len(configs_to_generate)} configs...")
+
+            old_hashes = {}
+            for config in configs_to_generate:
+                config_id = config['id']
+                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+                old_hashes[config_id] = get_file_hash(samplesheet_path)
+
+            generated_sheets = generate_lane_samplesheets(
+                input.metadata,
+                lane_configs,
+                params.project_lookup,
+                params.masking_lookup,
+                params.output_dir,
+                input.run_info,
+                params.library
+            )
+
+            print(f"Generated sample sheets: {generated_sheets}")
+
+            for config in lane_configs:
+                config_id = config['id']
+                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+
+                if not os.path.exists(samplesheet_path):
+                    print(f"Warning: Expected sample sheet not created: {samplesheet_path}")
+                    os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
+                    open(samplesheet_path, 'w').close()
+
+                if config in configs_to_generate:
+                    new_hash = get_file_hash(samplesheet_path)
+                    old_hash = old_hashes.get(config_id)
+
+                    if new_hash != old_hash:
+                        os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                        open(done_marker, 'w').close()
+                        print(f"Updated done marker for {config_id} (content changed)")
+                    else:
+                        if not os.path.exists(done_marker):
+                            os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                            open(done_marker, 'w').close()
+                            print(f"Created done marker for {config_id} (content unchanged)")
+                        else:
+                            print(f"Skipped done marker update for {config_id} (content unchanged)")
+                else:
+                    if not os.path.exists(done_marker):
+                        os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                        open(done_marker, 'w').close()
+                        print(f"Created done marker for {config_id} (not regenerated)")
+
+        except Exception as e:
+            print(f"Error generating sample sheets: {e}")
+            import traceback
+            traceback.print_exc()
+            for config in configs_to_generate:
+                config_id = config['id']
+                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
+                open(samplesheet_path, 'w').close()
+                os.makedirs(os.path.dirname(done_marker), exist_ok=True)
+                open(done_marker, 'w').close()
+
+rule generate_renaming_map:
+    input:
+        sample_sheet = "results/SampleSheet_{config_id}.csv"
+    output:
+        map = "results/renaming_map_{config_id}.csv"
+    log:
+        "logs/generate_renaming_map_{config_id}.log"
+    benchmark:
+        "benchmarks/generate_renaming_map_{config_id}.bench"
+    params:
+        lane_configs = LANE_CONFIGS,
+        project_lookup = PROJECT_LOOKUP,
+        masking_lookup = MASKING_LOOKUP,
+        metadata = METADATA_FILE,
+        run_info = "src/RunInfo_nn.xml",
+        out_dir = "results",
+        library = LIBRARY
+    run:
+        import sys
+        sys.stderr = sys.stdout = open(log[0], 'w')
+        import os
+        import pandas as pd
+        from io import StringIO
+
+        required_cols = {"Sample_Name", "Sample_Project", "Lane", "index", "index2", "Run", "Group", "Position"}
+
+        def has_required_columns(path):
+            if not os.path.exists(path):
+                return False
+            try:
+                df = pd.read_csv(path)
+                return required_cols.issubset(set(df.columns))
+            except Exception:
+                return False
+
+        def build_map_from_samplesheet(samplesheet_path, out_path, default_run):
+            if not os.path.exists(samplesheet_path):
+                print(f"SampleSheet not found: {samplesheet_path}")
+                return False
+
+            with open(samplesheet_path, 'r') as f:
+                lines = f.readlines()
+
+            header_row = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith("[BCLConvert_Data]") or line.strip().startswith("[Data]"):
+                    header_row = i + 1
+                    break
+
+            if header_row == -1 or header_row >= len(lines):
+                print("Could not find [BCLConvert_Data] or [Data] section in SampleSheet.")
+                return False
+
+            data_str = "".join(lines[header_row:])
+            try:
+                ss_df = pd.read_csv(StringIO(data_str))
+            except Exception as e:
+                print(f"Error parsing SampleSheet data section: {e}")
+                return False
+
+            if "Sample_Project" not in ss_df.columns and "Project" in ss_df.columns:
+                ss_df["Sample_Project"] = ss_df["Project"]
+            if "Sample_Name" not in ss_df.columns and "Sample_ID" in ss_df.columns:
+                ss_df["Sample_Name"] = ss_df["Sample_ID"]
+
+            for col in ["index", "index2", "Lane", "Sample_Project", "Sample_Name"]:
+                if col not in ss_df.columns:
+                    ss_df[col] = ""
+
+            map_df = pd.DataFrame()
+            map_df["Sample_Name"] = ss_df["Sample_Name"]
+            map_df["Sample_Project"] = ss_df["Sample_Project"]
+            map_df["Lane"] = ss_df["Lane"]
+            map_df["index"] = ss_df["index"]
+            map_df["index2"] = ss_df["index2"]
+            map_df["Run"] = default_run
+            map_df["Group"] = "Undetermined"
+
+            positions = []
+            for i in range(len(map_df)):
+                positions.append(f"P{i+1:03d}")
+            map_df["Position"] = positions
+
+            map_df.to_csv(out_path, index=False)
+            print(f"Generated fallback renaming map from SampleSheet: {out_path}")
+            return True
+
+        if has_required_columns(output.map):
+            print(f"Renaming map already valid: {output.map}")
+            return
+
+        if params.metadata and os.path.exists(params.metadata):
+            try:
+                generate_lane_samplesheets(
+                    params.metadata,
+                    params.lane_configs,
+                    params.project_lookup,
+                    params.masking_lookup,
+                    params.out_dir,
+                    params.run_info,
+                    params.library
+                )
+                if has_required_columns(output.map):
+                    print(f"Regenerated renaming map using metadata: {output.map}")
+                    return
+            except Exception as e:
+                print(f"Error regenerating renaming map from metadata: {e}")
+
+        build_map_from_samplesheet(input.sample_sheet, output.map, params.library)
+
+rule validate_barcode_hamming_distances:
+    input:
+        samplesheet = "results/SampleSheet_{config_id}.csv"
+    output:
+        report = "logs/barcode_hamming_validation_{config_id}.txt",
+        marker = touch("logs/barcode_hamming_validation_{config_id}.done"),
+        fixed_sheet = "results/SampleSheet_{config_id}_validated.csv"
+    log:
+        "logs/barcode_hamming_validation_{config_id}.log"
+    benchmark:
+        "benchmarks/barcode_hamming_validation_{config_id}.bench"
+    wildcard_constraints:
+        config_id = VALIDATE_CONFIG_ID_PATTERN
+    params:
+        script = "scripts/validate_barcode_hamming_distance.py",
+        tolerance = 1
+    shell:
+        """
+        (
+        echo "Validating barcode Hamming distances for {wildcards.config_id}..."
+        python3 {params.script} \
+            --samplesheets {input.samplesheet} \
+            --mismatch-tolerance {params.tolerance} \
+            --output {output.report} \
+            --output-sheet {output.fixed_sheet} \
+            --fix
+
+        exit_code=$?
+        if [ $exit_code -ne 0 ]; then
+            echo ""
+            echo "=========================================================="
+            echo "ERROR: Barcode Hamming distance validation FAILED for {wildcards.config_id} (after auto-fix attempt)"
+            echo "=========================================================="
+            echo ""
+            cat {output.report}
+            exit 1
+        fi
+        ) > {log} 2>&1
+        """
+
+rule bcl_convert:
+    input:
+        sample_sheet=lambda wildcards: f"results/SampleSheet_{wildcards.config_id}_validated.csv",
+        renaming_map = "results/renaming_map_{config_id}.csv",
+        data_dir=DATA_DIR,
+        _sheet_done=lambda wildcards: f"logs/generate_samplesheets_{wildcards.config_id}.done",
+        run_info = "src/RunInfo_nn.xml",
+        prev_done = get_prev_bcl_done
+    output:
+        done_file = touch(".output/{config_id}/.done")
+    log:
+        "logs/bcl_convert_{config_id}.log"
+    benchmark:
+        "benchmarks/bcl_convert_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    priority: 100
+    resources:
+        serial_operation=1
+    threads: 1
+    params:
+        lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
+        scratch_dir = SCRATCH_DIR,
+        bcl_conversion_threads = BCL_CONVERSION_THREADS,
+        bcl_compression_threads = BCL_COMPRESSION_THREADS,
+        bcl_decompression_threads = BCL_DECOMPRESSION_THREADS,
+    shell:
+        """
+        (
+        cleanup() {{
+            pkill -P $$ 2>/dev/null || true
+        }}
+        trap cleanup INT TERM
+
+        run_bcl_convert() {{
+            local sample_sheet_path="$1"
+            timeout 14400 bcl-convert \
+            --bcl-input-directory {input.data_dir} \
+            --output-directory "$bcl_out" \
+            --force \
+            --bcl-sampleproject-subdirectories true \
+            --sample-sheet "$sample_sheet_path" \
+            --strict-mode false \
+            --bcl-only-lane {params.lane} \
+            --bcl-num-parallel-tiles 4 \
+            --bcl-num-conversion-threads {params.bcl_conversion_threads} \
+            --bcl-num-compression-threads {params.bcl_compression_threads} \
+            --bcl-num-decompression-threads {params.bcl_decompression_threads}
+        }}
+
+        final_out=".output/{wildcards.config_id}"
+        if [ ! -z "{params.scratch_dir}" ]; then
+            bcl_out="{params.scratch_dir}/{wildcards.config_id}"
+        else
+            bcl_out="$final_out"
+        fi
+
+        find "$bcl_out" -name "*.fastq.gz" -delete 2>/dev/null || true
+        mkdir -p "$bcl_out"
+
+        run_bcl_convert {input.sample_sheet}
+
+        bcl_status=$?
+        if [ $bcl_status -ne 0 ]; then
+            cleanup
+            exit $bcl_status
+        fi
+
+        if [ ! -z "{params.scratch_dir}" ]; then
+            echo "Syncing from scratch to output with checksum verification..."
+            mkdir -p "$final_out"
+            sync_ok=false
+            for attempt in 1 2 3; do
+                if rsync -aW --delete "$bcl_out/" "$final_out/"; then
+                    sync_ok=true
+                    break
+                fi
+                echo "rsync attempt $attempt failed, retrying..."
+            done
+            if [ "$sync_ok" != "true" ]; then
+                echo "ERROR: rsync failed after 3 attempts. Scratch data preserved at $bcl_out"
+                exit 1
+            fi
+            rm -rf "$bcl_out"
+            echo "Scratch data removed after successful sync."
+        fi
+
+        if [ -f "metadata/flexbar_barcodes_{wildcards.config_id}.txt" ]; then
+            echo "Inline demux lane detected; preserving Undetermined reads."
+        else
+            find "$final_out" -name "Undetermined*" -delete
+            echo "Undetermined reads deleted"
+        fi
+
+        src/run_rename.sh {wildcards.config_id} "$final_out" {input.renaming_map}
+
+        trap - INT TERM
+        touch {output.done_file}
+        ) > {log} 2>&1
+        """
+
+rule bcl_project_done:
+    input:
+        done = maybe_ancient(".output/{config_id}/.done"),
+        decision = "logs/orientation_decision_{config_id}.json"
+    output:
+        sentinel = touch("output/{config_id}/{project}/.project_done")
+    wildcard_constraints:
+        config_id = "[^/]+",
+        project = "[^/]+"
+    run:
+        import os, glob, shutil, json as json_mod
+        config_id = wildcards.config_id
+        new_project = wildcards.project
+        old_project = PROJECT_RENAME_MAP_INV.get((config_id, new_project), new_project)
+
+        orientation = "original"
+        try:
+            with open(input.decision) as _df:
+                _dec = json_mod.load(_df)
+            orientation = _dec.get(old_project, _dec.get(new_project, "original"))
+        except Exception:
+            pass
+
+        src_base = ".output_rc" if orientation.startswith("rc") else ".output"
+        src_dir = os.path.abspath(f"{src_base}/{config_id}/{old_project}")
+        new_dir = os.path.abspath(f"output/{config_id}/{new_project}")
+
+        if os.path.isdir(src_dir):
+            if os.path.isdir(new_dir) and not os.listdir(new_dir):
+                os.rmdir(new_dir)
+            if not os.path.exists(new_dir):
+                shutil.move(src_dir, new_dir)
+            else:
+                for _fname in os.listdir(src_dir):
+                    _src_f = os.path.join(src_dir, _fname)
+                    _dst_f = os.path.join(new_dir, _fname)
+                    if os.path.isfile(_src_f):
+                        if os.path.exists(_dst_f):
+                            os.remove(_dst_f)
+                        shutil.move(_src_f, _dst_f)
+
+        os.makedirs(new_dir, exist_ok=True)
+
+        all_lane_projects = sorted([p for cid, p in CONFIG_PROJECT_PAIRS if cid == config_id])
+        if all_lane_projects and all_lane_projects[0] == new_project:
+            src_lane_base = f".output_rc/{config_id}" if any(
+                orientation.startswith("rc") for p, v in [("_", orientation)]
+            ) else f".output/{config_id}"
+            src_lane_base = f".output/{config_id}"
+            dst_lane_base = f"output/{config_id}"
+            os.makedirs(dst_lane_base, exist_ok=True)
+            _LANE_DIRS = {'Reports', 'Logs', 'Thumbnail_Images', 'InterOp'}
+            for item in _LANE_DIRS:
+                src_item = os.path.join(src_lane_base, item)
+                dst_item = os.path.join(dst_lane_base, item)
+                if os.path.isdir(src_item) and not os.path.exists(dst_item):
+                    shutil.copytree(src_item, dst_item)
+                elif os.path.isdir(src_item):
+                    for _fn in os.listdir(src_item):
+                        _sf = os.path.join(src_item, _fn)
+                        _df = os.path.join(dst_item, _fn)
+                        if os.path.isfile(_sf) and not os.path.exists(_df):
+                            shutil.copy2(_sf, _df)
+
+        _INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
+        check_name = old_project if old_project else new_project
+        if not any(kw in check_name for kw in _INDEX_READ_KEYWORDS):
+            proj_dir = f"output/{config_id}/{new_project}"
+            removed = 0
+            for pattern in ["**/*-I1.fastq.gz", "**/*-I2.fastq.gz"]:
+                for f in glob.glob(os.path.join(proj_dir, pattern), recursive=True):
+                    os.remove(f)
+                    removed += 1
+            if removed:
+                print(f"Removed {removed} index FASTQ file(s) from {proj_dir}")
+
+rule calculate_md5sums:
+    input:
+        done = "output/{config_id}/{project}/.fastq_names_done"
+    output:
+        md5 = "output/{config_id}/{project}/md5sums.txt"
+    log:
+        "logs/calculate_md5sums_{config_id}_{project}.log"
+    benchmark:
+        "benchmarks/calculate_md5sums_{config_id}_{project}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+",
+        project = ".+"
+    shell:
+        """
+        (
+        cd output/{wildcards.config_id}/{wildcards.project}
+        find . -name '*.fastq.gz' -type f -print0 | xargs -0 -P 8 md5sum | sort -k2 > md5sums.txt
+        count=$(wc -l < md5sums.txt)
+        echo "Generated md5sums.txt with $count entries for {wildcards.project}"
+        if [ "$count" -eq 0 ]; then
+            echo "ERROR: md5sums.txt is empty, no .fastq.gz files found" >&2
+            exit 1
+        fi
+        ) > {log} 2>&1
+        """
+
+rule generate_exclude_indexes:
+    input:
+        samplesheets = lambda wildcards: [f"results/SampleSheet_{other_id}.csv" for other_id in get_config_ids_for_lane(get_lane_for_config(wildcards.config_id)) if other_id != wildcards.config_id]
+    output:
+        txt = "results/exclude_indexes_{config_id}.txt"
+    benchmark:
+        "benchmarks/generate_exclude_indexes_{config_id}.bench"
+    run:
+        import sys
+        indexes = set()
+        for sheet in input.samplesheets:
+            indexes.update(get_index_sequences_from_samplesheet(sheet))
+        with open(output.txt, 'w') as f:
+            for idx in sorted(indexes):
+                f.write(f"{idx}\n")
+        import os; os.utime(output.txt)
+        print(f"Wrote {len(indexes)} exclude indexes for {wildcards.config_id}")
+
+rule analyze_undetermined:
+    input:
+        done = ".output/{config_id}/.done"
+    output:
+        csv = "results/undetermined_indices/{config_id}.csv"
+    log:
+        "logs/analyze_undetermined_{config_id}.log"
+    benchmark:
+        "benchmarks/analyze_undetermined_{config_id}.bench"
+    params:
+        barcodes = lambda wildcards: f".output/{wildcards.config_id}/Reports/Top_Unknown_Barcodes.csv"
+    run:
+        import csv as csv_mod
+        import os
+
+        with open(log[0], 'w') as logf:
+            rows = []
+            with open(params.barcodes) as f:
+                reader = csv_mod.DictReader(f)
+                for r in reader:
+                    idx1 = r.get('index', '').strip()
+                    idx2 = r.get('index2', '').strip()
+                    count = int(r.get('# Reads', '0'))
+                    seq = f"{idx1}+{idx2}" if idx2 else idx1
+                    index_type = "Dual" if idx2 else "Single"
+                    rows.append((count, index_type, seq))
+
+            os.makedirs(os.path.dirname(output.csv), exist_ok=True)
+            with open(output.csv, 'w', newline='') as f:
+                writer = csv_mod.writer(f)
+                writer.writerow(['Count', 'Type', 'Index Sequence'])
+                for count, itype, seq in rows:
+                    writer.writerow([count, itype, seq])
+
+            logf.write(f"Converted {len(rows)} barcodes from {params.barcodes}\n")
+
+rule detect_rc_candidates:
+    input:
+        undetermined = "results/undetermined_indices/{config_id}.csv",
+        samplesheet = "results/SampleSheet_{config_id}.csv"
+    output:
+        candidates = "logs/rc_candidates_{config_id}.json"
+    log:
+        "logs/detect_rc_candidates_{config_id}.log"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    params:
+        rc_threshold = config.get("rc_rerun_threshold", 0.5),
+        min_total_count = config.get("rc_rerun_min_total_count", 1000),
+        min_rc_count = config.get("rc_rerun_min_rc_count", 1000),
+    run:
+        import json as json_mod
+        import subprocess
+        import sys as sys_mod
+        result = subprocess.run(
+            [
+                sys_mod.executable, "scripts/check_index_rc_swap.py",
+                "--samples", input.samplesheet,
+                "--undetermined", input.undetermined,
+                "--format", "json",
+                "--rc-threshold", str(params.rc_threshold),
+                "--min-total-count", str(params.min_total_count),
+                "--min-rc-count", str(params.min_rc_count),
+            ],
+            capture_output=True, text=True
+        )
+        with open(log[0], 'w') as lf:
+            lf.write(result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"check_index_rc_swap.py failed:\n{result.stderr}")
+        payload = json_mod.loads(result.stdout)
+        suspects = [
+            r for r in payload.get('project_suspects', [])
+            if r.get('config_id') == wildcards.config_id
+        ]
+        with open(output.candidates, 'w') as f:
+            json_mod.dump(suspects, f, indent=2)
+        print(f"RC candidates for {wildcards.config_id}: {[r['project'] for r in suspects]}")
+
+rule generate_rc_samplesheet:
+    input:
+        samplesheet = "results/SampleSheet_{config_id}.csv",
+        candidates = "logs/rc_candidates_{config_id}.json"
+    output:
+        rc_samplesheet = "results/SampleSheet_{config_id}_rc.csv"
+    log:
+        "logs/generate_rc_samplesheet_{config_id}.log"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    run:
+        import subprocess, sys as sys_mod
+        result = subprocess.run(
+            [
+                sys_mod.executable, "src/apply_rc_to_samplesheet.py",
+                "--samplesheet", input.samplesheet,
+                "--candidates", input.candidates,
+                "--output", output.rc_samplesheet,
+            ],
+            capture_output=True, text=True
+        )
+        with open(log[0], 'w') as lf:
+            lf.write(result.stdout)
+            lf.write(result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"apply_rc_to_samplesheet.py failed:\n{result.stderr}")
+
+rule validate_barcode_hamming_distances_rc:
+    input:
+        samplesheet = "results/SampleSheet_{config_id}_rc.csv"
+    output:
+        report = "logs/barcode_hamming_validation_rc_{config_id}.txt",
+        marker = touch("logs/barcode_hamming_validation_rc_{config_id}.done"),
+        fixed_sheet = "results/SampleSheet_{config_id}_rc_validated.csv"
+    log:
+        "logs/barcode_hamming_validation_rc_{config_id}.log"
+    benchmark:
+        "benchmarks/barcode_hamming_validation_rc_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    params:
+        script = "scripts/validate_barcode_hamming_distance.py",
+        tolerance = 1
+    shell:
+        """
+        (
+        echo "Validating RC sample sheet barcode Hamming distances for {wildcards.config_id}..."
+        python3 {params.script} \
+            --samplesheets {input.samplesheet} \
+            --mismatch-tolerance {params.tolerance} \
+            --output {output.report} \
+            --output-sheet {output.fixed_sheet} \
+            --fix
+
+        exit_code=$?
+        if [ $exit_code -ne 0 ]; then
+            echo ""
+            echo "=========================================================="
+            echo "ERROR: RC barcode Hamming distance validation FAILED for {wildcards.config_id} (after auto-fix attempt)"
+            echo "=========================================================="
+            echo ""
+            cat {output.report}
+            exit 1
+        fi
+        ) > {log} 2>&1
+        """
+
+rule bcl_convert_rc:
+    input:
+        rc_samplesheet = "results/SampleSheet_{config_id}_rc_validated.csv",
+        renaming_map = "results/renaming_map_{config_id}.csv",
+        candidates = "logs/rc_candidates_{config_id}.json",
+        data_dir = DATA_DIR,
+        run_info = "src/RunInfo_nn.xml",
+        orig_done = ".output/{config_id}/.done"
+    output:
+        output_dir = directory(".output_rc/{config_id}"),
+        done_file = touch(".output_rc/{config_id}/.done")
+    log:
+        "logs/bcl_convert_rc_{config_id}.log"
+    benchmark:
+        "benchmarks/bcl_convert_rc_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    priority: 90
+    resources:
+        serial_operation=1
+    threads: 1
+    params:
+        lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
+        bcl_conversion_threads = BCL_CONVERSION_THREADS,
+        bcl_compression_threads = BCL_COMPRESSION_THREADS,
+        bcl_decompression_threads = BCL_DECOMPRESSION_THREADS,
+    run:
+        import json as json_mod, subprocess, sys as sys_mod, os as os_mod
+        with open(input.candidates) as f:
+            suspects = json_mod.load(f)
+        os_mod.makedirs(output.output_dir, exist_ok=True)
+        with open(log[0], 'w') as lf:
+            if not suspects:
+                lf.write(f"No RC suspects for {wildcards.config_id}; skipping BCL Convert RC run.\n")
+                return
+            lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
+            cmd = [
+                "bcl-convert",
+                "--bcl-input-directory", str(input.data_dir),
+                "--output-directory", str(output.output_dir),
+                "--force",
+                "--bcl-sampleproject-subdirectories", "true",
+                "--sample-sheet", str(input.rc_samplesheet),
+                "--strict-mode", "false",
+                "--bcl-only-lane", str(params.lane),
+                "--bcl-num-parallel-tiles", "4",
+                "--bcl-num-conversion-threads", str(params.bcl_conversion_threads),
+                "--bcl-num-compression-threads", str(params.bcl_compression_threads),
+                "--bcl-num-decompression-threads", str(params.bcl_decompression_threads),
+            ]
+            lf.write(f"Running: {' '.join(cmd)}\n")
+            lf.flush()
+            result = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=14400)
+            if result.returncode != 0:
+                raise RuntimeError(f"bcl-convert RC run failed for {wildcards.config_id}")
+
+            rename_cmd = [
+                "bash", "src/run_rename.sh",
+                wildcards.config_id,
+                str(output.output_dir),
+                str(input.renaming_map),
+            ]
+            lf.write(f"Running: {' '.join(rename_cmd)}\n")
+            lf.flush()
+            rename_result = subprocess.run(rename_cmd, stdout=lf, stderr=subprocess.STDOUT)
+            if rename_result.returncode != 0:
+                raise RuntimeError(f"RC FASTQ rename failed for {wildcards.config_id}")
+
+rule pick_orientation:
+    input:
+        done_orig = maybe_ancient(".output/{config_id}/.done"),
+        done_rc = ".output_rc/{config_id}/.done",
+        candidates = "logs/rc_candidates_{config_id}.json"
+    output:
+        decision = "logs/orientation_decision_{config_id}.json"
+    log:
+        "logs/pick_orientation_{config_id}.log"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    run:
+        import json as json_mod, csv as csv_mod, os as os_mod
+
+        def read_project_counts(stats_csv):
+            counts = {}
+            if not os_mod.path.exists(stats_csv):
+                return counts
+            try:
+                with open(stats_csv) as f:
+                    reader = csv_mod.DictReader(f)
+                    for r in reader:
+                        proj = (r.get('SampleProject') or r.get('Sample_Project') or '').strip()
+                        reads_raw = r.get('# Reads') or r.get('Reads') or '0'
+                        try:
+                            reads = int(reads_raw)
+                        except ValueError:
+                            reads = 0
+                        if proj:
+                            counts[proj] = counts.get(proj, 0) + reads
+            except Exception as e:
+                with open(log[0], 'a') as lf:
+                    lf.write(f"Warning: could not parse {stats_csv}: {e}\n")
+            return counts
+
+        with open(input.candidates) as f:
+            suspects = json_mod.load(f)
+
+        samplesheet_path = f"results/SampleSheet_{wildcards.config_id}.csv"
+        preserve_undetermined = False
+        if os_mod.path.exists(samplesheet_path):
+            try:
+                with open(samplesheet_path, 'r', encoding='utf-8', errors='ignore') as _ssf:
+                    preserve_undetermined = "flexbar" in _ssf.read().lower()
+            except Exception:
+                preserve_undetermined = False
+
+        fix_type_map = {}
+        for rec in suspects:
+            ft = rec.get('fix_type', 'i7_rc')
+            fix_type_map[rec['project']] = "rc_" + ft.replace('_rc', '')
+
+        decision = {}
+        with open(log[0], 'w') as lf:
+            if not suspects:
+                lf.write(f"No RC suspects for {wildcards.config_id}; all projects use original.\n")
+            else:
+                orig_stats = f".output/{wildcards.config_id}/Reports/Demultiplex_Stats.csv"
+                rc_stats = f".output_rc/{wildcards.config_id}/Reports/Demultiplex_Stats.csv"
+                orig_counts = read_project_counts(orig_stats)
+                rc_counts = read_project_counts(rc_stats)
+                lf.write(f"Original counts: {orig_counts}\n")
+                lf.write(f"RC counts: {rc_counts}\n")
+                for rec in suspects:
+                    project = rec['project']
+                    orig = orig_counts.get(project, 0)
+                    rc_val = rc_counts.get(project, 0)
+                    winner = fix_type_map.get(project, "rc_i7") if rc_val > orig else "original"
+                    decision[project] = winner
+                    lf.write(f"{project}: original={orig}, rc={rc_val} -> {winner}\n")
+
+        with open(output.decision, 'w') as f:
+            json_mod.dump(decision, f, indent=2)
+
+        import shutil as _shutil_rc
+        rc_projects = {p for p, v in decision.items() if v.startswith("rc")}
+        _LANE_DIRS = {'Reports', 'Logs', 'Thumbnail_Images', 'InterOp'}
+        rc_lane_dir = f".output_rc/{wildcards.config_id}"
+        if os_mod.path.isdir(rc_lane_dir):
+            with open(log[0], 'a') as lf:
+                for item in os_mod.listdir(rc_lane_dir):
+                    if item.startswith('.'):
+                        continue
+                    item_path = os_mod.path.join(rc_lane_dir, item)
+                    if os_mod.path.isdir(item_path) and item not in rc_projects and item not in _LANE_DIRS:
+                        lf.write(f"Removing unused RC project dir: {item_path}\n")
+                        _shutil_rc.rmtree(item_path)
+                    elif os_mod.path.isfile(item_path) and item.startswith('Undetermined') and item.endswith('.fastq.gz'):
+                        if preserve_undetermined:
+                            lf.write(f"Preserving RC undetermined reads for flexbar lane: {item_path}\n")
+                        else:
+                            lf.write(f"Removing RC undetermined reads: {item_path}\n")
+                            os_mod.remove(item_path)
+
+        orig_lane_dir = f".output/{wildcards.config_id}"
+        if os_mod.path.isdir(orig_lane_dir):
+            with open(log[0], 'a') as lf:
+                for item in os_mod.listdir(orig_lane_dir):
+                    if item.startswith('Undetermined') and item.endswith('.fastq.gz'):
+                        item_path = os_mod.path.join(orig_lane_dir, item)
+                        if os_mod.path.isfile(item_path):
+                            if preserve_undetermined:
+                                lf.write(f"Preserving original undetermined reads for flexbar lane: {item_path}\n")
+                            else:
+                                lf.write(f"Removing original undetermined reads: {item_path}\n")
+                                os_mod.remove(item_path)
+
+rule update_validation_workbook:
+    input:
+        decisions = expand("logs/orientation_decision_{config_id}.json", config_id=CONFIG_IDS),
+        metadata = maybe_ancient(metadata)
+    output:
+        xlsx = VALIDATION_XLSX
+    run:
+        validate_metadata_and_write_report(str(input.metadata), out_xlsx=output.xlsx)
+
+rule check_index_rc_swap:
+    input:
+        samples = lambda wildcards: sorted(glob.glob("results/SampleSheet_*.csv")),
+        undetermined = lambda wildcards: sorted(glob.glob("results/undetermined_indices/*.csv"))
+    output:
+        "results/check_index_rc_swap.txt"
+    log:
+        "logs/check_index_rc_swap.log"
+    params:
+        script = "scripts/check_index_rc_swap.py"
+    threads: 1
+    shell:
+        """
+        python3 {params.script} --samples {input.samples} --undetermined {input.undetermined} > {output} 2> {log}
+        """
