@@ -1,0 +1,7 @@
+services:
+  grthub-bclconvert:
+    build: .
+    image: ghcr.io/whtns/grthub_bclconvert:${IMAGE_TAG:-latest}
+    ports:
+      - "8888:8888"
+    restart: unless-stopped

@@ -1,0 +1,10 @@
+.env.local
+docker-compose.override.yml
+.codetree/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+*.txt
+*.log
+*.docx
+.specstory/

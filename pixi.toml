@@ -1,0 +1,29 @@
+[workspace]
+channels = ["conda-forge", "bioconda"]
+name = "grthub_bclconvert"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[feature.grthub-bclconvert.dependencies]
+python = "3.12.*"
+pip = "*"
+setuptools = "*"
+wheel = "*"
+snakemake = "*"
+fastqc = "*"
+flexbar = "*"
+seqtk = "*"
+matplotlib = "*"
+pandas = "*"
+numpy = "*"
+openpyxl = "*"
+slack-sdk = "*"
+ipython = "*"
+pyside6 = "*"
+pyyaml = "*"
+requests = "*"
+
+[environments]
+grthub-bclconvert = { features = ["grthub-bclconvert"], no-default-feature = true }
