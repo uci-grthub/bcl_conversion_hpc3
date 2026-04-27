@@ -9,13 +9,13 @@ import xml.etree.ElementTree as ET
 from io import StringIO
 
 # HPC3 stripped-down version: no email, no Nextcloud.
-# Run with: snakemake --snakefile Snakefile_hpc3 --configfile snakemake_config_hpc3.yaml
-#           --use-singularity --singularity-args "-B /staging,/dfs6"
+# Run with: singularity exec --bind /dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+#           snakemake --snakefile Snakefile_hpc3 --configfile snakemake_config.yaml \
 #           --cores 16
 
-container: "docker://ghcr.io/whtns/grthub_bclconvert:latest"
+container: "/dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif"
 
-configfile: "snakemake_config_hpc3.yaml"
+configfile: "snakemake_config.yaml"
 
 # Load project-specific config if it exists (higher priority than default)
 _PROJECT_CONFIG = f"snakemake_config_project.yaml"
@@ -284,28 +284,23 @@ for (lane, group), project in PROJECT_LOOKUP.items():
 
 
 def fix_runinfo_reverse_complement():
-    import re, os
+    import os
+    import shutil
     src = os.path.join(DATA_DIR, "RunInfo.xml")
-    dest = "src/RunInfo_nn.xml"
+    dest = "src/RunInfo.xml"
     if not os.path.exists(src):
         raise FileNotFoundError(f"Source RunInfo.xml not found: {src}")
-    with open(src, "r") as f:
-        content = f.read()
-    pattern = r'(<Read[^>]*Number="3"[^>]*IsReverseComplement=")[YN]"'
-    replacement = r'\1N"'
-    new_content = re.sub(pattern, replacement, content)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "w") as f:
-        f.write(new_content)
+    shutil.copy2(src, dest)
     with open("logs/fix_runinfo_reverse_complement.log", "w") as lf:
-        lf.write("RunInfo.xml copied and IsReverseComplement set to N for Read Number=3\n")
+        lf.write("RunInfo.xml copied without modification\n")
 
 _src_runinfo = os.path.join(DATA_DIR, "RunInfo.xml")
-_dest_runinfo = "src/RunInfo_nn.xml"
+_dest_runinfo = "src/RunInfo.xml"
 if not os.path.exists(_dest_runinfo) or (os.path.exists(_src_runinfo) and os.path.getmtime(_src_runinfo) > os.path.getmtime(_dest_runinfo)):
     fix_runinfo_reverse_complement()
 
-SAMPLE_SHEETS_DICT = generate_lane_samplesheets(METADATA_FILE, LANE_CONFIGS, PROJECT_LOOKUP, MASKING_LOOKUP, "results", "src/RunInfo_nn.xml", LIBRARY)
+SAMPLE_SHEETS_DICT = generate_lane_samplesheets(METADATA_FILE, LANE_CONFIGS, PROJECT_LOOKUP, MASKING_LOOKUP, "results", "src/RunInfo.xml", LIBRARY)
 
 CONFIG_IDS = list(SAMPLE_SHEETS_DICT.keys()) if SAMPLE_SHEETS_DICT else []
 if not CONFIG_IDS and detected_lanes:
@@ -1261,7 +1256,7 @@ rule flexbar_stage_project:
 rule generate_samplesheets:
     input:
         metadata = METADATA_FILE if METADATA_FILE else [],
-        run_info = "src/RunInfo_nn.xml"
+        run_info = "src/RunInfo.xml"
     output:
         expand("results/SampleSheet_{config_id}.csv", config_id=CONFIG_IDS),
         expand("logs/generate_samplesheets_{config_id}.done", config_id=CONFIG_IDS)
@@ -1421,7 +1416,7 @@ rule generate_renaming_map:
         project_lookup = PROJECT_LOOKUP,
         masking_lookup = MASKING_LOOKUP,
         metadata = METADATA_FILE,
-        run_info = "src/RunInfo_nn.xml",
+        run_info = "src/RunInfo.xml",
         out_dir = "results",
         library = LIBRARY
     run:
@@ -1563,7 +1558,7 @@ rule bcl_convert:
         renaming_map = "results/renaming_map_{config_id}.csv",
         data_dir=DATA_DIR,
         _sheet_done=lambda wildcards: f"logs/generate_samplesheets_{wildcards.config_id}.done",
-        run_info = "src/RunInfo_nn.xml",
+        run_info = "src/RunInfo.xml",
         prev_done = get_prev_bcl_done
     output:
         done_file = touch(".output/{config_id}/.done")
@@ -1586,6 +1581,8 @@ rule bcl_convert:
     shell:
         """
         (
+        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        
         cleanup() {{
             pkill -P $$ 2>/dev/null || true
         }}
@@ -1614,7 +1611,7 @@ rule bcl_convert:
             bcl_out="$final_out"
         fi
 
-        find "$bcl_out" -name "*.fastq.gz" -delete 2>/dev/null || true
+        rm -f "$bcl_out"/*.fastq.gz 2>/dev/null || true
         mkdir -p "$bcl_out"
 
         run_bcl_convert {input.sample_sheet}
@@ -1647,7 +1644,7 @@ rule bcl_convert:
         if [ -f "metadata/flexbar_barcodes_{wildcards.config_id}.txt" ]; then
             echo "Inline demux lane detected; preserving Undetermined reads."
         else
-            find "$final_out" -name "Undetermined*" -delete
+            rm -f "$final_out"/Undetermined* 2>/dev/null || true
             echo "Undetermined reads deleted"
         fi
 
@@ -1719,7 +1716,7 @@ rule bcl_project_done:
                     for _fn in os.listdir(src_item):
                         _sf = os.path.join(src_item, _fn)
                         _df = os.path.join(dst_item, _fn)
-                        if os.path.isfile(_sf) and not os.path.exists(_df):
+                        if os.path.isfile(_sf):
                             shutil.copy2(_sf, _df)
 
         _INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
@@ -1749,8 +1746,10 @@ rule calculate_md5sums:
     shell:
         """
         (
+        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        
         cd output/{wildcards.config_id}/{wildcards.project}
-        find . -name '*.fastq.gz' -type f -print0 | xargs -0 -P 8 md5sum | sort -k2 > md5sums.txt
+        ls -1 *.fastq.gz 2>/dev/null | while read f; do md5sum "$f"; done | sort -k2 > md5sums.txt
         count=$(wc -l < md5sums.txt)
         echo "Generated md5sums.txt with $count entries for {wildcards.project}"
         if [ "$count" -eq 0 ]; then
@@ -1930,7 +1929,7 @@ rule bcl_convert_rc:
         renaming_map = "results/renaming_map_{config_id}.csv",
         candidates = "logs/rc_candidates_{config_id}.json",
         data_dir = DATA_DIR,
-        run_info = "src/RunInfo_nn.xml",
+        run_info = "src/RunInfo.xml",
         orig_done = ".output/{config_id}/.done"
     output:
         output_dir = directory(".output_rc/{config_id}"),
@@ -1950,47 +1949,38 @@ rule bcl_convert_rc:
         bcl_conversion_threads = BCL_CONVERSION_THREADS,
         bcl_compression_threads = BCL_COMPRESSION_THREADS,
         bcl_decompression_threads = BCL_DECOMPRESSION_THREADS,
-    run:
-        import json as json_mod, subprocess, sys as sys_mod, os as os_mod
-        with open(input.candidates) as f:
-            suspects = json_mod.load(f)
-        os_mod.makedirs(output.output_dir, exist_ok=True)
-        with open(log[0], 'w') as lf:
-            if not suspects:
-                lf.write(f"No RC suspects for {wildcards.config_id}; skipping BCL Convert RC run.\n")
-                return
-            lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
-            cmd = [
-                "bcl-convert",
-                "--bcl-input-directory", str(input.data_dir),
-                "--output-directory", str(output.output_dir),
-                "--force",
-                "--bcl-sampleproject-subdirectories", "true",
-                "--sample-sheet", str(input.rc_samplesheet),
-                "--strict-mode", "false",
-                "--bcl-only-lane", str(params.lane),
-                "--bcl-num-parallel-tiles", "4",
-                "--bcl-num-conversion-threads", str(params.bcl_conversion_threads),
-                "--bcl-num-compression-threads", str(params.bcl_compression_threads),
-                "--bcl-num-decompression-threads", str(params.bcl_decompression_threads),
-            ]
-            lf.write(f"Running: {' '.join(cmd)}\n")
-            lf.flush()
-            result = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=14400)
-            if result.returncode != 0:
-                raise RuntimeError(f"bcl-convert RC run failed for {wildcards.config_id}")
+    shell:
+        """
+        (
+        mkdir -p {output.output_dir}
 
-            rename_cmd = [
-                "bash", "src/run_rename.sh",
-                wildcards.config_id,
-                str(output.output_dir),
-                str(input.renaming_map),
-            ]
-            lf.write(f"Running: {' '.join(rename_cmd)}\n")
-            lf.flush()
-            rename_result = subprocess.run(rename_cmd, stdout=lf, stderr=subprocess.STDOUT)
-            if rename_result.returncode != 0:
-                raise RuntimeError(f"RC FASTQ rename failed for {wildcards.config_id}")
+        suspects=$(python3 -c "import json; d=json.load(open('{input.candidates}')); print(len(d))")
+        if [ "$suspects" -eq 0 ]; then
+            echo "No RC suspects for {wildcards.config_id}; skipping BCL Convert RC run."
+            exit 0
+        fi
+
+        python3 -c "import json; d=json.load(open('{input.candidates}')); print('RC suspects:', [r['project'] for r in d])"
+
+        timeout 14400 bcl-convert \
+            --bcl-input-directory {input.data_dir} \
+            --output-directory {output.output_dir} \
+            --force \
+            --bcl-sampleproject-subdirectories true \
+            --sample-sheet {input.rc_samplesheet} \
+            --strict-mode false \
+            --bcl-only-lane {params.lane} \
+            --bcl-num-parallel-tiles 4 \
+            --bcl-num-conversion-threads {params.bcl_conversion_threads} \
+            --bcl-num-compression-threads {params.bcl_compression_threads} \
+            --bcl-num-decompression-threads {params.bcl_decompression_threads}
+
+        bash src/run_rename.sh \
+            {wildcards.config_id} \
+            {output.output_dir} \
+            {input.renaming_map}
+        ) >> {log} 2>&1
+        """
 
 rule pick_orientation:
     input:

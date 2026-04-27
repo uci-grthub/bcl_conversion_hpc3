@@ -8,3 +8,12 @@ docker-compose.override.yml
 *.log
 *.docx
 .specstory/
+benchmarks/
+.output/
+output/
+.snakemake/
+Reports/
+src/__pycache__/metadata_validation.cpython-312.pyc
+src/__pycache__/rename_fastqs.cpython-312.pyc
+RunInfo.xml
+snakemake_config_project.yaml

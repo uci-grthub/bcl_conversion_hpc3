@@ -2091,6 +2091,8 @@ rule bcl_convert:
     shell:
         """
         (
+        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        
         cleanup() {{
             pkill -P $$ 2>/dev/null || true
         }}
@@ -2128,7 +2130,7 @@ rule bcl_convert:
             dragen_out="$final_out"
         fi
 
-        find "$dragen_out" -name "*.fastq.gz" -delete 2>/dev/null || true
+        rm -f "$dragen_out"/*.fastq.gz 2>/dev/null || true
         mkdir -p "$dragen_out"
 
         run_dragen {input.sample_sheet}
@@ -2164,7 +2166,7 @@ rule bcl_convert:
         if [ -f "metadata/flexbar_barcodes_{wildcards.config_id}.txt" ]; then
             echo "Inline demux lane detected (metadata/flexbar_barcodes_{wildcards.config_id}.txt exists); preserving Undetermined reads."
         else
-            find "$final_out" -name "Undetermined*" -delete
+            rm -f "$final_out"/Undetermined* 2>/dev/null || true
             echo "Undetermined reads deleted"
         fi
 
@@ -2309,8 +2311,10 @@ rule calculate_md5sums:
     shell:
         """
         (
+        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        
         cd output/{wildcards.config_id}/{wildcards.project}
-        find . -name '*.fastq.gz' -type f -print0 | xargs -0 -P 8 md5sum | sort -k2 > md5sums.txt
+        ls -1 *.fastq.gz 2>/dev/null | while read f; do md5sum "$f"; done | sort -k2 > md5sums.txt
         count=$(wc -l < md5sums.txt)
         echo "Generated md5sums.txt with $count entries for {wildcards.project}"
         if [ "$count" -eq 0 ]; then

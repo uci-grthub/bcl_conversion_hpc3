@@ -1,13 +1,13 @@
 # Snakemake configuration for postprocess workflow
 sample_sheet: "src/SampleSheet_default.csv"
 num_reads: 2
-library_name: ""
+library_name: "iR00x"
 start_s: 1
 lanes: [1,2,3,4,5,6,7,8]
 fastp_threads: 4
 flexbar_bin: "/home/kstachel/TOOLS/flexbar-speedup/build_parasail/src/flexbar"
-metadata: ""
-data_dir: ""
+metadata: "/dfs9/ucightf-lab/kstachel/test_bcl/iR00x/metadata/04212026_SC2177719-SC3_iR004.xlsx"
+data_dir: "/dfs9/ucightf-lab/kstachel/test_bcl/20260423_SH00564_0009_ASC2219076-SC3"
 tiles: ""
 email_sender: "kstachel@uci.edu"
 email_recipient: "kstachel@uci.edu"
