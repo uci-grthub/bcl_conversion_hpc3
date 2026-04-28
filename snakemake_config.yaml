@@ -1,28 +1,21 @@
-# Snakemake configuration for postprocess workflow
+# Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud)
 sample_sheet: "src/SampleSheet_default.csv"
 num_reads: 2
-library_name: "iR00x"
+library_name: ""
 start_s: 1
 lanes: [1,2,3,4,5,6,7,8]
 fastp_threads: 4
-flexbar_bin: "/home/kstachel/TOOLS/flexbar-speedup/build_parasail/src/flexbar"
-metadata: "/dfs9/ucightf-lab/kstachel/test_bcl/iR00x/metadata/04212026_SC2177719-SC3_iR004.xlsx"
-data_dir: "/dfs9/ucightf-lab/kstachel/test_bcl/20260423_SH00564_0009_ASC2219076-SC3"
+flexbar_bin: ""
+metadata: ""
+data_dir: ""
 tiles: ""
-email_sender: "kstachel@uci.edu"
-email_recipient: "kstachel@uci.edu"
-email_cc: "kstachel@uci.edu"
-nextcloud_dir_name: "dragenshare"
-nextcloud_dir_path: "nextcloud"
-external_drive_path: "/mnt/jbod_raid/nextshare/bcl_convert/NovaSeqX"
 
-# Fast local NVMe scratch for DRAGEN bcl-convert output (avoids writing directly to slow JBOD RAID).
-# DRAGEN writes FASTQs here first; files are moved to the final output/ path after conversion.
-# Set to "" or omit to write directly to output/ (slower if on network/JBOD storage).
+# Fast local NVMe scratch for bcl-convert output (avoids writing directly to slow storage).
+# bcl-convert writes FASTQs here first; files are moved to the final output/ path after conversion.
+# Set to "" or omit to write directly to output/.
 scratch_dir: ""
 
-# Order IDs whose projects should be excluded from rule all (e.g. skip processing for a specific order).
-# Also excludes the order-level reports and emails for those order IDs.
+# Order IDs whose projects should be excluded from rule all.
 # Example: exclude_order_ids: ["0326I-13", "0326I-14"]
 exclude_order_ids: []
 
@@ -38,3 +31,8 @@ bcl_convert_order:
   - lane6
   - lane7
   - lane8
+
+# bcl-convert threads (HPC3 can use more threads than the Dragen instrument)
+bcl_conversion_threads: 16
+bcl_compression_threads: 8
+bcl_decompression_threads: 8

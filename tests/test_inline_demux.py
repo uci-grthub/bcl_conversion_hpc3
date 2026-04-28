@@ -15,7 +15,7 @@ What this checks
 8. Empty barcode pos → Undetermined (read too short to have a barcode)
 
 Run with:
-    mamba run -n bcl_convert python3 tests/test_inline_demux.py
+    singularity exec "$BCL_CONVERT_SIF" python3 tests/test_inline_demux.py
 """
 from __future__ import annotations
 

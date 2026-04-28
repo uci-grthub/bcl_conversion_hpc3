@@ -23,12 +23,11 @@ This SOP provides clear, human‑readable steps to execute the NovaSeqX BCL conv
 - Enter the project directory
 `/staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}` 
 
-## 2) Activate the conda environment.
+## 2) Ensure the Singularity container is available.
 
-- Install the `bcl_convert` conda environment
-  - The `bcl_convert` conda env needs to be installed only once per user
-  - it needs to be activated every time the workflow is executed 
-  `mamba activate bcl_convert`
+- The workflow runs inside a Singularity container (`bcl_convert.sif`).
+- Set `BCL_CONVERT_SIF` to the container path if it differs from the default,
+  or rely on the default path in `run_hpc3.sh`.
 
 ## 3) Copy the SampleSheet into the new project
 

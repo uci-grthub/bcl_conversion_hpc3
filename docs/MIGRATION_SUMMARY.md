@@ -144,7 +144,6 @@ After U5I6Y*: [Skip:5bp] [Index:6bp] [Genomic:145bp]
 **Test Results**:
 ```bash
 cd /staging/nextcloud/testing_illumina/NovaseqX/xR074/.claude/xR074-migrate-to-bcl-convert
-mamba activate bcl_convert
 snakemake -n
 # ✅ SUCCESS: 1451 jobs planned without errors
 # ✅ NO duplicate barcode conflict

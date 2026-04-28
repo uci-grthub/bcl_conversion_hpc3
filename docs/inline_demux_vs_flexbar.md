@@ -37,7 +37,7 @@ hamming(obs_bc, ref)        # 6 comparisons × 6 barcodes = 36 ops per read
 | Assignment rate | ~10% | Expected >80% |
 | Runtime (1.3B reads) | 53 hours | Minutes |
 
-mamba run -n bcl_convert python3 tests/test_inline_demux.py
+singularity exec "$BCL_CONVERT_SIF" python3 tests/test_inline_demux.py
 
 The test covers the key behavioral difference between inline_demux and flexbar_per_config:
 

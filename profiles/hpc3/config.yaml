@@ -1,3 +1,3 @@
 snakefile: Snakefile_hpc3
-configfile: snakemake_config_hpc3.yaml
+configfile: snakemake_config.yaml
 cores: 16
