@@ -1,3 +1,13 @@
 snakefile: Snakefile_hpc3
 configfile: snakemake_config.yaml
+executor: slurm
+use-singularity: true
+singularity-args: >-
+  --bind /dfs9
+  --bind /tmp/bcl-convert-logs:/var/log/bcl-convert
+  --env PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 cores: 16
+default-resources:
+  slurm_partition: free
+  mem_mb: 8000
+  runtime: 60
