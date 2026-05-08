@@ -2505,9 +2505,12 @@ rule bcl_convert:
         }}
         trap cleanup INT TERM
 
-        run_dragen() {{
+        run_bcl_convert() {{
             local sample_sheet_path="$1"
-            timeout 7200 dragen --bcl-conversion-only true \
+            timeout 7200 /opt/apps/singularity/3.11.3/bin/singularity exec \
+            --bind /dfs3b,/dfs9 \
+            /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+            bcl-convert \
             --bcl-input-directory {input.data_dir} \
             --output-directory "$dragen_out" \
             --force \
@@ -2515,7 +2518,6 @@ rule bcl_convert:
             --sample-sheet "$sample_sheet_path" \
             --strict-mode false \
             --bcl-only-lane {params.lane} \
-            --run-info {params.run_info_path} \
             --bcl-num-parallel-tiles 1 \
             --bcl-num-conversion-threads 8 \
             --bcl-num-compression-threads 8 \
@@ -2540,7 +2542,7 @@ rule bcl_convert:
         rm -f "$dragen_out"/*.fastq.gz 2>/dev/null || true
         mkdir -p "$dragen_out"
 
-        run_dragen {input.sample_sheet}
+        run_bcl_convert {input.sample_sheet}
 
         dragen_status=$?
         if [ $dragen_status -ne 0 ]; then
@@ -2970,7 +2972,10 @@ rule bcl_convert_rc:
             lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
             tiles_args = ["--tiles", str(params.tiles)] if params.tiles else []
             cmd = [
-                "dragen", "--bcl-conversion-only", "true",
+                "singularity", "exec",
+                "--bind", "/dfs3b,/dfs9",
+                "/dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif",
+                "bcl-convert",
                 "--bcl-input-directory", str(input.data_dir),
                 "--output-directory", str(output.output_dir),
                 "--force",
@@ -2978,7 +2983,6 @@ rule bcl_convert_rc:
                 "--sample-sheet", str(input.rc_samplesheet),
                 "--strict-mode", "false",
                 "--bcl-only-lane", str(params.lane),
-                "--run-info", str(params.run_info_path),
                 "--bcl-num-parallel-tiles", "1",
                 "--bcl-num-conversion-threads", "8",
                 "--bcl-num-compression-threads", "8",
