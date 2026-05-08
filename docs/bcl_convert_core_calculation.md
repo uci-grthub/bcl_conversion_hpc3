@@ -1,0 +1,1 @@
+Total = (Tiles x ConvThreads) + CompThreads + DecompThreads

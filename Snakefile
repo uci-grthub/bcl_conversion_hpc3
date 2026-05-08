@@ -1207,6 +1207,8 @@ rule fastp_sample:
     wildcard_constraints:
         config_id = "[^/]+",
         sample_path = ".*"
+    resources:
+        mem_mb = get_fastp_mem_mb
     params:
         fastqs = get_fastp_sample_input,
     threads: 2

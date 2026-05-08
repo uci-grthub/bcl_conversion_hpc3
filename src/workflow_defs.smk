@@ -1809,6 +1809,16 @@ def get_fastp_sample_input(wildcards):
 
     raise ValueError(f"Could not find sample for config_id='{config_id}' and sample_path='{sample_path}' in renaming map.")
 
+def get_fastp_mem_mb(wildcards):
+    try:
+        fastqs = get_fastp_sample_input(wildcards)
+        if fastqs and os.path.exists(fastqs[0]):
+            size_mb = os.path.getsize(fastqs[0]) / (1024 * 1024)
+            return max(8000, int(size_mb // 2) + 4000)
+    except Exception:
+        pass
+    return 8000
+
 def get_fastp_plots_targets(wildcards):
     config_id = wildcards.config_id
     df = _fastp_rows_for_config(config_id)
