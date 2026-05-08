@@ -8,23 +8,10 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from io import StringIO
 
-envvars: 
-    "GMAIL_APP_PASSWORD",
-    "NEXTCLOUD_URL",
-    "NEXTCLOUD_USER",
-    "NEXTCLOUD_PASSWORD"
-
-NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL")
-if not NEXTCLOUD_URL:
-    raise SystemExit("Error: NEXTCLOUD_URL environment variable not set")
-
-NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER")
-if not NEXTCLOUD_USER:
-    raise SystemExit("Error: NEXTCLOUD_USER environment variable not set")
-
-NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD")
-if not NEXTCLOUD_PASSWORD:
-    raise SystemExit("Error: NEXTCLOUD_PASSWORD environment variable not set")
+NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "")
+NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
+NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 configfile: "snakemake_config.yaml"
 
