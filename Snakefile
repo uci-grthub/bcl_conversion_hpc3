@@ -2487,8 +2487,9 @@ rule bcl_convert:
         config_id = "[^/]+"
     priority: 100
     resources:
-        serial_operation=1
-    threads: 1
+        serial_operation=1,
+        mem_mb=131072
+    threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
@@ -2499,7 +2500,8 @@ rule bcl_convert:
         """
         (
         export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        
+        module load singularity
+
         cleanup() {{
             pkill -P $$ 2>/dev/null || true
         }}
@@ -2507,7 +2509,8 @@ rule bcl_convert:
 
         run_bcl_convert() {{
             local sample_sheet_path="$1"
-            timeout 7200 /opt/apps/singularity/3.11.3/bin/singularity exec \
+            timeout 7200 singularity exec \
+            --writable-tmpfs \
             --bind /dfs3b,/dfs9 \
             /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
             bcl-convert \
@@ -2972,7 +2975,8 @@ rule bcl_convert_rc:
             lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
             tiles_args = ["--tiles", str(params.tiles)] if params.tiles else []
             cmd = [
-                "singularity", "exec",
+                "/opt/apps/singularity/3.11.3/bin/singularity", "exec",
+                "--writable-tmpfs",
                 "--bind", "/dfs3b,/dfs9",
                 "/dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif",
                 "bcl-convert",

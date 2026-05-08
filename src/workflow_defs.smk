@@ -184,7 +184,7 @@ def is_special_atac_project_or_sheet(name):
         n = str(name or "").replace("_", "").replace(" ", "").lower()
     except Exception:
         n = ""
-    return n in ("bdrhapsodyatacseq", "10xmultiomeatacseq")
+    return n in ("bdrhapsodyatacseq", "bdrhapsodyatac", "10xmultiomeatacseq")
 
 
 def is_10x_multiome_atac_project_or_sheet(name):
@@ -1177,7 +1177,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                             if type_.startswith('R'):
                                 cycle_str = f"U{len_}" if actual_is_index else f"Y{len_}"
                             elif type_.startswith('I'):
-                                if type_ == 'I2' and special_10x_atac and not row_has_index2:
+                                if type_ == 'I2' and special_atac_index_reads and not row_has_index2:
                                     cycle_str = f"U{len_}"
                                 else:
                                     cycle_str = f"I{len_}"
