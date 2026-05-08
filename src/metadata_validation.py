@@ -40,6 +40,15 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
             pass
         return str(val).strip()
 
+    def _norm_project_name(val):
+        """Normalize a project name: replace spaces and underscores with a single underscore."""
+        if pd.isna(val):
+            return ''
+        s = str(val).strip()
+        if not s or s.lower() in ('nan', 'none'):
+            return ''
+        return re.sub(r'[\s_]+', '_', s).strip('_')
+
     if not metadata_file or not os.path.exists(metadata_file):
         issues.append({'sheet': '', 'row': '', 'col': '', 'message': f'Metadata file not found: {metadata_file}'})
         os.makedirs('metadata', exist_ok=True)
@@ -247,13 +256,7 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
             proj_variants = ['Project name', 'Project Name', 'Project', 'Sample_Project']
             present = [c for c in proj_variants if c in df.columns]
             if present:
-                def _norm_proj_val(v):
-                    if pd.isna(v):
-                        return ''
-                    s = str(v).strip()
-                    s = s.replace('_', ' ')
-                    s = ' '.join(s.split())
-                    return s
+                _norm_proj_val = _norm_project_name
 
                 # create normalized versions and detect per-row inconsistencies
                 norm_cols = {}
@@ -417,19 +420,13 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
         # Masking validation runs after all sheets are processed
 
     # Validate project-name parity between Summary and non-Summary tabs
-    def _clean_project_name(val):
-        if pd.isna(val):
-            return ''
-        s = str(val).strip()
-        if not s or s.lower() in ('nan', 'none'):
-            return ''
-        s = s.replace('_', ' ')
-        s = ' '.join(s.split())
-        return s
+    _clean_project_name = _norm_project_name
 
     summary_projects = set()
     non_summary_projects = set()
     non_summary_project_sheets = {}
+    summary_proj_orig = {}
+    non_summary_proj_orig = {}
 
     for sheet, df in sheet_dfs.items():
         proj_col = None
@@ -441,40 +438,144 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
             continue
 
         is_summary_tab = False
+        is_barcode_list_tab = False
         try:
             is_summary_tab = isinstance(sheet, str) and 'summary' in sheet.lower()
+            is_barcode_list_tab = isinstance(sheet, str) and 'barcode' in sheet.lower() and 'list' in sheet.lower()
         except Exception:
-            is_summary_tab = False
+            pass
+
+        # Only Summary and Barcode List tabs canonically carry project names;
+        # all other specialty tabs (10x, BD, etc.) link to Summary via lane/group/Lab ID.
+        if not is_summary_tab and not is_barcode_list_tab:
+            continue
 
         for raw_proj in df[proj_col].tolist():
             proj = _clean_project_name(raw_proj)
             if not proj:
                 continue
+            raw_str = str(raw_proj).strip() if not pd.isna(raw_proj) else ''
             if is_summary_tab:
                 summary_projects.add(proj)
+                if proj not in summary_proj_orig:
+                    summary_proj_orig[proj] = raw_str
             else:
                 non_summary_projects.add(proj)
                 non_summary_project_sheets.setdefault(proj, set()).add(sheet)
+                if proj not in non_summary_proj_orig:
+                    non_summary_proj_orig[proj] = raw_str
 
-    missing_in_tabs = sorted(summary_projects - non_summary_projects)
-    for proj in missing_in_tabs:
-        issues.append({
-            'sheet': 'Summary',
-            'row': '',
-            'col': 'Project',
-            'message': f"Project listed in Summary but missing from non-Summary tabs: {proj}"
-        })
+    # Only compare if Barcode List (the canonical non-summary project-name source) has data.
+    if non_summary_projects:
+        missing_in_tabs = sorted(summary_projects - non_summary_projects)
+        for proj in missing_in_tabs:
+            orig = summary_proj_orig.get(proj, proj).replace(' ', '_')
+            issues.append({
+                'sheet': 'Summary',
+                'row': '',
+                'col': 'Project',
+                'message': f"Project listed in Summary but missing from Barcode List: {orig}"
+            })
 
     missing_in_summary = sorted(non_summary_projects - summary_projects)
     for proj in missing_in_summary:
+        orig = non_summary_proj_orig.get(proj, proj).replace(' ', '_')
         sheets = sorted(non_summary_project_sheets.get(proj, set()))
         sheet_list = ', '.join(sheets) if sheets else 'unknown sheet'
         issues.append({
             'sheet': 'Summary',
             'row': '',
             'col': 'Project',
-            'message': f"Project present in non-Summary tabs but missing from Summary: {proj} (tabs: {sheet_list})"
+            'message': f"Project present in Barcode List but missing from Summary: {orig}"
         })
+
+    # Validate 'Sample sheet tab' column in Summary against actual lane/group sheet placements.
+    # Build two maps:
+    #   _lane_group_to_sheets : (lane, group) -> set of sheet names that contain it
+    #   _sheet_to_lane_groups : sheet name    -> set of (lane, group) pairs it contains
+    # Prefer the right-side duplicate Lane column (renamed "Lane.1" by pandas) because it
+    # holds the project-metadata lane matching the Summary, not the BCL sample-sheet lane.
+    _lane_group_to_sheets = {}
+    _sheet_to_lane_groups = {}
+    for _sheet, _df in sheet_dfs.items():
+        try:
+            if isinstance(_sheet, str) and 'summary' in _sheet.lower():
+                continue
+            _lc = 'Lane.1' if 'Lane.1' in _df.columns else ('Lane' if 'Lane' in _df.columns else None)
+            _gc = next((c for c in ('Group', 'Gr', 'group') if c in _df.columns), None)
+            if not _lc or not _gc:
+                continue
+            _sheet_to_lane_groups[_sheet] = set()
+            for (_lv, _gv), _ in _df.groupby([_lc, _gc]):
+                _lk = _norm_key(_lv)
+                _gk = _norm_key(_gv)
+                if _lk and _gk:
+                    _lane_group_to_sheets.setdefault((_lk, _gk), set()).add(_sheet)
+                    _sheet_to_lane_groups[_sheet].add((_lk, _gk))
+        except Exception:
+            continue
+
+    def _norm_sheet_ref(s):
+        return re.sub(r'[\s_]+', '', str(s)).lower()
+
+    for _sheet, _df in sheet_dfs.items():
+        try:
+            if not (isinstance(_sheet, str) and 'summary' in _sheet.lower()):
+                continue
+            _tab_col = next((c for c in _df.columns if str(c).strip().lower() == 'sample sheet tab'), None)
+            if _tab_col is None:
+                continue
+            _lc = 'Lane' if 'Lane' in _df.columns else None
+            _gc = next((c for c in ('Group', 'Gr', 'group') if c in _df.columns), None)
+            if not _lc or not _gc:
+                continue
+            for _pos, (_ridx, _row) in enumerate(_df.iterrows()):
+                _tab_val = _row.get(_tab_col)
+                if pd.isna(_tab_val) or str(_tab_val).strip() == '':
+                    continue
+                _tab_str = str(_tab_val).strip()
+                # Skip multi-value or annotation-style cells
+                if ',' in _tab_str or 'attachment' in _tab_str.lower():
+                    continue
+                _lk = _norm_key(_row.get(_lc))
+                _gk = _norm_key(_row.get(_gc))
+                if _lk is None or _gk is None:
+                    continue
+                # Resolve the named tab to an actual sheet (space/underscore-insensitive)
+                _named_sheet = next(
+                    (s for s in _sheet_to_lane_groups if _norm_sheet_ref(s) == _norm_sheet_ref(_tab_str)),
+                    None
+                )
+                if _named_sheet is None:
+                    continue  # named tab not found — covered by project-parity check
+                # Check whether this lane/group is present in the named tab
+                if (_lk, _gk) not in _sheet_to_lane_groups[_named_sheet]:
+                    _actual = _lane_group_to_sheets.get((_lk, _gk), set())
+                    if _actual:
+                        _msg = (
+                            f"'Sample sheet tab' lists '{_tab_str}' but lane {_lk} group {_gk} "
+                            f"data is in: {', '.join(sorted(_actual))}"
+                        )
+                    else:
+                        _tab_coverage = ', '.join(
+                            f"lane {l} group {g}"
+                            for l, g in sorted(_sheet_to_lane_groups[_named_sheet])
+                        ) or 'no lane/group data'
+                        _msg = (
+                            f"'Sample sheet tab' lists '{_tab_str}' but lane {_lk} group {_gk} "
+                            f"is not in that tab (tab covers: {_tab_coverage})"
+                        )
+                    issues.append({
+                        'sheet': _sheet,
+                        'row': int(_ridx),
+                        'col': str(_tab_col),
+                        'message': _msg,
+                        'lane': _lk,
+                        'group': _gk,
+                        'excel_row': int(_ridx) + 2
+                    })
+        except Exception:
+            continue
 
     # Validate masking against index lengths after all sheets are processed
     def _mask_len_map(masking_str):
@@ -675,6 +776,10 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
                 len1 = 0 if index1 in ('', 'nan', 'None') else len(index1)
                 len2 = 0 if index2 in ('', 'nan', 'None') else len(index2)
 
+                # No barcode data available for this lane/group — cannot validate masking.
+                if len1 == 0 and len2 == 0:
+                    continue
+
             if i1_len is not None and len1 != i1_len:
                 issues.append({
                     'sheet': sheet,
@@ -687,11 +792,18 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
                 })
 
             if i2_len is not None:
+                _tab_ref = row.get('Sample sheet tab', '')
+                _tab_ref_str = '' if pd.isna(_tab_ref) else str(_tab_ref).lower()
+                is_atac_tab = (
+                    (isinstance(sheet, str) and 'atac' in sheet.lower())
+                    or 'atac' in _tab_ref_str
+                )
                 skip_i2_len_check = (
                     len2 == 0
                     and (
                         _is_10x_multiome_atac_row(row)
                         or _is_flexbar_row(row)
+                        or is_atac_tab
                     )
                 )
 
@@ -787,6 +899,13 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
 
             if issues:
                 issues_df = pd.DataFrame(issues)
+                try:
+                    issues_df['_lane_sort'] = pd.to_numeric(issues_df['lane'], errors='coerce')
+                    issues_df['_group_sort'] = issues_df['group'].astype(str)
+                    issues_df.sort_values(['_lane_sort', '_group_sort'], inplace=True, na_position='last')
+                    issues_df.drop(columns=['_lane_sort', '_group_sort'], inplace=True)
+                except Exception:
+                    pass
             else:
                 issues_df = pd.DataFrame([{'sheet': 'OK', 'row': '', 'col': '', 'message': 'No issues detected'}])
             issues_df.to_excel(writer, sheet_name='RECOMMENDED_CHANGES', index=False)
@@ -825,7 +944,7 @@ def validate_metadata_and_write_report(metadata_file, out_xlsx=None):
 
             rc_rows = []
             try:
-                for dec_file in sorted(_glob.glob('logs/orientation_decision_*.json')):
+                for dec_file in sorted(_glob.glob('logs/*/orientation_decision_*.json')):
                     config_id = os.path.basename(dec_file).replace('orientation_decision_', '').replace('.json', '')
                     with open(dec_file) as _df:
                         dec = _json.load(_df)

@@ -445,9 +445,9 @@ def generate_miseq_samplesheets(metadata_file, out_dir, run_info_path, run_name)
     
     # Generate sample sheet file
     config_id = "lane1"
-    outfile = os.path.join(out_dir, f"SampleSheet_{config_id}.csv")
-    
-    os.makedirs(out_dir, exist_ok=True)
+    outfile = os.path.join(out_dir, config_id, f"SampleSheet_{config_id}.csv")
+
+    os.makedirs(os.path.join(out_dir, config_id), exist_ok=True)
     
     with open(outfile, 'w') as f:
         f.write("[Header]\n")
@@ -493,10 +493,10 @@ def generate_miseq_samplesheets(metadata_file, out_dir, run_info_path, run_name)
     positions = [f"P{i+1:03d}" for i in range(len(df_samples))]
     map_df['Position'] = positions
     
-    map_file = os.path.join(out_dir, f"renaming_map_{config_id}.csv")
+    map_file = os.path.join(out_dir, config_id, f"renaming_map_{config_id}.csv")
     write_renaming_map(map_df, map_file)
     print(f"Generated renaming map: {map_file}")
-    
+
     return {config_id: outfile}
 
 def get_run_read_lengths(run_info_path):
@@ -533,7 +533,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     try:
         _base = os.path.splitext(os.path.basename(metadata_file))[0]
         out_xlsx = os.path.join('metadata', f"metadata_validation_{_base}.xlsx")
-        _dec_files = glob.glob('logs/orientation_decision_*.json')
+        _dec_files = glob.glob('logs/*/orientation_decision_*.json')
         _needs_regen = (
             not os.path.exists(out_xlsx)
             or os.path.getmtime(metadata_file) > os.path.getmtime(out_xlsx)
@@ -568,7 +568,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                 try:
                     lane = int(float(row.get('Lane', pd.NA)))
                     group = int(float(row.get('Group', pd.NA)))
-                    project = str(row.get('Project name', '')).strip()
+                    project = str(row.get('Project name', '')).strip().replace(' ', '_')
                     if project and project.lower() != 'nan':
                         barcode_list_lookup[(lane, group)] = project
                 except:
@@ -581,6 +581,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     # Sheets like "Barcode List" appear multiple times per lane (multiple groups) and
     # must be excluded so we don't incorrectly override their multi-group assignments.
     sheet_tab_group_lookup = {}
+    flexbar_groups = set()  # (lane, group) pairs whose demux is handled by flexbar, not bcl-convert
     try:
         xl = pd.ExcelFile(metadata_file)
         if 'Summary' in xl.sheet_names:
@@ -596,6 +597,10 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                         tab_norm = tab.replace('_', ' ').strip().lower()
                         if tab_norm and tab_norm != 'nan':
                             tab_counts.setdefault((l, tab_norm), set()).add(g)
+                            # "Flexbar, attachment" tab means flexbar handles demux post-bcl-convert;
+                            # exclude these groups from bcl-convert sample sheets entirely.
+                            if 'flexbar' in tab_norm or 'pareseq' in tab_norm:
+                                flexbar_groups.add((l, g))
                     except:
                         pass
                 # Only include tabs that map to exactly one group per lane
@@ -669,23 +674,29 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                 # Override local group with global group from Summary sheet if available.
                 # Application-specific sheets (e.g., BD Rhapsody_WTA) use local group
                 # numbering that may not match the global group from the Summary sheet.
+                # Only apply when the lane's rows agree on a single group (or have none):
+                # sheets like Barcode List carry multi-group data with correct global
+                # numbering and must not be collapsed to the Summary's single-group entry.
                 tab_norm = str(sheet).replace('_', ' ').strip().lower()
                 for lane_val in sheet_samples['Lane'].unique():
                     try:
                         l = int(float(lane_val))
                         if (l, tab_norm) in sheet_tab_group_lookup:
                             global_grp = sheet_tab_group_lookup[(l, tab_norm)]
-                            sheet_samples.loc[sheet_samples['Lane'] == lane_val, 'Group'] = global_grp
+                            lane_mask = sheet_samples['Lane'] == lane_val
+                            lane_groups = sheet_samples.loc[lane_mask, 'Group'].dropna().unique()
+                            if len(lane_groups) <= 1:
+                                sheet_samples.loc[lane_mask, 'Group'] = global_grp
                     except:
                         pass
 
                 # Project
                 if 'Project name' in df.columns:
                     df['Project name'] = df['Project name'].ffill()
-                    sheet_samples['Project'] = df['Project name']
+                    sheet_samples['Project'] = df['Project name'].astype(str).str.strip().str.replace(' ', '_', regex=False)
                 elif 'Sample_Project' in df.columns:
                     df['Sample_Project'] = df['Sample_Project'].ffill()
-                    sheet_samples['Project'] = df['Sample_Project']
+                    sheet_samples['Project'] = df['Sample_Project'].astype(str).str.strip().str.replace(' ', '_', regex=False)
                 else:
                     sheet_samples['Project'] = pd.NA
                 
@@ -755,7 +766,21 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
         return {}
         
     df = all_samples
-    
+
+    # Remove flexbar-handled groups: their reads land in Undetermined and are
+    # demuxed by flexbar_per_config, so they must not appear in bcl-convert sheets.
+    if flexbar_groups and 'Lane' in df.columns and 'Group' in df.columns:
+        def _is_flexbar_row(row):
+            try:
+                return (int(float(row['Lane'])), int(float(row['Group']))) in flexbar_groups
+            except:
+                return False
+        flexbar_mask = df.apply(_is_flexbar_row, axis=1)
+        if flexbar_mask.any():
+            print(f"Excluding {flexbar_mask.sum()} flexbar-handled samples from bcl-convert sheets: "
+                  f"{sorted(flexbar_groups)}")
+            df = df[~flexbar_mask].reset_index(drop=True)
+
     # Assign Masking to samples based on Lane and Group
     def get_sample_masking(row):
         try:
@@ -774,14 +799,85 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     
     # Ensure output directory exists
     os.makedirs(out_dir, exist_ok=True)
-    
-    global_position_counter = 1
+
+    # Build lane start offsets using all lanes in metadata, so Pxxx stays stable
+    # even when config['lanes'] runs only a subset of lanes.
+    def _is_valid_index(val):
+        if pd.isna(val):
+            return False
+        s = str(val).strip()
+        if not s:
+            return False
+        return s.lower() != 'nan'
+
+    def _parse_i1_i2_lengths(masking):
+        i1_len = None
+        i2_len = None
+        try:
+            for p in [x.strip() for x in str(masking).split(',') if x and str(x).strip()]:
+                if ':' not in p:
+                    continue
+                t, l = p.split(':', 1)
+                t = t.strip().upper()
+                l = int(str(l).strip())
+                if t == 'I1':
+                    i1_len = l
+                elif t == 'I2':
+                    i2_len = l
+        except Exception:
+            pass
+        return i1_len, i2_len
+
+    def _prepare_lane_df(raw_df, lane):
+        lane_prepped = raw_df[raw_df['Lane'] == lane].copy()
+
+        # Normalize I2-only rows: move barcode index -> index2 when I1 is disabled.
+        if 'Masking' in lane_prepped.columns and 'index' in lane_prepped.columns and 'index2' in lane_prepped.columns:
+            for ridx, row in lane_prepped.iterrows():
+                i1_len, i2_len = _parse_i1_i2_lengths(row.get('Masking', ''))
+                if i1_len == 0 and (i2_len or 0) > 0:
+                    idx1 = row.get('index', '')
+                    idx2 = row.get('index2', '')
+                    if _is_valid_index(idx1) and not _is_valid_index(idx2):
+                        lane_prepped.at[ridx, 'index2'] = str(idx1).strip()
+                        lane_prepped.at[ridx, 'index'] = ""
+
+        valid_indices = lane_prepped.apply(
+            lambda r: _is_valid_index(r.get('index', '')) or _is_valid_index(r.get('index2', '')),
+            axis=1
+        )
+        if valid_indices.any():
+            lane_prepped = lane_prepped[valid_indices]
+
+        for _col in ['index', 'index2']:
+            if _col in lane_prepped.columns:
+                lane_prepped[_col] = lane_prepped[_col].apply(
+                    lambda x: '' if pd.isna(x) or str(x).strip().lower() == 'nan' else str(x).strip()
+                )
+
+        lane_prepped = lane_prepped.drop_duplicates(subset=['Lane', 'Project', 'index', 'index2'], keep='first')
+
+        # Remove projects that are demuxed post-hoc (not present in renaming maps).
+        if 'Project' in lane_prepped.columns:
+            lane_prepped = lane_prepped[
+                ~lane_prepped['Project'].astype(str).str.contains('flexbar|pareseq|fqtk', case=False, na=False, regex=True)
+            ]
+
+        return lane_prepped.reset_index(drop=True)
+
+    lane_position_start = {}
+    _position_counter = 1
+    all_lanes_for_positioning = sorted({int(float(l)) for l in df['Lane'].dropna().unique()})
+    for lane_for_position in all_lanes_for_positioning:
+        lane_position_start[lane_for_position] = _position_counter
+        _position_counter += len(_prepare_lane_df(df, lane_for_position))
 
     for config in lane_configs:
         lane = config['lane']
         config_id = config['id']
         # Filter by Lane only — multiple masking groups are merged into one SampleSheet
-        lane_df = df[df['Lane'] == lane].copy()
+        lane_df = _prepare_lane_df(df, lane)
+        lane_position_counter = lane_position_start.get(lane, 1)
         # Determine if this config comes from a special ATAC sheet (allow both space and underscore)
         # that should preserve index-read handling.
         special_atac_index_reads = False
@@ -941,10 +1037,27 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
         # Target: Project,Lane,Sample_ID,Sample_Name,index,index2,Sample_Project
         
         ss_data = pd.DataFrame()
-        
+
         ss_data['Lane'] = lane_df['Lane']
-        ss_data['Project'] = lane_df['Project']
-        ss_data['Sample_Project'] = lane_df['Project']
+        # Sanitize project names for DRAGEN: only allow alphanumeric, hyphen, underscore.
+        # Replace other characters with underscore and prevent ambiguous names like 'Undetermined'.
+        def _sanitize_project_name(v):
+            try:
+                if pd.isna(v):
+                    return ''
+                s = str(v).strip()
+                # Replace any character not in A-Z a-z 0-9 - _ with '_'
+                s = re.sub(r'[^a-zA-Z0-9\-_]', '_', s)
+                if s == '':
+                    return ''
+                if s.lower() == 'undetermined':
+                    return 'Project_Undetermined'
+                return s
+            except Exception:
+                return str(v)
+
+        ss_data['Project'] = lane_df['Project'].apply(_sanitize_project_name)
+        ss_data['Sample_Project'] = ss_data['Project']
         
         if 'Sample_Name' in lane_df.columns:
             # Fill missing sample names with a default
@@ -1104,7 +1217,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
             return str(seq).translate(comp)[::-1]
 
         if 'Sample_Project' in ss_data.columns:
-            flexbar_mask = ss_data['Sample_Project'].str.contains('flexbar', case=False, na=False)
+            flexbar_mask = ss_data['Sample_Project'].str.contains('flexbar|pareseq', case=False, na=False, regex=True)
             if flexbar_mask.any():
                 # Write barcode FASTA (R1-direction) before removing flexbar rows from ss_data.
                 # FLEXBAR_CONFIGS in Snakefile detects this file to trigger inline_demux rules.
@@ -1122,6 +1235,28 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                 lane_df = lane_df[~flexbar_mask].reset_index(drop=True)
                 override_cycles_list = [oc for oc, fb in zip(override_cycles_list, flexbar_mask.values) if not fb]
 
+        # fqtk samples are demultiplexed post-hoc from Undetermined reads using fqtk
+        # (i7-only barcode matching via I1 reads).  Remove them from the DRAGEN sheet
+        # and write metadata/fqtk_barcodes_{config_id}.tsv so the Snakefile can detect
+        # the config and build FQTK_CONFIGS / FQTK_CONFIG_RENAMING_MAP at DAG time.
+        if 'Sample_Project' in ss_data.columns:
+            fqtk_mask = ss_data['Sample_Project'].str.contains('fqtk', case=False, na=False)
+            if fqtk_mask.any():
+                fqtk_tsv_path = os.path.join("metadata", f"fqtk_barcodes_{config_id}.tsv")
+                os.makedirs("metadata", exist_ok=True)
+                with open(fqtk_tsv_path, 'w') as tf:
+                    tf.write("sample_id\tbarcode\n")
+                    for _, row in ss_data[fqtk_mask].iterrows():
+                        name = str(row.get('Sample_Name', '')).strip()
+                        i1 = str(row.get('index', '') or '').strip()
+                        i1 = '' if i1.lower() in ('nan', '') else i1
+                        if name and i1:
+                            tf.write(f"{name}\t{i1}\n")
+                print(f"Generated {fqtk_tsv_path}")
+                ss_data = ss_data[~fqtk_mask].reset_index(drop=True)
+                lane_df = lane_df[~fqtk_mask].reset_index(drop=True)
+                override_cycles_list = [oc for oc, fq in zip(override_cycles_list, fqtk_mask.values) if not fq]
+
         # Reorder columns
         cols = ['Lane', 'Sample_ID', 'Sample_Name', 'index', 'index2', 'Sample_Project', 'OverrideCycles']
         # Add missing cols if any
@@ -1131,7 +1266,8 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
 
         ss_data = ss_data[cols]
         
-        outfile = os.path.join(out_dir, f"SampleSheet_{config_id}.csv")
+        outfile = os.path.join(out_dir, config_id, f"SampleSheet_{config_id}.csv")
+        os.makedirs(os.path.join(out_dir, config_id), exist_ok=True)
         with open(outfile, 'w') as f:
             f.write("[Header]\n")
             f.write("FileFormatVersion,2\n")
@@ -1236,14 +1372,14 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     return str(val)
             map_df['Group'] = lane_df['Group'].apply(format_group).values
             
-            # Add Position (P001, P002, etc.)
+            # Add Position (P001, P002, etc.) using global lane offsets
             positions = []
             for _ in range(len(ss_data)):
-                positions.append(f"P{global_position_counter:03d}")
-                global_position_counter += 1
+                positions.append(f"P{lane_position_counter:03d}")
+                lane_position_counter += 1
             map_df['Position'] = positions
             
-            map_file = os.path.join(out_dir, f"renaming_map_{config_id}.csv")
+            map_file = os.path.join(out_dir, config_id, f"renaming_map_{config_id}.csv")
             write_renaming_map(map_df, map_file)
         except Exception as e:
             print(f"Error generating renaming map for {config_id}: {e}")
@@ -1308,12 +1444,24 @@ def get_order_id_configs(sample_sheets_dict):
     order_id_to_projects = {}
     
     for config_id in sample_sheets_dict:
-        map_path = f"results/renaming_map_{config_id}.csv"
+        map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
         if os.path.exists(map_path):
             try:
-                df = pd.read_csv(map_path)
+                import time as _time
+                df = None
+                for _attempt in range(3):
+                    try:
+                        df = pd.read_csv(map_path)
+                        if not df.empty:
+                            break
+                    except Exception:
+                        pass
+                    _time.sleep(2)
+                if df is None or df.empty:
+                    print(f"Warning: {map_path} was empty or unreadable after retries, skipping")
+                    continue
                 df['Sample_Project'] = df['Sample_Project'].astype(str)
-                
+
                 # Extract lane from config_id for lane-aware order lookup
                 lane_match = re.match(r'lane(\d+)', config_id)
                 config_lane = int(lane_match.group(1)) if lane_match else 0
@@ -1357,7 +1505,7 @@ def get_order_id_configs(sample_sheets_dict):
 def get_project_lane_pairs(sample_sheets_dict):
     pairs = set()
     for config_id in sample_sheets_dict:
-        map_path = f"results/renaming_map_{config_id}.csv"
+        map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
         if os.path.exists(map_path):
             try:
                 df = pd.read_csv(map_path)
@@ -1379,7 +1527,7 @@ def get_project_lane_pairs(sample_sheets_dict):
 def get_config_project_pairs(sample_sheets_dict):
     pairs = set()
     for config_id in sample_sheets_dict:
-        map_path = f"results/renaming_map_{config_id}.csv"
+        map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
         if os.path.exists(map_path):
             try:
                 df = pd.read_csv(map_path)
@@ -1473,14 +1621,14 @@ def get_project_plot_targets(project, lane_filter=None, order_id=None):
                     stem = f"{run}-L{lane_val}-G{group}-{position}-{barcode}"
                     path = f"{orig_project}/{stem}"
 
-                targets.append(f"results/fastp_plots/{config_id}/{path}-mean_phred.png")
-                targets.append(f"results/fastp_plots/{config_id}/{path}-base_comp.png")
+                targets.append(f"results/{config_id}/{path}-mean_phred.png")
+                targets.append(f"results/{config_id}/{path}-base_comp.png")
         except Exception as e:
             print(f"Error building plot targets for {project} in {config_id}: {e}")
     return targets
 
 def read_sample_sheet(config_id):
-    sheet_path = f"results/SampleSheet_{config_id}.csv"
+    sheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
     if not os.path.exists(sheet_path):
         return None
     
@@ -1505,6 +1653,7 @@ def read_sample_sheet(config_id):
 def _fastp_row_path(row, idx):
     project = str(row.get('Sample_Project', '')).strip()
     sample_name = str(row.get('Sample_Name', '')).strip()
+    output_project = PROJECT_RENAME_MAP.get((str(row.get('Run', '')).strip(), project), project)
 
     run = str(row.get('Run', '')).strip()
     lane = int(row.get('Lane', 0))
@@ -1532,14 +1681,14 @@ def _fastp_row_path(row, idx):
     if is_parse_or_10x(project):
         if not sample_name or sample_name.lower() == 'nan':
             return None
-        return f"{project}/{sample_name}" if project and project.lower() != 'nan' else sample_name
+        return f"{output_project}/{sample_name}" if output_project and output_project.lower() != 'nan' else sample_name
 
     stem = f"{run}-L{lane}-G{group}-{position}-{barcode}"
-    return f"{project}/{stem}" if project and project.lower() != 'nan' else stem
+    return f"{output_project}/{stem}" if output_project and output_project.lower() != 'nan' else stem
 
 def _fastp_rows_for_config(config_id):
     frames = []
-    map_path = f"results/renaming_map_{config_id}.csv"
+    map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
     if os.path.exists(map_path):
         try:
             frames.append(pd.read_csv(map_path))
@@ -1549,6 +1698,10 @@ def _fastp_rows_for_config(config_id):
     flex_rows = globals().get('FLEXBAR_CONFIG_RENAMING_MAP', {}).get(config_id, [])
     if flex_rows:
         frames.append(pd.DataFrame(flex_rows))
+
+    fqtk_rows = globals().get('FQTK_CONFIG_RENAMING_MAP', {}).get(config_id, [])
+    if fqtk_rows:
+        frames.append(pd.DataFrame(fqtk_rows))
 
     if not frames:
         return None
@@ -1563,7 +1716,7 @@ def get_fastp_targets(wildcards):
             for idx, row in df.iterrows():
                 path = _fastp_row_path(row, idx)
                 if path:
-                    targets.append(f"results/fastp/{config_id}/{path}.json")
+                    targets.append(f"results/{config_id}/{path}.fastp.json")
             return list(dict.fromkeys(targets))
         except Exception as e:
             print(f"Error building fastp targets for {config_id}: {e}")
@@ -1585,7 +1738,7 @@ def get_fastp_sample_input(wildcards):
     sample_path = wildcards.sample_path
 
     # Try to use renaming map first, then injected flexbar rows.
-    map_path = f"results/renaming_map_{config_id}.csv"
+    map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
     import time as _time
     df = None
     if os.path.exists(map_path):
@@ -1606,8 +1759,13 @@ def get_fastp_sample_input(wildcards):
         if flex_rows:
             df = pd.concat([df, pd.DataFrame(flex_rows)], ignore_index=True)
 
+    fqtk_rows = globals().get('FQTK_CONFIG_RENAMING_MAP', {}).get(config_id, [])
+    if fqtk_rows:
+        fqtk_df = pd.DataFrame(fqtk_rows)
+        df = pd.concat([df, fqtk_df], ignore_index=True) if df is not None else fqtk_df
+
     if df is None:
-        raise ValueError(f"Renaming map not found and no flexbar rows available: {config_id}")
+        raise ValueError(f"Renaming map not found and no flexbar/fqtk rows available: {config_id}")
 
     try:
         for idx, row in df.iterrows():
@@ -1663,8 +1821,8 @@ def get_fastp_plots_targets(wildcards):
     for idx, row in df.iterrows():
         path = _fastp_row_path(row, idx)
         if path:
-            targets.append(f"results/fastp_plots/{config_id}/{path}-mean_phred.png")
-            targets.append(f"results/fastp_plots/{config_id}/{path}-base_comp.png")
+            targets.append(f"results/{config_id}/{path}-mean_phred.png")
+            targets.append(f"results/{config_id}/{path}-base_comp.png")
     return targets
 
 def get_project_fastp_targets(wildcards):
@@ -1686,7 +1844,7 @@ def get_project_fastp_targets(wildcards):
             for idx, row in project_samples.iterrows():
                 path = _fastp_row_path(row, idx)
                 if path:
-                    targets.append(f"results/fastp/{config_id}/{path}.json")
+                    targets.append(f"results/{config_id}/{path}.fastp.json")
         except Exception as e:
             print(f"Error building fastp targets for {project} in {config_id}: {e}")
     return targets
@@ -1702,14 +1860,14 @@ def get_fastp_plots_lane_inputs(wildcards):
     lane = wildcards.lane
     config_id = f"lane{lane}"
     if config_id in CONFIG_IDS:
-        return [f"results/fastp_plots_{config_id}.done"]
+        return [f"results/{config_id}/fastp_plots_{config_id}.done"]
     return []
 
 def get_bcl_convert_fastqs(wildcards):
     import pandas as pd
     import os
     config_id = wildcards.config_id
-    map_path = f"results/renaming_map_{config_id}.csv"
+    map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
     if not os.path.exists(map_path):
         return []
     df = pd.read_csv(map_path)

@@ -39,7 +39,6 @@ if os.path.exists(_PROJECT_CONFIG):
         _project_config = _yaml.safe_load(_f) or {}
     # Merge: project-specific config overrides default config
     config.update(_project_config)
-
 # All config values read AFTER merge - project-specific config takes priority
 
 # Fail fast if required config values are missing or empty
@@ -57,6 +56,7 @@ DATA_DIR = config.get("data_dir", "/staging/nextcloud/NovaseqX/20260115_LH00626_
 TILES = config.get("tiles", "1_1101")
 FLEXBAR_BIN = config.get("flexbar_bin", "")
 USE_ANCIENT = config.get("use_ancient", True)
+KEEP_UNDETERMINED_CONFIGS = " ".join(config.get("keep_undetermined_configs", []))
 
 def maybe_ancient(path):
     return ancient(path) if USE_ANCIENT else path
@@ -104,9 +104,13 @@ detected_lanes = []
 basecalls_path = DATA_DIR + "/Data/Intensities/BaseCalls"
 if os.path.exists(basecalls_path):
     detected_lanes = sorted([
-        int(d[1:]) for d in os.listdir(basecalls_path) 
+        int(d[1:]) for d in os.listdir(basecalls_path)
         if d.startswith("L") and d[1:].isdigit() and os.path.isdir(os.path.join(basecalls_path, d))
     ])
+
+_restrict_lanes = config.get("lanes", [])
+if _restrict_lanes:
+    detected_lanes = [l for l in detected_lanes if l in _restrict_lanes]
 
 # print("detected_lanes:", detected_lanes)
 
@@ -131,7 +135,7 @@ if METADATA_FILE and os.path.exists(METADATA_FILE):
         xl = pd.ExcelFile(METADATA_FILE)
         is_miseq_format = 'Barcode Entries' in xl.sheet_names and 'Summary' not in xl.sheet_names
         IS_MISEQ_FORMAT = is_miseq_format
-        
+
         if is_miseq_format:
             # MiSeq: simple format, assume single lane
             print("Detected MiSeq metadata format")
@@ -272,6 +276,8 @@ if METADATA_FILE and os.path.exists(METADATA_FILE):
             if 'Lane' in df.columns:
                 # Collect unique lanes (masking groups are merged into a single SampleSheet per lane)
                 unique_lanes = sorted(df['Lane'].dropna().apply(lambda x: int(float(x))).unique())
+                if _restrict_lanes:
+                    unique_lanes = [l for l in unique_lanes if l in _restrict_lanes]
                 for lane in unique_lanes:
                     LANE_CONFIGS.append({
                         'lane': lane,
@@ -326,6 +332,8 @@ VALIDATE_CONFIG_ID_PATTERN = "[^/]+" if IS_MISEQ_FORMAT else r"lane\d+"
 ruleorder: validate_barcode_hamming_distances_rc > validate_barcode_hamming_distances
 ruleorder: flexbar_stage_project > bcl_project_done
 ruleorder: flexbar_stage_project > normalize_project_fastq_names
+ruleorder: fqtk_stage_project > bcl_project_done
+ruleorder: fqtk_stage_project > normalize_project_fastq_names
 
 # Build project directory rename map: (config_id, old_project) -> new_folder_name
 # Format: {LabID}_{OrderID}_{library_name}_L{lane}_G{group}
@@ -390,14 +398,21 @@ if not CONFIG_IDS and detected_lanes:
 _preferred_bcl_order = [str(x) for x in config.get("bcl_convert_order", [])]
 _preferred_bcl_order = [cid for cid in _preferred_bcl_order if cid in CONFIG_IDS]
 BCL_CONVERT_ORDER = _preferred_bcl_order + [cid for cid in CONFIG_IDS if cid not in _preferred_bcl_order]
-BCL_CONVERT_PREV = {
-    cid: (BCL_CONVERT_ORDER[i - 1] if i > 0 else None)
-    for i, cid in enumerate(BCL_CONVERT_ORDER)
-}
+# Only chain sequential dependencies when the user explicitly provided an order.
+# An empty bcl_convert_order means "run all lanes in parallel".
+if _preferred_bcl_order:
+    BCL_CONVERT_PREV = {
+        cid: (BCL_CONVERT_ORDER[i - 1] if i > 0 else None)
+        for i, cid in enumerate(BCL_CONVERT_ORDER)
+    }
+else:
+    BCL_CONVERT_PREV = {}
 
 def get_prev_bcl_done(wildcards):
     prev_cid = BCL_CONVERT_PREV.get(wildcards.config_id)
     if not prev_cid:
+        return []
+    if os.path.exists(f".output/{wildcards.config_id}/.done"):
         return []
     return [maybe_ancient(f".output/{prev_cid}/.done")]
 
@@ -439,6 +454,14 @@ for config in LANE_CONFIGS:
     barcode_path = os.path.join("metadata", f"flexbar_barcodes_{config['id']}.txt")
     if os.path.exists(barcode_path):
         FLEXBAR_CONFIGS.append(config['id'])
+
+FQTK_CONFIGS = []
+for config in LANE_CONFIGS:
+    if config['id'] not in CONFIG_IDS:
+        continue
+    fqtk_tsv = os.path.join("metadata", f"fqtk_barcodes_{config['id']}.tsv")
+    if os.path.exists(fqtk_tsv):
+        FQTK_CONFIGS.append(config['id'])
 
 # _CONFIG_PROJECT_PAIRS_RAW keeps the *original* Sample_Project names from the
 # renaming-map CSVs.  These are the names under which fastp JSONs and BCL
@@ -509,7 +532,7 @@ if EXCLUDE_ORDER_IDS:
     CONFIG_PROJECT_PAIRS = [(c, p) for c, p in CONFIG_PROJECT_PAIRS if p not in _exclude_projects]
     PROJECTS = [p for p in PROJECTS if p not in _exclude_projects]
 
-PROJECT_LINK_LOGS = [f"logs/project_link_{config_id}---{project}.log" for config_id, project in CONFIG_PROJECT_PAIRS]
+PROJECT_LINK_LOGS = [f"logs/{config_id}/project_link_{config_id}---{project}.log" for config_id, project in CONFIG_PROJECT_PAIRS]
 
 # Build flexbar order ID map: config_id -> order_id
 # Flexbar projects appear in PROJECT_LOOKUP for a flexbar lane but not in any BCL convert samplesheet.
@@ -527,7 +550,9 @@ for _fconfig in FLEXBAR_CONFIGS:
             if _oid and _oid not in EXCLUDE_ORDER_IDS:
                 FLEXBAR_ORDER_ID_MAP[_fconfig] = _oid
                 FLEXBAR_ORDER_ID_PROJECT[_fconfig] = _proj
-FLEXBAR_CONFIG_BY_ORDER_ID = {v: k for k, v in FLEXBAR_ORDER_ID_MAP.items()}
+FLEXBAR_CONFIG_BY_ORDER_ID = {}  # order_id -> [config_id, ...]
+for _k, _v in FLEXBAR_ORDER_ID_MAP.items():
+    FLEXBAR_CONFIG_BY_ORDER_ID.setdefault(_v, []).append(_k)
 FLEXBAR_ACTIVE_ORDER_IDS = list(FLEXBAR_ORDER_ID_MAP.values())
 FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_ACTIVE_ORDER_IDS]
 
@@ -593,26 +618,102 @@ FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_AC
 ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
 ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
 
+# Build fqtk order ID map: config_id -> order_id
+# fqtk projects appear in PROJECT_LOOKUP for their lane but not in any BCL Convert samplesheet.
+FQTK_ORDER_ID_MAP = {}    # config_id -> order_id
+FQTK_ORDER_ID_PROJECT = {}  # config_id -> original project name from metadata
+for _qconfig in FQTK_CONFIGS:
+    _qlane = int(_qconfig.replace('lane', ''))
+    _qbcl_projs = _bcl_raw_projects_by_config.get(_qconfig, set())
+    for (_ql, _), _qproj in PROJECT_LOOKUP.items():
+        if _ql == _qlane and _qproj not in _qbcl_projs:
+            _qoid = PROJECT_ORDER_ID.get((_qproj, _qlane), '')
+            if _qoid and _qoid not in EXCLUDE_ORDER_IDS:
+                FQTK_ORDER_ID_MAP[_qconfig] = _qoid
+                FQTK_ORDER_ID_PROJECT[_qconfig] = _qproj
+
+# Build fqtk renaming map: config_id -> list of row dicts (one per barcode/sample).
+# The TSV has a header row (sample_id\tbarcode) followed by data rows.
+FQTK_CONFIG_RENAMING_MAP = {}
+for _qconfig, _qorder_id in FQTK_ORDER_ID_MAP.items():
+    _qlane = int(_qconfig.replace('lane', ''))
+    _qtsv_path = f"metadata/fqtk_barcodes_{_qconfig}.tsv"
+    if not os.path.exists(_qtsv_path):
+        continue
+    _qproj = FQTK_ORDER_ID_PROJECT.get(_qconfig)
+    if not _qproj:
+        continue
+    _qgroup = None
+    for (_ql, _qg), _qp in PROJECT_LOOKUP.items():
+        if _ql == _qlane and _qp == _qproj:
+            _qgroup = _qg
+            break
+    if _qgroup is None:
+        continue
+    _qrows = []
+    _qdata_idx = 0
+    with open(_qtsv_path) as _qtf:
+        for _qi, _qtline in enumerate(_qtf):
+            if _qi == 0:
+                continue  # skip header
+            _qparts = _qtline.strip().split('\t')
+            if len(_qparts) >= 2 and _qparts[0].strip() and _qparts[1].strip():
+                _qrows.append({
+                    'Sample_Project': _qproj,
+                    'Sample_Name': _qparts[0].strip(),
+                    'Run': LIBRARY,
+                    'Lane': _qlane,
+                    'Group': _qgroup,
+                    'index': _qparts[1].strip(),
+                    'index2': '',
+                    'Position': f'P{_qdata_idx+1:03d}',
+                })
+                _qdata_idx += 1
+    if _qrows:
+        FQTK_CONFIG_RENAMING_MAP[_qconfig] = _qrows
+
+# Inject fqtk projects into CONFIG_PROJECT_PAIRS, ORDER_ID_CONFIGS, ACTIVE_ORDER_IDS
+for _qconfig, _qrows in FQTK_CONFIG_RENAMING_MAP.items():
+    _qorig_proj = _qrows[0]['Sample_Project']
+    _qrenamed_proj = PROJECT_RENAME_MAP.get((_qconfig, _qorig_proj), _qorig_proj)
+    _qpair = (_qconfig, _qrenamed_proj)
+    if _qpair not in CONFIG_PROJECT_PAIRS:
+        CONFIG_PROJECT_PAIRS.append(_qpair)
+    _projects_in_pairs.add(_qrenamed_proj)
+    _qorder_id = FQTK_ORDER_ID_MAP[_qconfig]
+    if _qorder_id not in ORDER_ID_CONFIGS:
+        ORDER_ID_CONFIGS[_qorder_id] = set()
+    elif not isinstance(ORDER_ID_CONFIGS.get(_qorder_id), set):
+        ORDER_ID_CONFIGS[_qorder_id] = set(ORDER_ID_CONFIGS.get(_qorder_id, []))
+    ORDER_ID_CONFIGS[_qorder_id].add(_qrenamed_proj)
+    if _qorder_id not in ACTIVE_ORDER_IDS:
+        ACTIVE_ORDER_IDS.append(_qorder_id)
+
+# Rebuild order-level targets to include newly added fqtk orders
+ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
+ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
+
 # print("CONFIG_PROJECT_PAIRS:", CONFIG_PROJECT_PAIRS)
 
 rule all:
     input:
-        expand("results/fastp_plots_{config_id}.done", config_id=CONFIG_IDS),
+        expand("results/{config_id}/fastp_plots_{config_id}.done", config_id=CONFIG_IDS),
         expand(".output/{config_id}/.done", config_id=CONFIG_IDS),
         expand("output/{config_id}/{project}/md5sums.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         ORDER_ID_REPORTS,
         ORDER_ID_MD5S,
-        expand("results/fastp_plots_summary_lane{lane}.done", lane=detected_lanes),
+        expand("results/{config_id}/fastp_plots_summary_lane{lane}.done", config_id=CONFIG_IDS, lane=detected_lanes),
         expand("results/undetermined_indices/{config_id}.csv", config_id=CONFIG_IDS),
-        expand("results/read_counts_{project}.csv", project=PROJECTS),
-        # expand("logs/project_link_{config_id}_{project}.log", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
-        expand("logs/project_links_{config_id}---{project}.yaml", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        expand("results/{config_id}/{project}/read_counts_{project}.csv", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        # expand("logs/{config_id}/project_link_{config_id}_{project}.log", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        expand("logs/{config_id}/project_links_{config_id}---{project}.yaml", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         f"results/{LIBRARY}-count.csv",
         f"Reports/{LIBRARY}_read_counts_email.done",
         expand("Reports/order_{order_id}/email_sent.done", order_id=ACTIVE_ORDER_IDS + FLEXBAR_ACTIVE_ORDER_IDS),
-        expand("logs/verify_project_link_{config_id}---{project}.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        expand("logs/{config_id}/verify_project_link_{config_id}---{project}.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         ([VALIDATION_XLSX] if VALIDATION_XLSX else []),
-        expand("results/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
+        expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
+        expand("results/{config_id}/fqtk_{config_id}.done", config_id=FQTK_CONFIGS),
         # "logs/rsync_to_external_drive.done",
         # "results/check_index_rc_swap.txt"
     benchmark:
@@ -636,7 +737,7 @@ rule report_order_id:
             )
         ],
         links_yamls = lambda wildcards: [
-            f"logs/project_links_{c}---{p}.yaml"
+            f"logs/{c}/project_links_{c}---{p}.yaml"
             for c, p in CONFIG_PROJECT_PAIRS
             if p in ORDER_ID_CONFIGS.get(wildcards.order_id, [])
             and (
@@ -655,8 +756,8 @@ rule report_order_id:
     params:
         order_id = "{order_id}",
         output_base = "output",
-        fastp_plots_base = "results/fastp_plots",
-        fastp_base = "results/fastp",
+        fastp_plots_base = "results",
+        fastp_base = "results",
         report_dir = "Reports/order_{order_id}"
     run:
         import subprocess
@@ -698,7 +799,7 @@ rule report_order_id:
             # This handles Snakemake subprocess mode where named input lambdas
             # may resolve to [] even though the files exist on disk.
             import glob as _glob
-            links_yaml_files = sorted(_glob.glob(f"logs/project_links_*---*_{order_id}_*.yaml"))
+            links_yaml_files = sorted(_glob.glob(f"logs/**/project_links_*---*_{order_id}_*.yaml", recursive=True))
         for yaml_path in links_yaml_files:
             if os.path.exists(yaml_path):
                 with open(yaml_path) as _yf:
@@ -741,10 +842,10 @@ rule report_order_id:
                 )
             project_name_map[_proj] = _orig
 
-        # Flexbar projects are injected into CONFIG_PROJECT_PAIRS after the main
+        # Flexbar/fqtk projects are injected into CONFIG_PROJECT_PAIRS after the main
         # rename map is built, so they are not present in _CONFIG_PROJECT_PAIRS_RAW.
-        # Add an explicit renamed->original mapping here so generate_report.py can
-        # find the fastp JSONs under the original flexbar project directory.
+        # Add explicit renamed->original mappings here so generate_report.py can
+        # find the fastp JSONs under the original project directory.
         for _fconfig in FLEXBAR_CONFIGS:
             _forig = FLEXBAR_ORDER_ID_PROJECT.get(_fconfig)
             if not _forig:
@@ -752,6 +853,13 @@ rule report_order_id:
             _frenamed = PROJECT_RENAME_MAP.get((_fconfig, _forig), _forig)
             if _frenamed in projects:
                 project_name_map[_frenamed] = _forig
+        for _qconfig in FQTK_CONFIGS:
+            _qorig = FQTK_ORDER_ID_PROJECT.get(_qconfig)
+            if not _qorig:
+                continue
+            _qrenamed = PROJECT_RENAME_MAP.get((_qconfig, _qorig), _qorig)
+            if _qrenamed in projects:
+                project_name_map[_qrenamed] = _qorig
         project_name_map_json = _json.dumps(project_name_map)
 
         # Open log file
@@ -841,10 +949,10 @@ rule report_order_id:
 rule flexbar_project_link:
     """Create a Nextcloud share for the flexbar output directory and record the link."""
     input:
-        done = "results/flexbar_{config_id}.done"
+        done = "results/{config_id}/flexbar_{config_id}.done"
     output:
-        link_log  = "logs/flexbar_project_link_{config_id}.log",
-        yaml_file = "logs/flexbar_project_links_{config_id}.yaml"
+        link_log  = "logs/{config_id}/flexbar_project_link_{config_id}.log",
+        yaml_file = "logs/{config_id}/flexbar_project_links_{config_id}.yaml"
     benchmark:
         "benchmarks/flexbar_project_link_{config_id}.bench"
     wildcard_constraints:
@@ -1007,11 +1115,64 @@ rule flexbar_project_link:
                 f.write(f"PDF STDERR: {pdf_result.stderr}\n")
 
 
+rule collect_flexbar_report_extras:
+    input:
+        done = "results/{config_id}/flexbar_{config_id}.done"
+    output:
+        flexbar_log = "Reports/order_{order_id}/flexbarOut_{config_id}.log",
+        barcodes    = "Reports/order_{order_id}/flexbar_barcodes_{config_id}.txt",
+        filesizes   = "Reports/order_{order_id}/flexbar_filesizes_{config_id}.txt"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    run:
+        import shutil, os, re
+        config_id = wildcards.config_id
+        os.makedirs(f"Reports/order_{wildcards.order_id}", exist_ok=True)
+        shutil.copy(f"output/{config_id}/flexbar/flexbarOut.log", output.flexbar_log)
+
+        # Build sample_name -> renamed stem mapping from FLEXBAR_CONFIG_RENAMING_MAP
+        name_map = {}
+        for _row in FLEXBAR_CONFIG_RENAMING_MAP.get(config_id, []):
+            _sname = _row['Sample_Name']
+            _idx1 = str(_row.get('index', '') or '')
+            _idx2 = str(_row.get('index2', '') or '')
+            _bc = f"{_idx1}-{_idx2}" if _idx2 and _idx2.lower() != 'nan' else _idx1
+            name_map[_sname] = f"{_row['Run']}-L{_row['Lane']}-G{_row['Group']}-{_row['Position']}-{_bc}"
+
+        # Write barcodes file with renamed sample names in column 1
+        with open(f"metadata/flexbar_barcodes_{config_id}.txt") as _fin, \
+             open(output.barcodes, 'w') as _fout:
+            for _line in _fin:
+                _parts = _line.rstrip('\n').split('\t')
+                if _parts and _parts[0].strip() in name_map:
+                    _parts[0] = name_map[_parts[0].strip()]
+                _fout.write('\t'.join(_parts) + '\n')
+
+        # Write filesizes file with renamed FASTQ names
+        with open(f"output/{config_id}/flexbar/size.txt") as _fin, \
+             open(output.filesizes, 'w') as _fout:
+            for _line in _fin:
+                _parts = _line.rstrip('\n').split('\t')
+                if len(_parts) >= 2:
+                    _m = re.match(r'flexbarOut_barcode_(.+?)(_R2)?\.fastq\.gz$', _parts[1].strip())
+                    if _m:
+                        _sname, _r2 = _m.group(1), _m.group(2)
+                        _rtype = 'R2' if _r2 else 'R1'
+                        if _sname in name_map:
+                            _parts[1] = f"{name_map[_sname]}-{_rtype}.fastq.gz"
+                _fout.write('\t'.join(_parts) + '\n')
+
+
 rule send_order_email:
     input:
         html = "Reports/order_{order_id}/index.html",
-        md5 = "Reports/order_{order_id}/md5sums.txt",
-        pdf = "Reports/order_{order_id}/Download_Instructions.pdf"
+        md5  = "Reports/order_{order_id}/md5sums.txt",
+        pdf  = "Reports/order_{order_id}/Download_Instructions.pdf",
+        flexbar_extras = lambda wildcards: [
+            f"Reports/order_{wildcards.order_id}/{prefix}_{cid}.{ext}"
+            for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(wildcards.order_id, [])
+            for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]
+        ]
     output:
         touch("Reports/order_{order_id}/email_sent.done")
     log:
@@ -1019,13 +1180,30 @@ rule send_order_email:
     benchmark:
         "benchmarks/send_order_email_{order_id}.bench"
     params:
-        script = "src/send_email.py",
-        sender = EMAIL_SENDER,
+        script   = "src/send_email.py",
+        sender   = EMAIL_SENDER,
         receiver = EMAIL_RECIPIENT,
         cc_email = EMAIL_CC,
-        subject = lambda wildcards: f"Sequencing Report for Order {wildcards.order_id}"
-    shell:
-        "python3 src/send_email_retry.py {params.script} {params.sender} {params.receiver} \"{params.subject}\" {input.html} \"{input.md5};{input.pdf}\" {params.cc_email} {wildcards.order_id} > {log} 2>&1 && touch {output}"
+        subject  = lambda wildcards: f"Sequencing Report for Order {wildcards.order_id}"
+    run:
+        import subprocess, os
+        order_id = wildcards.order_id
+        attachments = f"{input.md5};{input.pdf}"
+        for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(order_id, []):
+            for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]:
+                extra = f"Reports/order_{order_id}/{prefix}_{cid}.{ext}"
+                if os.path.exists(extra):
+                    attachments += f";{extra}"
+        cmd = [
+            "python3", "src/send_email_retry.py",
+            params.script, params.sender, params.receiver,
+            params.subject, input.html, attachments,
+            params.cc_email, order_id
+        ]
+        with open(log[0], "w") as logf:
+            result = subprocess.run(cmd, stdout=logf, stderr=logf)
+        if result.returncode != 0:
+            raise RuntimeError(f"Email send failed (see {log[0]})")
 
 rule fastp_sample:
     input:
@@ -1033,10 +1211,10 @@ rule fastp_sample:
             lambda orig: f"output/{wildcards.config_id}/{PROJECT_RENAME_MAP.get((wildcards.config_id, orig), orig)}/.fastq_names_done"
         )(wildcards.sample_path.split('/')[0])
     output:
-        json = "results/fastp/{config_id}/{sample_path}.json",
-        html = "results/fastp/{config_id}/{sample_path}.html"
+        json = "results/{config_id}/{sample_path}.fastp.json",
+        html = "results/{config_id}/{sample_path}.fastp.html"
     log:
-        "logs/fastp_sample/{config_id}/{sample_path}.log"
+        "logs/{config_id}/fastp_sample/{config_id}/{sample_path}.log"
     benchmark:
         "benchmarks/fastp_sample_{config_id}_{sample_path}.bench"
     wildcard_constraints:
@@ -1065,7 +1243,7 @@ rule fastp_sample:
 rule normalize_project_fastq_names:
     input:
         done = "output/{config_id}/{project}/.project_done",
-        renaming_map = "results/renaming_map_{config_id}.csv"
+        renaming_map = "results/{config_id}/renaming_map_{config_id}.csv"
     output:
         sentinel = touch("output/{config_id}/{project}/.fastq_names_done")
     wildcard_constraints:
@@ -1073,6 +1251,7 @@ rule normalize_project_fastq_names:
         project = ".+"
     run:
         import os
+        import shutil
 
         config_id = wildcards.config_id
         new_project = wildcards.project
@@ -1087,6 +1266,63 @@ rule normalize_project_fastq_names:
         lowered = check_name.lower()
         if any(token in lowered for token in ["10x", "parse", "bd"]):
             return
+
+        def _materialize_and_backlink(src_abs, dst_abs):
+            if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
+                os.unlink(dst_abs)
+            if not os.path.exists(dst_abs):
+                try:
+                    os.link(src_abs, dst_abs)
+                except Exception:
+                    shutil.copy2(src_abs, dst_abs)
+            if os.path.lexists(src_abs):
+                try:
+                    if os.path.islink(src_abs) and os.path.realpath(src_abs) == os.path.realpath(dst_abs):
+                        return
+                    os.unlink(src_abs)
+                except Exception:
+                    pass
+            os.symlink(os.path.abspath(dst_abs), src_abs)
+
+        _all_flex_rows = globals().get('FLEXBAR_CONFIG_RENAMING_MAP', {}).get(config_id, [])
+        _flexbar_orig_proj = globals().get('FLEXBAR_ORDER_ID_PROJECT', {}).get(config_id, '')
+        _flexbar_proj = PROJECT_RENAME_MAP.get((config_id, _flexbar_orig_proj), _flexbar_orig_proj)
+        flex_rows = _all_flex_rows if new_project == _flexbar_proj else []
+        for idx, row in enumerate(flex_rows):
+            sample_name = str(row.get("Sample_Name", "")).strip()
+            if not sample_name or sample_name.lower() == "nan":
+                continue
+
+            run_name = str(row.get("Run", "")).strip()
+            lane = int(row.get("Lane", 0))
+            try:
+                group = str(int(float(row.get("Group", 0))))
+            except Exception:
+                group = str(row.get("Group", "")).strip()
+            if not group or group.lower() == "nan":
+                group = "Undetermined"
+
+            index1 = str(row.get("index", "")).strip()
+            if index1.lower() == "nan":
+                index1 = ""
+            index2 = str(row.get("index2", "")).strip()
+            if index2.lower() == "nan":
+                index2 = ""
+
+            barcode = f"{index1}-{index2}" if index2 else index1
+            position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
+            stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
+
+            src_r1 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}.fastq.gz")
+            dst_r1 = os.path.abspath(f"{project_dir}/{stem}-R1.fastq.gz")
+            if os.path.exists(src_r1) or os.path.islink(src_r1):
+                _materialize_and_backlink(src_r1, dst_r1)
+
+            if NUM_READS > 1:
+                src_r2 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}_R2.fastq.gz")
+                dst_r2 = os.path.abspath(f"{project_dir}/{stem}-R2.fastq.gz")
+                if os.path.exists(src_r2) or os.path.islink(src_r2):
+                    _materialize_and_backlink(src_r2, dst_r2)
 
         df = pd.read_csv(input.renaming_map)
         project_rows = df[df["Sample_Project"].astype(str).str.strip() == old_project]
@@ -1136,9 +1372,9 @@ rule fastp_per_config:
     input:
         get_fastp_targets
     output:
-        touch("results/fastp_{config_id}.done")
+        touch("results/{config_id}/fastp_{config_id}.done")
     log:
-        "logs/fastp_per_config_{config_id}.log"
+        "logs/{config_id}/fastp_per_config_{config_id}.log"
     benchmark:
         "benchmarks/fastp_per_config_{config_id}.bench"
     wildcard_constraints:
@@ -1146,12 +1382,12 @@ rule fastp_per_config:
 
 rule fastp_plots_sample:
     input:
-        json = "results/fastp/{config_id}/{sample_path}.json"
+        json = "results/{config_id}/{sample_path}.fastp.json"
     output:
-        mean = "results/fastp_plots/{config_id}/{sample_path}-mean_phred.png",
-        base = "results/fastp_plots/{config_id}/{sample_path}-base_comp.png"
+        mean = "results/{config_id}/{sample_path}-mean_phred.png",
+        base = "results/{config_id}/{sample_path}-base_comp.png"
     log:
-        "logs/fastp_plots_sample/{config_id}/{sample_path}.log"
+        "logs/{config_id}/fastp_plots_sample/{config_id}/{sample_path}.log"
     benchmark:
         "benchmarks/fastp_plots_sample_{config_id}_{sample_path}.bench"
     wildcard_constraints:
@@ -1175,105 +1411,70 @@ rule fastp_plots_per_config:
     input:
         get_fastp_plots_targets
     output:
-        touch("results/fastp_plots_{config_id}.done")
+        touch("results/{config_id}/fastp_plots_{config_id}.done")
     log:
-        "logs/fastp_plots_per_config_{config_id}.log"
+        "logs/{config_id}/fastp_plots_per_config_{config_id}.log"
     benchmark:
         "benchmarks/fastp_plots_per_config_{config_id}.bench"
     wildcard_constraints:
         config_id = "lane.*"
 
-def get_project_done_sentinels(wildcards):
-    target_projects = {wildcards.project}
-    for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
-        if old_project == wildcards.project:
-            target_projects.add(new_project)
-        elif new_project == wildcards.project:
-            target_projects.add(old_project)
-
-    return [
-        f"output/{config_id}/{project}/.project_done"
-        for config_id, project in CONFIG_PROJECT_PAIRS
-        if project in target_projects
-    ]
-
-
-def get_project_bcl_done_sentinels(wildcards):
-    target_projects = {wildcards.project}
-    for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
-        if old_project == wildcards.project:
-            target_projects.add(new_project)
-        elif new_project == wildcards.project:
-            target_projects.add(old_project)
-
-    return [
-        f".output/{config_id}/.done"
-        for config_id, project in CONFIG_PROJECT_PAIRS
-        if project in target_projects
-    ]
 
 rule summarize_project_reads:
     input:
-        project_done = get_project_done_sentinels,
-        bcl_done = get_project_bcl_done_sentinels
+        project_done = "output/{config_id}/{project}/.project_done",
+        bcl_done = ".output/{config_id}/.done"
     output:
-        "results/read_counts_{project}.csv"
+        "results/{config_id}/{project}/read_counts_{project}.csv"
     log:
-        "logs/summarize_project_reads_{project}.log"
+        "logs/{config_id}/summarize_project_reads_{config_id}_{project}.log"
     benchmark:
-        "benchmarks/summarize_project_reads_{project}.bench"
+        "benchmarks/summarize_project_reads_{config_id}_{project}.bench"
     run:
         import sys
         sys.stderr = sys.stdout = open(log[0], 'w')
         import pandas as pd
         import os
 
+        # The demux stats may use the pre-rename project name
         target_projects = {wildcards.project}
-        for (config_id, old_project), new_project in PROJECT_RENAME_MAP.items():
-            if old_project == wildcards.project:
-                target_projects.add(new_project)
-            elif new_project == wildcards.project:
-                target_projects.add(old_project)
+        for (cid, old_project), new_project in PROJECT_RENAME_MAP.items():
+            if cid == wildcards.config_id:
+                if old_project == wildcards.project:
+                    target_projects.add(new_project)
+                elif new_project == wildcards.project:
+                    target_projects.add(old_project)
 
+        demux_path = f"output/{wildcards.config_id}/Reports/Demultiplex_Stats.csv"
         data = []
-        for done_marker in input.bcl_done:
-            parts = str(done_marker).split('/')
-            if len(parts) < 3:
-                print(f"Skipping unexpected done marker path: {done_marker}")
-                continue
 
-            config_id = parts[1]
-            demux_path = f"output/{config_id}/Reports/Demultiplex_Stats.csv"
-
-            if not os.path.exists(demux_path):
-                print(f"Skipping missing {demux_path}")
-                continue
-
+        if not os.path.exists(demux_path):
+            print(f"Skipping missing {demux_path}")
+        else:
             try:
                 demux_df = pd.read_csv(demux_path)
             except Exception as e:
                 print(f"Error reading {demux_path}: {e}")
-                continue
+                demux_df = pd.DataFrame()
 
-            if 'Sample_Project' not in demux_df.columns:
+            if 'Sample_Project' in demux_df.columns:
+                matches = demux_df[demux_df['Sample_Project'].astype(str).isin(target_projects)]
+                for _, row in matches.iterrows():
+                    sample_name = str(row.get('SampleID', row.get('Sample_ID', ''))).strip()
+                    read_pairs = int(row.get('# Reads', 0))
+                    data.append({
+                        'Config': wildcards.config_id,
+                        'Project': wildcards.project,
+                        'Sample': sample_name,
+                        'Total_Reads': read_pairs,
+                        'Passed_Reads': read_pairs,
+                    })
+            else:
                 print(f"Missing Sample_Project column in {demux_path}")
-                continue
-
-            matches = demux_df[demux_df['Sample_Project'].astype(str).isin(target_projects)]
-            for _, row in matches.iterrows():
-                sample_name = str(row.get('SampleID', row.get('Sample_ID', ''))).strip()
-                read_pairs = int(row.get('# Reads', 0))
-                data.append({
-                    'Config': config_id,
-                    'Project': wildcards.project,
-                    'Sample': sample_name,
-                    'Total_Reads': read_pairs,
-                    'Passed_Reads': read_pairs,
-                })
 
         df = pd.DataFrame(data)
         if not df.empty:
-            df = df.sort_values(['Config', 'Sample'])
+            df = df.sort_values(['Sample'])
         df.to_csv(output[0], index=False)
 
 rule compile_read_counts:
@@ -1285,8 +1486,9 @@ rule compile_read_counts:
             config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
             project=[p for c, p in CONFIG_PROJECT_PAIRS],
         ),
-        maps = expand("results/renaming_map_{config_id}.csv", config_id=CONFIG_IDS),
-        flexbar_done = expand("results/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS)
+        maps = expand("results/{config_id}/renaming_map_{config_id}.csv", config_id=CONFIG_IDS),
+        flexbar_done = expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
+        fqtk_done    = expand("results/{config_id}/fqtk_{config_id}.done", config_id=FQTK_CONFIGS)
     output:
         csv = f"results/{LIBRARY}-count.csv"
     log:
@@ -1449,6 +1651,52 @@ rule compile_read_counts:
                         lane_group_counts[lane_group_key][label][3] += reads
                         current_barcode = None
 
+        # Parse fqtk demux-metrics.txt and add per-sample read counts as a "fqtk" group
+        for config_id in FQTK_CONFIGS:
+            lane_num = None
+            try:
+                m = _re.match(r'lane(\d+)', config_id)
+                if m:
+                    lane_num = int(m.group(1))
+            except Exception:
+                pass
+            if lane_num is None:
+                continue
+
+            fqtk_metrics = os.path.join("output", config_id, "fqtk", "demux-metrics.txt")
+            if not os.path.exists(fqtk_metrics):
+                print(f"Skipping missing fqtk metrics: {fqtk_metrics}")
+                continue
+
+            lane_group_key = (lane_num, "fqtk")
+            lane_group_counts.setdefault(lane_group_key, {})
+
+            try:
+                with open(fqtk_metrics) as _fh:
+                    header_line = None
+                    for _line in _fh:
+                        _line = _line.rstrip('\n')
+                        if not _line or _line.startswith('#'):
+                            continue
+                        parts = _line.split('\t')
+                        if header_line is None:
+                            header_line = parts
+                            continue
+                        row_dict = dict(zip(header_line, parts))
+                        sample = row_dict.get('barcode_name', row_dict.get('sample_id', ''))
+                        if not sample or sample.lower() in ('unmatched', 'undetermined', ''):
+                            continue
+                        try:
+                            reads = int(row_dict.get('templates', row_dict.get('reads', 0)))
+                        except (ValueError, TypeError):
+                            reads = 0
+                        label = sample
+                        if label not in lane_group_counts[lane_group_key]:
+                            lane_group_counts[lane_group_key][label] = [0, 0, "fqtk", 0]
+                        lane_group_counts[lane_group_key][label][3] += reads
+            except Exception as _e:
+                print(f"Warning: could not parse fqtk metrics {fqtk_metrics}: {_e}")
+
         lane_group_pairs_sorted = sorted(lane_group_counts.keys())
 
         if not lane_group_pairs_sorted:
@@ -1512,9 +1760,9 @@ rule fastp_plots_lane:
     input:
         get_fastp_plots_lane_inputs
     output:
-        touch("results/fastp_plots_summary_lane{lane}.done")
+        touch("results/{config_id}/fastp_plots_summary_lane{lane}.done")
     log:
-        "logs/fastp_plots_lane{lane}.log"
+        "logs/{config_id}/fastp_plots_lane{lane}.log"
     wildcard_constraints:
         lane = r"\d+"
 
@@ -1526,9 +1774,9 @@ rule flexbar_per_config:
     threads: 16
     priority: 99
     output:
-        touch("results/flexbar_{config_id}.done")
+        touch("results/{config_id}/flexbar_{config_id}.done")
     log:
-        "logs/flexbar_{config_id}.log"
+        "logs/{config_id}/flexbar_{config_id}.log"
     benchmark:
         "benchmarks/flexbar_per_config_{config_id}.bench"
     params:
@@ -1563,12 +1811,14 @@ rule flexbar_per_config:
         fi
 
         # Build processed FASTA from raw tab-delimited barcodes.
-        awk '
-        {{
+        awk -F'\t' '
+        NF >= 3 {{
             name = $1
-            barcode = $2
+            barcode = $3
             gsub(/\r/, "", name)
             gsub(/\r/, "", barcode)
+            gsub(/ /, "_", name)
+            gsub(/[^a-zA-Z0-9_]/, "", name)
             gsub(/A/, "X", barcode)
             gsub(/T/, "A", barcode)
             gsub(/X/, "T", barcode)
@@ -1597,29 +1847,26 @@ rule flexbar_per_config:
             --umi-tags \
             --target {params.outdir}/flexbarOut -n {threads}
 
+        # Prepare headers and create each R2 with seqkit's internal threading.
         for r1_out in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
             [ -e "$r1_out" ] || continue
-
             base_name=$(basename "$r1_out" .fastq.gz)
-            # Example base_name: flexbarOut_barcode_L-0-1
-
             # Skip R2 conversion for unassigned reads
             if [[ "$base_name" == *"unassigned"* ]]; then
                 echo "Skipping R2 conversion for unassigned: $base_name"
                 continue
             fi
 
-            echo "Processing R2 for $base_name..."
-
-            zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 > "{params.outdir}/${{base_name}}_headers.txt"
+            echo "Preparing headers for $base_name"
+            zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 | sed 's/_[ATGCN]*$//' > "{params.outdir}/${{base_name}}_headers.txt"
 
             if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
-                seqtk subseq {params.r2} "{params.outdir}/${{base_name}}_headers.txt" | gzip > "{params.outdir}/${{base_name}}_R2.fastq.gz"
+                seqkit grep -j {threads} -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz"
             else
                 echo "No reads found for $base_name"
             fi
 
-            rm "{params.outdir}/${{base_name}}_headers.txt"
+            rm -f "{params.outdir}/${{base_name}}_headers.txt"
         done
 
         curr_dir=$PWD
@@ -1653,18 +1900,18 @@ _FLEXBAR_STAGE_CONFIG_CONSTRAINT, _FLEXBAR_STAGE_PROJECT_CONSTRAINT = _make_flex
 rule flexbar_stage_project:
     """Stage flexbar-demuxed files into per-project directory with canonical names.
 
-    Creates real files at {stem}-R1/2.fastq.gz in the renamed project directory,
-    then points flexbarOut_barcode_{name}.fastq.gz back to those files via symlink.
-    Writes .project_done / .fastq_names_done sentinels so downstream rules
-    (calculate_md5sums, fastp_sample, project_link) treat this like a normal project.
+    Moves flexbarOut_barcode_{name}.fastq.gz files into the renamed project directory
+    as {stem}-R1/2.fastq.gz. Writes .project_done / .fastq_names_done sentinels so
+    downstream rules (calculate_md5sums, fastp_sample, project_link) treat this like
+    a normal project.
     """
     input:
-        done = "results/flexbar_{config_id}.done"
+        done = "results/{config_id}/flexbar_{config_id}.done"
     output:
         project_done = "output/{config_id}/{project}/.project_done",
         names_done   = "output/{config_id}/{project}/.fastq_names_done"
     log:
-        "logs/flexbar_stage_project_{config_id}_{project}.log"
+        "logs/{config_id}/flexbar_stage_project_{config_id}_{project}.log"
     wildcard_constraints:
         config_id = _FLEXBAR_STAGE_CONFIG_CONSTRAINT,
         project   = _FLEXBAR_STAGE_PROJECT_CONSTRAINT
@@ -1678,33 +1925,16 @@ rule flexbar_stage_project:
         os.makedirs(proj_dir, exist_ok=True)
         log_lines = [f"Staging flexbar project {project} for {config_id}\n"]
 
-        def _materialize_and_backlink(src_abs, dst_abs):
-            # Ensure destination is a real file (hardlink preferred, copy fallback).
-            if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
-                os.unlink(dst_abs)
-
-            if not os.path.exists(dst_abs):
-                try:
-                    os.link(src_abs, dst_abs)
-                    log_lines.append(f"Hardlinked {dst_abs} <- {src_abs}\n")
-                except Exception:
-                    shutil.copy2(src_abs, dst_abs)
-                    log_lines.append(f"Copied {src_abs} -> {dst_abs}\n")
-            else:
-                log_lines.append(f"Kept existing destination {dst_abs}\n")
-
-            # Ensure flexbar path is a symlink back to destination.
-            if os.path.lexists(src_abs):
-                try:
-                    if os.path.islink(src_abs):
-                        _cur = os.path.realpath(src_abs)
-                        if os.path.realpath(dst_abs) == _cur:
-                            return
-                    os.unlink(src_abs)
-                except Exception:
-                    pass
-            os.symlink(os.path.abspath(dst_abs), src_abs)
-            log_lines.append(f"Linked {src_abs} -> {dst_abs}\n")
+        def _move_fastq(src_abs, dst_abs):
+            if os.path.exists(dst_abs):
+                log_lines.append(f"Kept existing {dst_abs}\n")
+                return
+            try:
+                os.rename(src_abs, dst_abs)
+                log_lines.append(f"Moved {src_abs} -> {dst_abs}\n")
+            except OSError:
+                shutil.move(src_abs, dst_abs)
+                log_lines.append(f"Moved (cross-device) {src_abs} -> {dst_abs}\n")
 
         for row in rows:
             name    = row['Sample_Name']
@@ -1716,13 +1946,13 @@ rule flexbar_stage_project:
             stem    = f"{run}-L{lane}-G{group}-{pos}-{barcode}"
             src_r1  = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{name}.fastq.gz")
             dst_r1  = os.path.abspath(f"{proj_dir}/{stem}-R1.fastq.gz")
-            if os.path.exists(src_r1) or os.path.islink(src_r1):
-                _materialize_and_backlink(src_r1, dst_r1)
+            if os.path.exists(src_r1):
+                _move_fastq(src_r1, dst_r1)
             if NUM_READS > 1:
                 src_r2 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{name}_R2.fastq.gz")
                 dst_r2 = os.path.abspath(f"{proj_dir}/{stem}-R2.fastq.gz")
-                if os.path.exists(src_r2) or os.path.islink(src_r2):
-                    _materialize_and_backlink(src_r2, dst_r2)
+                if os.path.exists(src_r2):
+                    _move_fastq(src_r2, dst_r2)
         with open(log[0], 'w') as lf:
             lf.writelines(log_lines)
         with open(output.project_done, 'w') as f:
@@ -1730,13 +1960,194 @@ rule flexbar_stage_project:
         with open(output.names_done, 'w') as f:
             f.write("flexbar canonical names done\n")
 
+
+def _make_fqtk_stage_constraints():
+    if not FQTK_CONFIG_RENAMING_MAP:
+        return "NOMATCH", "NOMATCH"
+    cfg = "|".join(re.escape(fc) for fc in FQTK_CONFIG_RENAMING_MAP)
+    projs = "|".join(
+        re.escape(PROJECT_RENAME_MAP.get((fc, FQTK_ORDER_ID_PROJECT[fc]), FQTK_ORDER_ID_PROJECT[fc]))
+        for fc in FQTK_CONFIG_RENAMING_MAP
+        if fc in FQTK_ORDER_ID_PROJECT
+    )
+    return cfg, projs or "NOMATCH"
+_FQTK_STAGE_CONFIG_CONSTRAINT, _FQTK_STAGE_PROJECT_CONSTRAINT = _make_fqtk_stage_constraints()
+
+
+rule fqtk_per_config:
+    """Demultiplex SMK/fqtk samples from a lane's Undetermined reads using fqtk.
+
+    Reads Undetermined R1/I1/R2 from .output/{config_id}/, probes I1 length to
+    determine the read structure, and runs fqtk demux with the barcode TSV from
+    metadata/fqtk_barcodes_{config_id}.tsv.  Outputs to output/{config_id}/fqtk/.
+    """
+    input:
+        bcl_done    = ".output/{config_id}/.done",
+        barcode_tsv = "metadata/fqtk_barcodes_{config_id}.tsv"
+    output:
+        touch("results/{config_id}/fqtk_{config_id}.done")
+    log:
+        "logs/{config_id}/fqtk_{config_id}.log"
+    benchmark:
+        "benchmarks/fqtk_per_config_{config_id}.bench"
+    params:
+        outdir  = "output/{config_id}/fqtk",
+        lane    = lambda wildcards: wildcards.config_id.replace('lane', ''),
+        lane_pad = lambda wildcards: f"{int(wildcards.config_id.replace('lane', '')):03d}",
+        r1      = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L{int(wildcards.config_id.replace('lane', '')):03d}_R1_001.fastq.gz",
+        i1      = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L{int(wildcards.config_id.replace('lane', '')):03d}_I1_001.fastq.gz",
+        r2      = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L{int(wildcards.config_id.replace('lane', '')):03d}_R2_001.fastq.gz",
+    shell:
+        """
+        (
+        mkdir -p {params.outdir}
+
+        R1="{params.r1}"
+        I1="{params.i1}"
+        R2="{params.r2}"
+
+        for f in "$R1" "$I1" "$R2"; do
+            if [ ! -f "$f" ]; then
+                echo "ERROR: expected Undetermined file not found: $f"
+                echo "  Ensure Pass-1 BCL Convert ran with CreateFastqForIndexReads=1."
+                exit 1
+            fi
+        done
+
+        # Probe I1 read length to build the correct read structure.
+        I1_LEN=$(set +o pipefail; zcat "$I1" | awk 'NR==2{{print length($0); exit}}')
+        if [ "$I1_LEN" -ge 10 ]; then
+            I1_READ_STRUCT="8B$(( I1_LEN - 8 ))S"
+        else
+            I1_READ_STRUCT="8B"
+        fi
+        echo "I1 read length: ${{I1_LEN}}bp -> read structure: $I1_READ_STRUCT"
+
+        conda run -n bcl_convert fqtk demux \
+            --inputs "$R1" "$I1" "$R2" \
+            --read-structures "151T" "$I1_READ_STRUCT" "151T" \
+            --sample-metadata {input.barcode_tsv} \
+            --output {params.outdir} \
+            --max-mismatches 1 \
+            --min-mismatch-delta 2
+
+        echo "fqtk demux complete"
+        cat "{params.outdir}/demux-metrics.txt" 2>/dev/null || true
+
+        # Remove unmatched reads — not needed downstream and can be large.
+        rm -f "{params.outdir}"/unmatched.*.fq.gz
+
+        curr_dir=$PWD
+        cd {params.outdir}
+        md5sum *.fq.gz > md5sum.txt 2>/dev/null || true
+        du -h *.fq.gz > size.txt 2>/dev/null || true
+        cd "$curr_dir"
+        ) > {log} 2>&1
+
+        touch {output}
+        """
+
+
+rule fqtk_stage_project:
+    """Stage fqtk-demuxed files into per-project directory with canonical names.
+
+    BD/10x projects get DRAGEN-style names: {sample}_S{n}_L{lane:03d}_R1_001.fastq.gz
+    Other projects get stem-based names: {stem}-R1.fastq.gz (same as flexbar).
+    Writes .project_done and .fastq_names_done sentinels.
+    """
+    input:
+        done = "results/{config_id}/fqtk_{config_id}.done"
+    output:
+        project_done = "output/{config_id}/{project}/.project_done",
+        names_done   = "output/{config_id}/{project}/.fastq_names_done"
+    log:
+        "logs/{config_id}/fqtk_stage_project_{config_id}_{project}.log"
+    wildcard_constraints:
+        config_id = _FQTK_STAGE_CONFIG_CONSTRAINT,
+        project   = _FQTK_STAGE_PROJECT_CONSTRAINT
+    run:
+        import os
+        import shutil
+        config_id = wildcards.config_id
+        project   = wildcards.project
+        rows      = FQTK_CONFIG_RENAMING_MAP.get(config_id, [])
+        proj_dir  = f"output/{config_id}/{project}"
+        os.makedirs(proj_dir, exist_ok=True)
+        log_lines = [f"Staging fqtk project {project} for {config_id}\n"]
+
+        def _materialize_and_backlink(src_abs, dst_abs):
+            if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
+                os.unlink(dst_abs)
+            if not os.path.exists(dst_abs):
+                try:
+                    os.link(src_abs, dst_abs)
+                    log_lines.append(f"Hardlinked {dst_abs} <- {src_abs}\n")
+                except Exception:
+                    shutil.copy2(src_abs, dst_abs)
+                    log_lines.append(f"Copied {src_abs} -> {dst_abs}\n")
+            else:
+                log_lines.append(f"Kept existing destination {dst_abs}\n")
+            if os.path.lexists(src_abs):
+                try:
+                    if os.path.islink(src_abs):
+                        if os.path.realpath(src_abs) == os.path.realpath(dst_abs):
+                            return
+                    os.unlink(src_abs)
+                except Exception:
+                    pass
+            os.symlink(os.path.abspath(dst_abs), src_abs)
+            log_lines.append(f"Linked {src_abs} -> {dst_abs}\n")
+
+        # Resolve original project name (before rename) to check is_parse_or_10x
+        project_orig = rows[0].get('Sample_Project', project) if rows else project
+
+        # Compute global S-number offset: count BCL Convert rows for this config
+        # so fqtk samples continue the numbering (e.g. BCL=84 rows → fqtk gets S85, S86)
+        import pandas as _pd
+        _map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
+        _s_num_offset = 0
+        if os.path.exists(_map_path):
+            try:
+                _s_num_offset = len(_pd.read_csv(_map_path))
+            except Exception:
+                pass
+
+        for _fqtk_i, row in enumerate(rows):
+            name    = row['Sample_Name']
+            run     = row['Run']
+            lane    = int(row['Lane'])
+            group   = str(row['Group'])
+            pos     = row['Position']
+            barcode = row['index']
+            s_num   = _s_num_offset + _fqtk_i + 1
+            src_r1  = os.path.abspath(f"output/{config_id}/fqtk/{name}.R1.fq.gz")
+            src_r2  = os.path.abspath(f"output/{config_id}/fqtk/{name}.R2.fq.gz")
+            if is_parse_or_10x(project_orig):
+                dst_r1 = os.path.abspath(f"{proj_dir}/{name}_S{s_num}_L{lane:03d}_R1_001.fastq.gz")
+                dst_r2 = os.path.abspath(f"{proj_dir}/{name}_S{s_num}_L{lane:03d}_R2_001.fastq.gz")
+            else:
+                stem   = f"{run}-L{lane}-G{group}-{pos}-{barcode}"
+                dst_r1 = os.path.abspath(f"{proj_dir}/{stem}-R1.fastq.gz")
+                dst_r2 = os.path.abspath(f"{proj_dir}/{stem}-R2.fastq.gz")
+            if os.path.exists(src_r1) or os.path.islink(src_r1):
+                _materialize_and_backlink(src_r1, dst_r1)
+            if os.path.exists(src_r2) or os.path.islink(src_r2):
+                _materialize_and_backlink(src_r2, dst_r2)
+        with open(log[0], 'w') as lf:
+            lf.writelines(log_lines)
+        with open(output.project_done, 'w') as f:
+            f.write("fqtk project staged\n")
+        with open(output.names_done, 'w') as f:
+            f.write("fqtk canonical names done\n")
+
+
 rule generate_samplesheets:
     input:
         metadata = METADATA_FILE if METADATA_FILE else [],
         run_info = "src/RunInfo_nn.xml"
     output:
-        expand("results/SampleSheet_{config_id}.csv", config_id=CONFIG_IDS),
-        expand("logs/generate_samplesheets_{config_id}.done", config_id=CONFIG_IDS)
+        expand("results/{config_id}/SampleSheet_{config_id}.csv", config_id=CONFIG_IDS),
+        expand("logs/{config_id}/generate_samplesheets_{config_id}.done", config_id=CONFIG_IDS)
     log:
         "logs/generate_samplesheets.log"
     benchmark:
@@ -1774,8 +2185,8 @@ rule generate_samplesheets:
         
         for config in lane_configs:
             config_id = config['id']
-            samplesheet_path = f"results/SampleSheet_{config_id}.csv"
-            done_marker = f"logs/generate_samplesheets_{config_id}.done"
+            samplesheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
+            done_marker = f"logs/{config_id}/generate_samplesheets_{config_id}.done"
             
             needs_generation = False
             
@@ -1803,7 +2214,7 @@ rule generate_samplesheets:
             print(f"All sample sheets up to date, ensuring done markers exist...")
             for config in lane_configs:
                 config_id = config['id']
-                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                done_marker = f"logs/{config_id}/generate_samplesheets_{config_id}.done"
                 if not os.path.exists(done_marker):
                     os.makedirs(os.path.dirname(done_marker), exist_ok=True)
                     open(done_marker, 'w').close()
@@ -1815,8 +2226,8 @@ rule generate_samplesheets:
             print(f"No metadata file found, creating placeholder sample sheets")
             for config in configs_to_generate:
                 config_id = config['id']
-                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
-                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                samplesheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/{config_id}/generate_samplesheets_{config_id}.done"
                 
                 os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
                 open(samplesheet_path, 'w').close()
@@ -1833,7 +2244,7 @@ rule generate_samplesheets:
             old_hashes = {}
             for config in configs_to_generate:
                 config_id = config['id']
-                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
+                samplesheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
                 old_hashes[config_id] = get_file_hash(samplesheet_path)
             
             # Generate all sample sheets
@@ -1852,8 +2263,8 @@ rule generate_samplesheets:
             # Check which sample sheets actually changed and update only their done markers
             for config in lane_configs:
                 config_id = config['id']
-                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
-                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                samplesheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/{config_id}/generate_samplesheets_{config_id}.done"
                 
                 # Ensure sample sheet exists
                 if not os.path.exists(samplesheet_path):
@@ -1867,10 +2278,18 @@ rule generate_samplesheets:
                     old_hash = old_hashes.get(config_id)
                     
                     if new_hash != old_hash:
-                        # Content changed, update done marker
+                        # Content changed, update done marker and invalidate stale validated sheet
                         os.makedirs(os.path.dirname(done_marker), exist_ok=True)
                         open(done_marker, 'w').close()
                         print(f"Updated done marker for {config_id} (content changed)")
+                        for stale in [
+                            f"results/{config_id}/SampleSheet_{config_id}_validated.csv",
+                            f"logs/{config_id}/barcode_hamming_validation_{config_id}.done",
+                            f"logs/{config_id}/barcode_hamming_validation_{config_id}.txt",
+                        ]:
+                            if os.path.exists(stale):
+                                os.remove(stale)
+                                print(f"Removed stale validation artifact: {stale}")
                     else:
                         # Content unchanged, only touch if done marker doesn't exist
                         if not os.path.exists(done_marker):
@@ -1893,8 +2312,8 @@ rule generate_samplesheets:
             # Create placeholders for configs that were supposed to be generated
             for config in configs_to_generate:
                 config_id = config['id']
-                samplesheet_path = f"results/SampleSheet_{config_id}.csv"
-                done_marker = f"logs/generate_samplesheets_{config_id}.done"
+                samplesheet_path = f"results/{config_id}/SampleSheet_{config_id}.csv"
+                done_marker = f"logs/{config_id}/generate_samplesheets_{config_id}.done"
                 
                 os.makedirs(os.path.dirname(samplesheet_path), exist_ok=True)
                 open(samplesheet_path, 'w').close()
@@ -1907,11 +2326,11 @@ rule generate_samplesheets:
 # Generate renaming map by copying from generate_samplesheets output
 rule generate_renaming_map:
     input:
-        sample_sheet = "results/SampleSheet_{config_id}.csv"
+        sample_sheet = "results/{config_id}/SampleSheet_{config_id}.csv"
     output:
-        map = "results/renaming_map_{config_id}.csv"
+        map = "results/{config_id}/renaming_map_{config_id}.csv"
     log:
-        "logs/generate_renaming_map_{config_id}.log"
+        "logs/{config_id}/generate_renaming_map_{config_id}.log"
     benchmark:
         "benchmarks/generate_renaming_map_{config_id}.bench"
     params:
@@ -2025,13 +2444,13 @@ rule validate_barcode_hamming_distances:
     With --fix: sets BarcodeMismatchesIndex1/2 to 0 for conflicting samples and retries.
     """
     input:
-        samplesheet = "results/SampleSheet_{config_id}.csv"
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}.csv")
     output:
-        report = "logs/barcode_hamming_validation_{config_id}.txt",
-        marker = touch("logs/barcode_hamming_validation_{config_id}.done"),
-        fixed_sheet = "results/SampleSheet_{config_id}_validated.csv"
+        report = "logs/{config_id}/barcode_hamming_validation_{config_id}.txt",
+        marker = touch("logs/{config_id}/barcode_hamming_validation_{config_id}.done"),
+        fixed_sheet = "results/{config_id}/SampleSheet_{config_id}_validated.csv"
     log:
-        "logs/barcode_hamming_validation_{config_id}.log"
+        "logs/{config_id}/barcode_hamming_validation_{config_id}.log"
     benchmark:
         "benchmarks/barcode_hamming_validation_{config_id}.bench"
     wildcard_constraints:
@@ -2065,16 +2484,16 @@ rule validate_barcode_hamming_distances:
 
 rule bcl_convert:
     input:
-        sample_sheet=lambda wildcards: f"results/SampleSheet_{wildcards.config_id}_validated.csv",
-        renaming_map = "results/renaming_map_{config_id}.csv",
+        sample_sheet=lambda wildcards: f"results/{wildcards.config_id}/SampleSheet_{wildcards.config_id}_validated.csv",
+        renaming_map = maybe_ancient("results/{config_id}/renaming_map_{config_id}.csv"),
         data_dir=DATA_DIR,
-        _sheet_done=lambda wildcards: f"logs/generate_samplesheets_{wildcards.config_id}.done",
+        _sheet_done=lambda wildcards: maybe_ancient(f"logs/{wildcards.config_id}/generate_samplesheets_{wildcards.config_id}.done"),
         run_info = "src/RunInfo_nn.xml",
         prev_done = get_prev_bcl_done
     output:
         done_file = touch(".output/{config_id}/.done")
     log:
-        "logs/bcl_convert_{config_id}.log"
+        "logs/{config_id}/bcl_convert_{config_id}.log"
     benchmark:
         "benchmarks/bcl_convert_{config_id}.bench"
     wildcard_constraints:
@@ -2087,7 +2506,8 @@ rule bcl_convert:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
         tiles = TILES,
-        scratch_dir = SCRATCH_DIR
+        scratch_dir = SCRATCH_DIR,
+        keep_undetermined_configs = KEEP_UNDETERMINED_CONFIGS
     shell:
         """
         (
@@ -2160,16 +2580,33 @@ rule bcl_convert:
             echo "Scratch data removed after successful sync."
         fi
 
-        # Keep Undetermined reads when inline_demux will process this lane.
-        # MurnJ-style samples are excluded from the DRAGEN sheet (no physical index),
-        # so "flexbar" no longer appears in the sheet — check the barcode FASTA instead.
+        # Keep Undetermined reads if config is in keep_undetermined_configs or flexbar file exists.
+        keep_undetermined=false
+        echo "DEBUG keep_undetermined_configs='{params.keep_undetermined_configs}' config_id='{wildcards.config_id}'"
+        _keep_configs="{params.keep_undetermined_configs}"
+        for cfg in $_keep_configs; do
+            if [ "$cfg" = "{wildcards.config_id}" ]; then
+                keep_undetermined=true
+                break
+            fi
+        done
+        
         if [ -f "metadata/flexbar_barcodes_{wildcards.config_id}.txt" ]; then
-            echo "Inline demux lane detected (metadata/flexbar_barcodes_{wildcards.config_id}.txt exists); preserving Undetermined reads."
+            echo "Inline demux lane detected; preserving Undetermined reads."
+            keep_undetermined=true
+        fi
+
+        if [ -f "metadata/fqtk_barcodes_{wildcards.config_id}.tsv" ]; then
+            echo "fqtk demux lane detected; preserving Undetermined reads."
+            keep_undetermined=true
+        fi
+        
+        if [ "$keep_undetermined" = "true" ]; then
+            echo "Keeping Undetermined reads for {wildcards.config_id}."
         else
             rm -f "$final_out"/Undetermined* 2>/dev/null || true
             echo "Undetermined reads deleted"
         fi
-
         # Rename FASTQ files
         src/run_rename.sh {wildcards.config_id} "$final_out" {input.renaming_map}
 
@@ -2197,7 +2634,7 @@ rule bcl_project_done:
     """
     input:
         done = maybe_ancient(".output/{config_id}/.done"),
-        decision = "logs/orientation_decision_{config_id}.json"
+        decision = maybe_ancient("logs/{config_id}/orientation_decision_{config_id}.json")
     output:
         sentinel = touch("output/{config_id}/{project}/.project_done")
     wildcard_constraints:
@@ -2301,7 +2738,7 @@ rule calculate_md5sums:
     output:
         md5 = "output/{config_id}/{project}/md5sums.txt"
     log:
-        "logs/calculate_md5sums_{config_id}_{project}.log"
+        "logs/{config_id}/calculate_md5sums_{config_id}_{project}.log"
     benchmark:
         "benchmarks/calculate_md5sums_{config_id}_{project}.bench"
     wildcard_constraints:
@@ -2327,9 +2764,9 @@ rule calculate_md5sums:
 # Rule: generate exclude-indexes file for each config_id
 rule generate_exclude_indexes:
     input:
-        samplesheets = lambda wildcards: [f"results/SampleSheet_{other_id}.csv" for other_id in get_config_ids_for_lane(get_lane_for_config(wildcards.config_id)) if other_id != wildcards.config_id]
+        samplesheets = lambda wildcards: [f"results/{other_id}/SampleSheet_{other_id}.csv" for other_id in get_config_ids_for_lane(get_lane_for_config(wildcards.config_id)) if other_id != wildcards.config_id]
     output:
-        txt = "results/exclude_indexes_{config_id}.txt"
+        txt = "results/{config_id}/exclude_indexes_{config_id}.txt"
     benchmark:
         "benchmarks/generate_exclude_indexes_{config_id}.bench"
     run:
@@ -2349,7 +2786,7 @@ rule analyze_undetermined:
     output:
         csv = "results/undetermined_indices/{config_id}.csv"
     log:
-        "logs/analyze_undetermined_{config_id}.log"
+        "logs/{config_id}/analyze_undetermined_{config_id}.log"
     benchmark:
         "benchmarks/analyze_undetermined_{config_id}.bench"
     params:
@@ -2385,12 +2822,12 @@ rule detect_rc_candidates:
     Produces a JSON list of suspect project records (may be empty).
     """
     input:
-        undetermined = "results/undetermined_indices/{config_id}.csv",
-        samplesheet = "results/SampleSheet_{config_id}.csv"
+        undetermined = maybe_ancient("results/undetermined_indices/{config_id}.csv"),
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}.csv")
     output:
-        candidates = "logs/rc_candidates_{config_id}.json"
+        candidates = "logs/{config_id}/rc_candidates_{config_id}.json"
     log:
-        "logs/detect_rc_candidates_{config_id}.log"
+        "logs/{config_id}/detect_rc_candidates_{config_id}.log"
     wildcard_constraints:
         config_id = "[^/]+"
     params:
@@ -2433,12 +2870,12 @@ rule generate_rc_samplesheet:
     If no suspects, copies the original SampleSheet unchanged.
     """
     input:
-        samplesheet = "results/SampleSheet_{config_id}.csv",
-        candidates = "logs/rc_candidates_{config_id}.json"
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}.csv"),
+        candidates = maybe_ancient("logs/{config_id}/rc_candidates_{config_id}.json")
     output:
-        rc_samplesheet = "results/SampleSheet_{config_id}_rc.csv"
+        rc_samplesheet = "results/{config_id}/SampleSheet_{config_id}_rc.csv"
     log:
-        "logs/generate_rc_samplesheet_{config_id}.log"
+        "logs/{config_id}/generate_rc_samplesheet_{config_id}.log"
     wildcard_constraints:
         config_id = "[^/]+"
     run:
@@ -2467,13 +2904,13 @@ rule validate_barcode_hamming_distances_rc:
     dual-indexed samples, and checks i7 alone for single-indexed samples.
     """
     input:
-        samplesheet = "results/SampleSheet_{config_id}_rc.csv"
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}_rc.csv")
     output:
-        report = "logs/barcode_hamming_validation_rc_{config_id}.txt",
-        marker = touch("logs/barcode_hamming_validation_rc_{config_id}.done"),
-        fixed_sheet = "results/SampleSheet_{config_id}_rc_validated.csv"
+        report = "logs/{config_id}/barcode_hamming_validation_rc_{config_id}.txt",
+        marker = touch("logs/{config_id}/barcode_hamming_validation_rc_{config_id}.done"),
+        fixed_sheet = "results/{config_id}/SampleSheet_{config_id}_rc_validated.csv"
     log:
-        "logs/barcode_hamming_validation_rc_{config_id}.log"
+        "logs/{config_id}/barcode_hamming_validation_rc_{config_id}.log"
     benchmark:
         "benchmarks/barcode_hamming_validation_rc_{config_id}.bench"
     wildcard_constraints:
@@ -2511,17 +2948,17 @@ rule bcl_convert_rc:
     directory without running BCL Convert.
     """
     input:
-        rc_samplesheet = "results/SampleSheet_{config_id}_rc_validated.csv",
-        renaming_map = "results/renaming_map_{config_id}.csv",
-        candidates = "logs/rc_candidates_{config_id}.json",
+        rc_samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}_rc_validated.csv"),
+        renaming_map = maybe_ancient("results/{config_id}/renaming_map_{config_id}.csv"),
+        candidates = maybe_ancient("logs/{config_id}/rc_candidates_{config_id}.json"),
         data_dir = DATA_DIR,
         run_info = "src/RunInfo_nn.xml",
-        orig_done = ".output/{config_id}/.done"
+        orig_done = maybe_ancient(".output/{config_id}/.done")
     output:
         output_dir = directory(".output_rc/{config_id}"),
         done_file = touch(".output_rc/{config_id}/.done")
     log:
-        "logs/bcl_convert_rc_{config_id}.log"
+        "logs/{config_id}/bcl_convert_rc_{config_id}.log"
     benchmark:
         "benchmarks/bcl_convert_rc_{config_id}.bench"
     wildcard_constraints:
@@ -2587,11 +3024,11 @@ rule pick_orientation:
     input:
         done_orig = maybe_ancient(".output/{config_id}/.done"),
         done_rc = ".output_rc/{config_id}/.done",
-        candidates = "logs/rc_candidates_{config_id}.json"
+        candidates = "logs/{config_id}/rc_candidates_{config_id}.json"
     output:
-        decision = "logs/orientation_decision_{config_id}.json"
+        decision = "logs/{config_id}/orientation_decision_{config_id}.json"
     log:
-        "logs/pick_orientation_{config_id}.log"
+        "logs/{config_id}/pick_orientation_{config_id}.log"
     wildcard_constraints:
         config_id = "[^/]+"
     run:
@@ -2621,15 +3058,11 @@ rule pick_orientation:
         with open(input.candidates) as f:
             suspects = json_mod.load(f)
 
-        # Keep Undetermined FASTQs for lanes that include flexbar projects.
-        samplesheet_path = f"results/SampleSheet_{wildcards.config_id}.csv"
-        preserve_undetermined = False
-        if os_mod.path.exists(samplesheet_path):
-            try:
-                with open(samplesheet_path, 'r', encoding='utf-8', errors='ignore') as _ssf:
-                    preserve_undetermined = "flexbar" in _ssf.read().lower()
-            except Exception:
-                preserve_undetermined = False
+        # Keep Undetermined FASTQs for lanes configured for flexbar demux.
+        # Match bcl_convert behavior to avoid deleting inputs needed by flexbar_per_config.
+        preserve_undetermined = os_mod.path.isfile(
+            f"metadata/flexbar_barcodes_{wildcards.config_id}.txt"
+        )
 
         # Build fix_type lookup: project -> label (rc_i7 / rc_i5 / rc_both)
         fix_type_map = {}
@@ -2703,7 +3136,7 @@ rule update_validation_workbook:
     are known, so the RC_ORIENTATION sheet reflects which projects ran through RC.
     """
     input:
-        decisions = expand("logs/orientation_decision_{config_id}.json", config_id=CONFIG_IDS),
+        decisions = expand("logs/{config_id}/orientation_decision_{config_id}.json", config_id=CONFIG_IDS),
         metadata = maybe_ancient(metadata)
     output:
         xlsx = VALIDATION_XLSX
@@ -2715,7 +3148,7 @@ rule check_index_rc_swap:
     SampleSheet CSVs and undetermined indices CSVs.
     """
     input:
-        samples = lambda wildcards: sorted(glob.glob("results/SampleSheet_*.csv")),
+        samples = lambda wildcards: sorted(glob.glob("results/*/SampleSheet_*.csv")),
         undetermined = lambda wildcards: sorted(glob.glob("results/undetermined_indices/*.csv"))
     output:
         "results/check_index_rc_swap.txt"
@@ -2733,8 +3166,8 @@ rule project_link:
     input:
         done = "output/{config_id}/{project}/.project_done"
     output:
-        log = "logs/project_link_{config_id}---{project}.log",
-        yaml_file = "logs/project_links_{config_id}---{project}.yaml"
+        log = "logs/{config_id}/project_link_{config_id}---{project}.log",
+        yaml_file = "logs/{config_id}/project_links_{config_id}---{project}.yaml"
     benchmark:
         "benchmarks/project_link_{config_id}---{project}.bench"
     wildcard_constraints:
@@ -2991,11 +3424,11 @@ rule project_link:
 
 rule rescan_nextcloud:
     input:
-        "logs/project_link_{config_id}---{project}.log"
+        "logs/{config_id}/project_link_{config_id}---{project}.log"
     output:
-        touch("logs/nextcloud_scan_{config_id}---{project}.done")
+        touch("logs/{config_id}/nextcloud_scan_{config_id}---{project}.done")
     log:
-        "logs/rescan_nextcloud_{config_id}_{project}.log"
+        "logs/{config_id}/rescan_nextcloud_{config_id}_{project}.log"
     benchmark:
         "benchmarks/rescan_nextcloud_{config_id}_{project}.bench"
     wildcard_constraints:
@@ -3041,12 +3474,12 @@ rule rescan_nextcloud:
 
 rule verify_project_links:
     input:
-        project_link_log = "logs/project_link_{config_id}---{project}.log",
-        scan_done = "logs/nextcloud_scan_{config_id}---{project}.done"
+        project_link_log = "logs/{config_id}/project_link_{config_id}---{project}.log",
+        scan_done = "logs/{config_id}/nextcloud_scan_{config_id}---{project}.done"
     output:
-        report = "logs/verify_project_link_{config_id}---{project}.txt"
+        report = "logs/{config_id}/verify_project_link_{config_id}---{project}.txt"
     log:
-        "logs/verify_project_link_{config_id}---{project}.log"
+        "logs/{config_id}/verify_project_link_{config_id}---{project}.log"
     benchmark:
         "benchmarks/verify_project_link_{config_id}---{project}.bench"
     wildcard_constraints:
@@ -3188,7 +3621,7 @@ rule debug_project_link_files:
             print(f"{done_path}: {'EXISTS' if os.path.exists(done_path) else 'MISSING'}")
         print("\n=== DIAGNOSTIC: Expected .log files ===")
         for config_id, project in CONFIG_PROJECT_PAIRS:
-            log_path = f"logs/project_link_{config_id}_{project}.log"
+            log_path = f"logs/{config_id}/project_link_{config_id}_{project}.log"
             print(f"{log_path}: {'EXISTS' if os.path.exists(log_path) else 'MISSING'}")
         print("\n=== DIAGNOSTIC: All files in logs/ matching project_link_*.log ===")
         for fname in sorted(os.listdir('logs')):

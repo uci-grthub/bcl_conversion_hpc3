@@ -75,6 +75,21 @@ def get_image_base64(path, max_width=600, quality=35):
         except:
             return None
 
+def check_md5_file_permissions(path):
+    """Fail if path is not readable by owner, group, and others."""
+    mode = os.stat(path).st_mode
+    required = 0o444  # r--r--r--
+    if (mode & required) != required:
+        missing = []
+        if not (mode & 0o400):
+            missing.append("owner")
+        if not (mode & 0o040):
+            missing.append("group")
+        if not (mode & 0o004):
+            missing.append("others")
+        print(f"ERROR: {path} is missing read permission for: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
 def get_file_size(path):
     if os.path.exists(path):
         size_bytes = os.path.getsize(path)
@@ -191,7 +206,7 @@ def parse_flexbar_written_reads(log_path):
             text = fh.read()
 
         for m in re.finditer(
-            r'Read file:\s+(\S+)\s+written reads\s+(\d+)\s+short reads\s+(\d+)',
+            r'Read file:\s+(\S+)\n\s+written reads\s+(\d+)',
             text,
         ):
             fname = os.path.basename(m.group(1))
@@ -209,6 +224,43 @@ def parse_flexbar_written_reads(log_path):
                 counts[name]['r1'] = written
     except Exception as e:
         print(f"Warning: could not parse flexbar counts from {log_path}: {e}")
+
+    return counts
+
+def parse_fqtk_demux_metrics(metrics_path):
+    """Parse fqtk demux-metrics.txt and return per-sample read counts.
+
+    Returns:
+        dict: {sample_name: int_reads}
+    """
+    counts = {}
+    if not metrics_path or not os.path.exists(metrics_path):
+        return counts
+
+    try:
+        with open(metrics_path) as fh:
+            header_line = None
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if header_line is None:
+                    header_line = parts
+                    continue
+
+                row = dict(zip(header_line, parts))
+                sample_name = (row.get("barcode_name") or row.get("sample_id") or "").strip()
+                reads_raw = (row.get("templates") or row.get("reads") or "0").strip()
+                if not sample_name:
+                    continue
+
+                try:
+                    counts[sample_name] = counts.get(sample_name, 0) + int(reads_raw)
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"Warning: could not parse fqtk counts from {metrics_path}: {e}")
 
     return counts
 
@@ -276,6 +328,63 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
     # Format: list of dicts with {link, project, config_id, lane, run, group}
     seen = set()
     all_download_links = []
+
+    def _extract_group_from_name(name):
+        if not name:
+            return ''
+        m = re.search(r'_L\d+_G(\d+)', name)
+        if m:
+            return m.group(1)
+        m = re.search(r'_G(\d+)', name)
+        if m:
+            return m.group(1)
+        m = re.search(r'-G(\d+)', name)
+        if m:
+            return m.group(1)
+        return ''
+
+    def _infer_group_from_renaming_maps(project, lane_filter=None):
+        groups = set()
+        try:
+            for map_path in glob.glob('results/renaming_map_*.csv'):
+                try:
+                    with open(map_path) as mf:
+                        header = mf.readline().strip().split(',')
+                        cols = {c: i for i, c in enumerate(header)}
+                        for line in mf:
+                            parts = line.strip().split(',')
+                            if len(parts) < len(header):
+                                continue
+                            sp_idx = cols.get('Sample_Project')
+                            lane_idx = cols.get('Lane')
+                            group_idx = cols.get('Group')
+                            sample_project = parts[sp_idx].strip() if (sp_idx is not None and sp_idx < len(parts)) else ''
+                            lane = parts[lane_idx].strip() if (lane_idx is not None and lane_idx < len(parts)) else ''
+                            group = parts[group_idx].strip() if (group_idx is not None and group_idx < len(parts)) else ''
+                            if not sample_project:
+                                continue
+                            if sample_project == project:
+                                if lane_filter:
+                                    try:
+                                        lf = int(lane_filter) if not isinstance(lane_filter, (list, tuple)) else int(lane_filter[0])
+                                    except Exception:
+                                        lf = None
+                                    if lf is not None and lane and int(lane) != lf:
+                                        continue
+                                if group and group.lower() not in ('', 'nan'):
+                                    groups.add(group)
+                except Exception:
+                    continue
+        except Exception:
+            return ''
+        if groups:
+            # Return the smallest numeric group if possible, else any
+            try:
+                nums = sorted(int(g) for g in groups)
+                return str(nums[0])
+            except Exception:
+                return sorted(groups)[0]
+        return ''
     
     # Add existing links from HTML (no metadata available)
     for lk in existing_download_links:
@@ -299,13 +408,15 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
                 # Extract lane from config_id (format: lane1_R1-151_I1-8_I2-8_R2-151)
                 lane_match = re.match(r'lane(\d+)', config_id)
                 lane_num = lane_match.group(1) if lane_match else ''
+                # If group missing, try to infer from project name
+                group_inferred = group or _extract_group_from_name(proj_name) or _extract_group_from_name((project_name_map or {}).get(proj_name, '')) or _extract_group_from_name(orig_project_name) or _infer_group_from_renaming_maps(proj_name, lane_num)
                 all_download_links.append({
                     'link': lk,
                     'project': (project_name_map or {}).get(proj_name, proj_name),
                     'config_id': config_id,
                     'lane': lane_num,
                     'run': library_name,
-                    'group': group
+                    'group': group_inferred
                 })
     
     # Add current project's links if not already added from YAML
@@ -314,13 +425,14 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
             seen.add(lk)
             # Try to determine config_id from the link path or from available data
             # For now, use basic metadata
+            group_inferred = _extract_group_from_name(display_project) or _extract_group_from_name(orig_project_name) or _infer_group_from_renaming_maps(display_project, lane_filter)
             all_download_links.append({
                 'link': lk,
                 'project': display_project,
                 'config_id': '', 
                 'lane': str(lane_filter) if lane_filter else '',
                 'run': library_name,
-                'group': ''
+                'group': group_inferred
             })
 
     # Sort links by lane (numeric) then group (try numeric, fallback to string)
@@ -376,8 +488,16 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
     # Find all md5sums.txt files in output directories
     # Priority: Load from project-level first (output/*/*/md5sums.txt), then lane-level (output/*/md5sums.txt)
     
+    def _md5_key_variants(basename):
+        variants = [basename]
+        normalized = re.sub(r'_S\d+_', '_S_', basename)
+        if normalized not in variants:
+            variants.append(normalized)
+        return variants
+
     # First pass: load project-level md5s (these have the actual file checksums)
     for md5_file in glob.glob("output/*/*/md5sums.txt"):
+        check_md5_file_permissions(md5_file)
         try:
             project_from_path = os.path.basename(os.path.dirname(md5_file))
             with open(md5_file, 'r') as f:
@@ -392,7 +512,8 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
                         filepath_normalized = filepath.lstrip('./')
                         # Store with basename as key for lookup (most common case)
                         basename = os.path.basename(filepath_normalized)
-                        md5_lookup[basename] = md5_hash
+                        for key in _md5_key_variants(basename):
+                            md5_lookup[key] = md5_hash
                         
                         # Also collect for this specific project
                         if project == project_from_path:
@@ -402,6 +523,7 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
     
     # Second pass: load lane-level consolidated files (only for lanes without project files)
     for md5_file in glob.glob("output/*/md5sums.txt"):
+        check_md5_file_permissions(md5_file)
         try:
             with open(md5_file, 'r') as f:
                 for line in f:
@@ -414,8 +536,9 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
                         filepath_normalized = filepath.lstrip('./')
                         basename = os.path.basename(filepath_normalized)
                         # Only add if not already in lookup (project-level takes priority)
-                        if basename not in md5_lookup:
-                            md5_lookup[basename] = md5_hash
+                        for key in _md5_key_variants(basename):
+                            if key not in md5_lookup:
+                                md5_lookup[key] = md5_hash
         except Exception as e:
             print(f"Error reading md5 file {md5_file}: {e}")
     
@@ -438,7 +561,7 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
 <tr>
 <td style="padding: 18px; background-color: #ffffff; border-radius: 14px; box-shadow: 0 14px 30px rgba(0, 34, 68, 0.12); border: 1px solid rgba(0, 50, 98, 0.06);">
 <p style="margin: 0 0 10px 0; line-height: 1.6;"><strong>Dear GRTHub User,</strong></p>
-<p style="margin: 0 0 10px 0; line-height: 1.6;">The sequencing data for the samples you submitted to the GRTHub has been processed and is now available for downloading in FastQ file format.</p>
+<p style="margin: 0 0 10px 0; line-height: 1.6;">The sequencing data for the samples you submitted to the GRTHub has been processed and is now available for downloading in FastQ file format. If you would like to work with your data on UCI HPC3, GRTHub staff can transfer the data directly for you; please contact GRTHub directly to facilitate this.</p>
 <p style="margin: 0 0 10px 0; line-height: 1.6;">Your fastq files will remain available for downloading during a period of <strong>1 month only</strong>. Please download your files immediately and verify their integrity using the provided md5sum values as soon as possible, and before the end of this period. After 1 month, the FastQ files will be deleted from our servers.</p>
 <p style="margin: 0; line-height: 1.6;"><strong>A file containing the md5sum for your FastQ files is included in this report. Instructions for downloading the files are attached.</strong></p>
 </td>
@@ -483,7 +606,7 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
 """
     
     # Find all samples from fastp JSONs.
-    # Structure: results/fastp/{config_id}/{project}/{stem}.json
+    # Structure: results/{config_id}/{project}/{stem}.fastp.json
     # Some flexbar projects keep fastp outputs under the original project name,
     # while the report is rendered for the renamed folder name. Search both.
     fastp_lookup_names = []
@@ -494,7 +617,7 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
 
     json_files = []
     for fastp_lookup_name in fastp_lookup_names:
-        json_pattern = os.path.join(fastp_base_dir, "*", fastp_lookup_name, "*.json")
+        json_pattern = os.path.join(fastp_base_dir, "*", fastp_lookup_name, "*.fastp.json")
         print(f"Searching for JSONs with pattern: {json_pattern}")
         json_files.extend(glob.glob(json_pattern))
 
@@ -509,7 +632,7 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
         try:
             config_id = parts[-3]
             if config_id not in renaming_maps:
-                map_path = f"results/renaming_map_{config_id}.csv"
+                map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
                 if os.path.exists(map_path):
                     try:
                         import pandas as pd
@@ -523,20 +646,19 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
     
     samples = {} # stem -> { config_id: { info... } }
     demux_stats_cache = {}  # config_id -> {(orig_project, index): num_reads}
+    fqtk_counts_cache = {}   # config_id -> {sample_name: num_reads}
     flexbar_counts_cache = {}  # config_id -> {barcode_name: {'r1': int|None, 'r2': int|None}}
+    flexbar_label_cache = {}   # config_id -> {barcode_label: sample_name}
 
     for json_file in json_files:
         # Extract config_id (lane)
-        # path: .../results/fastp/{config_id}/{project}/{stem}.json
+        # path: .../results/{config_id}/{project}/{stem}.fastp.json
         parts = json_file.split(os.sep)
-        # Assuming standard structure
         try:
-            # Find 'fastp' in path to locate config_id
-            # It should be the parent of the parent of the file
-            # .../fastp/lane1_.../project/file.json
-            # So config_id is parts[-3] if file is parts[-1]
             config_id = parts[-3]
             stem = os.path.splitext(os.path.basename(json_file))[0]
+            if stem.endswith('.fastp'):
+                stem = stem[:-6]
         except:
             print(f"Could not parse path: {json_file}")
             continue
@@ -601,8 +723,14 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
             read2_len = summary.get('read2_mean_length', 0)
             
             is_paired = read2_len > 0
+            # For flexbar projects, fastp only sees R1 so read2_mean_length is 0.
+            # Detect pairing by checking whether the seqtk-generated R2 file exists.
+            if not is_paired and not is_parse_or_10x(fastp_lookup_name):
+                candidate_r2 = os.path.join(output_base_dir, config_id, project, f"{stem}-R2.fastq.gz")
+                if os.path.exists(candidate_r2):
+                    is_paired = True
             paired_reads = None
-            
+
             # Extract Barcode from stem or sample_name
             # For 10x/Parse/BD: need to look up barcode from renaming map
             # For default: extract from stem format {run}-L{lane}-G{group}-{position}-{barcode}
@@ -650,6 +778,25 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
             _cache = demux_stats_cache.get(config_id, {})
             demux_reads = _cache.get((fastp_lookup_name, barcode)) or _cache.get((fastp_lookup_name, rc_index2(barcode)))
             paired_reads = demux_reads if (demux_reads is not None and demux_reads > 0) else "N/A"
+
+            # Fallback: for fqtk-staged reads, derive paired reads from fqtk demux-metrics.
+            if paired_reads == "N/A":
+                if config_id not in fqtk_counts_cache:
+                    fqtk_metrics_candidates = [
+                        os.path.join(output_base_dir, config_id, project, "demux-metrics.txt"),
+                        os.path.join(output_base_dir, config_id, "fqtk", "demux-metrics.txt"),
+                        os.path.join(output_base_dir, config_id, "demux-metrics.txt"),
+                    ]
+                    fqtk_counts_cache[config_id] = {}
+                    for fqtk_metrics in fqtk_metrics_candidates:
+                        if os.path.exists(fqtk_metrics):
+                            fqtk_counts_cache[config_id] = parse_fqtk_demux_metrics(fqtk_metrics)
+                            break
+
+                _fqtk_counts = fqtk_counts_cache.get(config_id, {})
+                fqtk_reads = _fqtk_counts.get(stem)
+                if isinstance(fqtk_reads, int) and fqtk_reads > 0:
+                    paired_reads = fqtk_reads
 
             # File paths: check if 10x/Parse/BD project (uses Illumina naming) or default (uses stem naming)
             
@@ -726,27 +873,35 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
                             break
 
             # Fallback: for flexbar-staged FASTQs, derive paired reads from flexbarOut.log
-            # by matching the staged FASTQ back to its flexbar output file.
+            # by looking up the barcode label in the flexbar barcodes file to get sample_name.
             if paired_reads == "N/A":
                 if config_id not in flexbar_counts_cache:
                     flexbar_log = os.path.join(output_base_dir, config_id, "flexbar", "flexbarOut.log")
                     flexbar_counts_cache[config_id] = parse_flexbar_written_reads(flexbar_log)
 
                 _flex_counts = flexbar_counts_cache.get(config_id, {})
-                try:
-                    flexbar_dir = os.path.join(output_base_dir, config_id, "flexbar")
-                    for barcode_name, rec in _flex_counts.items():
-                        candidate_r1 = os.path.join(flexbar_dir, f"flexbarOut_barcode_{barcode_name}.fastq.gz")
-                        if os.path.exists(candidate_r1) and os.path.samefile(candidate_r1, r1_path):
-                            r1_written = rec.get('r1')
-                            r2_written = rec.get('r2')
-                            if isinstance(r1_written, int) and isinstance(r2_written, int):
-                                paired_reads = min(r1_written, r2_written)
-                            elif isinstance(r1_written, int):
-                                paired_reads = r1_written
-                            break
-                except Exception:
-                    pass
+                if _flex_counts:
+                    if config_id not in flexbar_label_cache:
+                        _label_map = {}
+                        _bc_file = os.path.join("metadata", f"flexbar_barcodes_{config_id}.txt")
+                        if os.path.exists(_bc_file):
+                            with open(_bc_file) as _bfh:
+                                for _bline in _bfh:
+                                    _bp = _bline.strip().split('\t')
+                                    if len(_bp) >= 2 and _bp[0].strip() and _bp[1].strip():
+                                        _label_map[_bp[1].strip()] = _bp[0].strip()
+                        flexbar_label_cache[config_id] = _label_map
+
+                    _label_map = flexbar_label_cache.get(config_id, {})
+                    _sample_name = _label_map.get(barcode)
+                    if _sample_name and _sample_name in _flex_counts:
+                        rec = _flex_counts[_sample_name]
+                        r1_written = rec.get('r1')
+                        r2_written = rec.get('r2')
+                        if isinstance(r1_written, int) and isinstance(r2_written, int):
+                            paired_reads = min(r1_written, r2_written)
+                        elif isinstance(r1_written, int):
+                            paired_reads = r1_written
 
             # Skip index read md5 calculation (too slow for large files)
             
