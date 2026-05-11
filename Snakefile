@@ -56,6 +56,24 @@ NEXTCLOUD_DIR_PATH = config.get("nextcloud_dir_path", "nextcloud3")
 EMAIL_SENDER = config.get("email_sender", "kstachel@uci.edu")
 EMAIL_RECIPIENT = config.get("email_recipient", "kstachel@uci.edu")
 EMAIL_CC = config.get("email_cc", "kstachel@uci.edu")
+SEND_EMAILS = config.get("send_emails", True)
+
+def _cfg_truthy(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+# Nextcloud operations can be disabled explicitly via config and are also
+# auto-disabled when required Nextcloud environment variables are missing
+# (common on HPC3 where no Nextcloud instance is available).
+ENABLE_NEXTCLOUD = (
+    _cfg_truthy(config.get("enable_nextcloud", True))
+    and bool(str(NEXTCLOUD_URL).strip())
+    and bool(str(NEXTCLOUD_USER).strip())
+    and bool(str(NEXTCLOUD_PASSWORD).strip())
+)
 
 # Rule: rsync project to external drive specified in config.yaml
 EXTERNAL_DRIVE_PATH = config.get("external_drive_path", None)
@@ -974,6 +992,16 @@ rule flexbar_project_link:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         yaml_data = {project: {config_id: {}}}
 
+        if not ENABLE_NEXTCLOUD:
+            with open(log_file, 'w') as f:
+                f.write("Status: SKIPPED\n")
+                f.write("Reason: Nextcloud sharing disabled for this workflow run.\n")
+                f.write(f"Project: {project}\nConfig ID: {config_id}\nOrder ID: {order_id}\n")
+            yaml_data[project][config_id][order_id] = {"link": "", "group": "flexbar"}
+            with open(yaml_file, 'w') as yf:
+                _yaml.dump(yaml_data, yf, default_flow_style=False)
+            return
+
         def extract_share_url(xml_text):
             if not xml_text: return None
             m = re.search(r'<url>(.*?)</url>', xml_text)
@@ -1174,23 +1202,27 @@ rule send_order_email:
         subject  = lambda wildcards: f"Sequencing Report for Order {wildcards.order_id}"
     run:
         import subprocess, os
-        order_id = wildcards.order_id
-        attachments = f"{input.md5};{input.pdf}"
-        for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(order_id, []):
-            for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]:
-                extra = f"Reports/order_{order_id}/{prefix}_{cid}.{ext}"
-                if os.path.exists(extra):
-                    attachments += f";{extra}"
-        cmd = [
-            "python3", "src/send_email_retry.py",
-            params.script, params.sender, params.receiver,
-            params.subject, input.html, attachments,
-            params.cc_email, order_id
-        ]
-        with open(log[0], "w") as logf:
-            result = subprocess.run(cmd, stdout=logf, stderr=logf)
-        if result.returncode != 0:
-            raise RuntimeError(f"Email send failed (see {log[0]})")
+        if not SEND_EMAILS:
+            with open(log[0], "w") as logf:
+                logf.write("send_emails=false; skipping email send.\n")
+        else:
+            order_id = wildcards.order_id
+            attachments = f"{input.md5};{input.pdf}"
+            for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(order_id, []):
+                for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]:
+                    extra = f"Reports/order_{order_id}/{prefix}_{cid}.{ext}"
+                    if os.path.exists(extra):
+                        attachments += f";{extra}"
+            cmd = [
+                "python3", "src/send_email_retry.py",
+                params.script, params.sender, params.receiver,
+                params.subject, input.html, attachments,
+                params.cc_email, order_id
+            ]
+            with open(log[0], "w") as logf:
+                result = subprocess.run(cmd, stdout=logf, stderr=logf)
+            if result.returncode != 0:
+                raise RuntimeError(f"Email send failed (see {log[0]})")
 
 rule fastp_sample:
     input:
@@ -1389,10 +1421,13 @@ rule fastp_plots_sample:
     threads: 1
     shell:
         """
+        module load singularity
         mkdir -p $(dirname {output.mean})
         (
-        python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
-        python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
+        singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+            python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
+        singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+            python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
         ) > {log} 2>&1
         """
 
@@ -1742,8 +1777,20 @@ rule send_read_counts_email:
         subject = f"Read counts for {LIBRARY}",
         body = lambda wildcards: f"Attached: per-lane read counts for {LIBRARY}.",
         cc_email = EMAIL_CC
-    shell:
-        "python3 {params.script} {params.sender} {params.receiver} \"{params.subject}\" \"{params.body}\" {input.csv} {params.cc_email} > {log} 2>&1"
+    run:
+        import subprocess
+        if not SEND_EMAILS:
+            with open(log[0], "w") as logf:
+                logf.write("send_emails=false; skipping email send.\n")
+        else:
+            with open(log[0], "w") as logf:
+                result = subprocess.run(
+                    ["python3", params.script, params.sender, params.receiver,
+                     params.subject, params.body, input.csv, params.cc_email],
+                    stdout=logf, stderr=logf
+                )
+            if result.returncode != 0:
+                raise RuntimeError(f"Email send failed (see {log[0]})")
 
 rule fastp_plots_lane:
     input:
@@ -3230,6 +3277,20 @@ rule project_link:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
         yaml_data = {project: {config_id: {}}}
+
+        if not ENABLE_NEXTCLOUD:
+            with open(log_file, 'w') as f:
+                f.write("Status: SKIPPED\n")
+                f.write("Reason: Nextcloud sharing disabled for this workflow run.\n")
+                f.write(f"Project: {project}\n")
+                f.write(f"Config ID: {config_id}\n")
+                f.write(f"Order ID: {order_id}\n")
+                f.write(f"Group: {group}\n")
+            yaml_data[project][config_id][order_id] = {"link": "", "group": group}
+            import yaml as _yaml
+            with open(yaml_file, 'w') as yf:
+                _yaml.dump(yaml_data, yf, default_flow_style=False)
+            return
         
         # Helper: Extract Browser URL
         def extract_share_url(xml_text):
@@ -3433,9 +3494,16 @@ rule rescan_nextcloud:
         config_id = "[^/]+",
         project = ".+"
     params:
-        nc_path = lambda wildcards: f"/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{wildcards.config_id}/{wildcards.project}"
+        nc_path = lambda wildcards: f"/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{wildcards.config_id}/{wildcards.project}",
+        enable_nextcloud = ENABLE_NEXTCLOUD
     shell:
         """
+        if [ "{params.enable_nextcloud}" != "True" ]; then
+            echo "Status: SKIPPED" > {log}
+            echo "Reason: Nextcloud scan disabled for this workflow run." >> {log}
+            exit 0
+        fi
+
         # Read NC_PATH from the project_link log (written by project_link rule) and use that for scanning.
         nc_log={input}
         nc_path=$(grep '^NC_PATH:' "$nc_log" | sed 's/^NC_PATH: //') || true
@@ -3487,6 +3555,21 @@ rule verify_project_links:
         import subprocess
         import re
         import os
+
+        if not ENABLE_NEXTCLOUD:
+            msg = [
+                "Project Link Verification Report",
+                f"Config ID: {wildcards.config_id}",
+                f"Project: {wildcards.project}",
+                "Status: SKIPPED",
+                "Reason: Nextcloud verification disabled for this workflow run.",
+            ]
+            os.makedirs(os.path.dirname(output.report), exist_ok=True)
+            with open(output.report, 'w') as f:
+                f.write('\n'.join(msg))
+            with open(log[0], 'w') as f:
+                f.write('\n'.join(msg))
+            return
         
         config_id = wildcards.config_id
         project = wildcards.project

@@ -1,4 +1,6 @@
 # Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud)
+send_emails: false
+enable_nextcloud: false
 sample_sheet: "src/SampleSheet_default.csv"
 num_reads: 2
 library_name: ""

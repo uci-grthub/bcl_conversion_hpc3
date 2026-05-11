@@ -582,6 +582,8 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     # must be excluded so we don't incorrectly override their multi-group assignments.
     sheet_tab_group_lookup = {}
     flexbar_groups = set()  # (lane, group) pairs whose demux is handled by flexbar, not bcl-convert
+    # (lane, group) -> project name (prefer values from Summary sheet when present)
+    summary_project_lookup = {}
     try:
         xl = pd.ExcelFile(metadata_file)
         if 'Summary' in xl.sheet_names:
@@ -614,6 +616,38 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                             sheet_tab_group_lookup[(l, tab_norm)] = g
                     except:
                         pass
+            # Build a summary_project_lookup from Summary rows when possible.
+            # Try common column names, otherwise pick a heuristic value.
+            summary_samplename_lookup = {}  # Sample_Name -> (lane, group) for fallback lookup
+            for _, row in df_summary.iterrows():
+                try:
+                    l = int(float(row['Lane']))
+                    g = int(float(row['Gr']))
+                    proj = None
+                    for col in ['Project', 'Sample_Project', 'Project name', 'Project Name', 'Lab ID', 'Sample project']:
+                        if col in df_summary.columns:
+                            v = row.get(col)
+                            if pd.notna(v) and str(v).strip() and str(v).lower() != 'nan':
+                                proj = str(v).strip().replace(' ', '_')
+                                break
+                    if not proj:
+                        # Heuristic: pick first string-like cell with an underscore and reasonable length
+                        for v in row.values:
+                            if isinstance(v, str) and '_' in v and len(v) > 6 and v.lower() != 'nan':
+                                proj = v.strip().replace(' ', '_')
+                                break
+                    if proj:
+                        summary_project_lookup[(l, g)] = proj
+                    # Build Sample_Name lookup for fallback when group is missing
+                    for col in ['Sample_Name', 'Sample Name', 'Sample ID', 'Sample_ID']:
+                        if col in df_summary.columns:
+                            sname = row.get(col)
+                            if pd.notna(sname) and str(sname).strip() and str(sname).lower() != 'nan':
+                                sname_clean = str(sname).strip()
+                                summary_samplename_lookup[sname_clean] = (l, g)
+                                break
+                except:
+                    pass
     except Exception as e:
         print(f"Note: Could not build sheet_tab_group_lookup: {e}")
     
@@ -662,12 +696,19 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     continue
                 
                 # Group (for project lookup)
+                # Accept multiple column name variations: 'Group', 'group', 'Gr', 'gr'
                 if 'Group' in df.columns:
                     df['Group'] = df['Group'].ffill()
                     sheet_samples['Group'] = df['Group']
                 elif 'group' in df.columns:
                     df['group'] = df['group'].ffill()
                     sheet_samples['Group'] = df['group']
+                elif 'Gr' in df.columns:
+                    df['Gr'] = df['Gr'].ffill()
+                    sheet_samples['Group'] = df['Gr']
+                elif 'gr' in df.columns:
+                    df['gr'] = df['gr'].ffill()
+                    sheet_samples['Group'] = df['gr']
                 else:
                     sheet_samples['Group'] = pd.NA
 
@@ -706,12 +747,25 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                         try:
                             l = int(float(row['Lane']))
                             g = int(float(row['Group']))
+                            # Prefer Summary-derived mapping when available
+                            if (l, g) in summary_project_lookup:
+                                return summary_project_lookup[(l, g)]
                             # First check Barcode List lookup
                             if (l, g) in barcode_list_lookup:
                                 return barcode_list_lookup[(l, g)]
-                            # Then fall back to project_lookup
+                            # Then fall back to project_lookup passed in
                             return project_lookup.get((l, g), "")
                         except:
+                            # Fallback: if group is missing, try to match by Sample_Name
+                            try:
+                                if pd.notna(row.get('Sample_Name')) and str(row.get('Sample_Name')).strip():
+                                    sname = str(row.get('Sample_Name')).strip()
+                                    if sname in summary_samplename_lookup:
+                                        l, g = summary_samplename_lookup[sname]
+                                        if (l, g) in summary_project_lookup:
+                                            return summary_project_lookup[(l, g)]
+                            except:
+                                pass
                             return row['Project']
                     return row['Project']
                 

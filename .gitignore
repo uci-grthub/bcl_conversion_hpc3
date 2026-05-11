@@ -11,6 +11,7 @@ docker-compose.override.yml
 benchmarks/
 .output/
 output/
+.output_rc/
 .snakemake/
 Reports/
 src/__pycache__/metadata_validation.cpython-312.pyc
