@@ -21,3 +21,4 @@ snakemake_config_project.yaml
 scripts/parse-upload-1.2.1.sh
 scripts/parse-upload-1.2.1.py
 .claude/
+*.pyc
