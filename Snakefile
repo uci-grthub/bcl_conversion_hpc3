@@ -1802,35 +1802,32 @@ rule fastp_plots_lane:
     wildcard_constraints:
         lane = r"\d+"
 
-rule flexbar_per_config:
+rule flexbar_r1_per_config:
     input:
         bcl_done = ".output/{config_id}/.done",
         raw_barcodes = "metadata/flexbar_barcodes_{config_id}.txt",
         adapter = "src/flexbar/adapter.3.fa"
-    threads: 16
+    threads: 32
     priority: 99
     output:
-        touch("results/{config_id}/flexbar_{config_id}.done")
+        touch("results/{config_id}/flexbar_r1_{config_id}.done")
     log:
-        "logs/{config_id}/flexbar_{config_id}.log"
+        "logs/{config_id}/flexbar_r1_{config_id}.log"
     benchmark:
-        "benchmarks/flexbar_per_config_{config_id}.bench"
+        "benchmarks/flexbar_r1_per_config_{config_id}.bench"
     params:
         outdir = "output/{config_id}/flexbar",
-        lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
-        r1 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz",
-        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz",
         raw_barcodes_abs = lambda wildcards, input: os.path.abspath(input.raw_barcodes),
         barcodes_abs = lambda wildcards: os.path.abspath(f"metadata/flexbar_barcodes_{wildcards.config_id}.fasta"),
         adapter_abs = lambda wildcards, input: os.path.abspath(input.adapter),
-        r1_abs = lambda wildcards, input: os.path.abspath(f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz"),
+        r1_abs = lambda wildcards: os.path.abspath(f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz"),
         flexbar_bin = FLEXBAR_BIN
     shell:
         """
         (
         mkdir -p {params.outdir}
 
-        echo "Starting Flexbar processing for {wildcards.config_id}"
+        echo "Starting Flexbar R1 processing for {wildcards.config_id}"
 
         flexbar_cmd="{params.flexbar_bin}"
         if [ -z "$flexbar_cmd" ]; then
@@ -1882,6 +1879,30 @@ rule flexbar_per_config:
             --min-read-length 15 \
             --umi-tags \
             --target {params.outdir}/flexbarOut -n {threads}
+        ) > {log} 2>&1
+
+        touch {output}
+        """
+
+rule flexbar_per_config:
+    input:
+        r1_done = "results/{config_id}/flexbar_r1_{config_id}.done",
+        bcl_done = ".output/{config_id}/.done",
+    threads: 32
+    priority: 99
+    output:
+        touch("results/{config_id}/flexbar_{config_id}.done")
+    log:
+        "logs/{config_id}/flexbar_{config_id}.log"
+    benchmark:
+        "benchmarks/flexbar_per_config_{config_id}.bench"
+    params:
+        outdir = "output/{config_id}/flexbar",
+        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz",
+    shell:
+        """
+        (
+        module load singularity
 
         # Prepare headers and create each R2 with seqkit's internal threading.
         for r1_out in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
@@ -1897,7 +1918,7 @@ rule flexbar_per_config:
             zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 | sed 's/_[ATGCN]*$//' > "{params.outdir}/${{base_name}}_headers.txt"
 
             if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
-                seqkit grep -j {threads} -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz"
+                singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif seqkit grep -j {threads} -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz"
             else
                 echo "No reads found for $base_name"
             fi
@@ -2537,7 +2558,7 @@ rule bcl_convert:
     priority: 100
     resources:
         serial_operation=1,
-        mem_mb=131072
+        mem_mb=144000
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
