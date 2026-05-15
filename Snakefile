@@ -1879,6 +1879,31 @@ rule flexbar_r1_per_config:
             --min-read-length 15 \
             --umi-tags \
             --target {params.outdir}/flexbarOut -n {threads}
+
+        # Sanity check: if barcodes are in the wrong orientation nearly all reads
+        # land in unassigned. Fail early with a clear message rather than producing
+        # empty R2 files downstream.
+        unassigned_bytes=$(stat -c%s "{params.outdir}/flexbarOut_barcode_unassigned.fastq.gz" 2>/dev/null || echo 0)
+        assigned_bytes=0
+        for f in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
+            [[ "$f" == *"unassigned"* ]] && continue
+            assigned_bytes=$(( assigned_bytes + $(stat -c%s "$f" 2>/dev/null || echo 0) ))
+        done
+        total_bytes=$(( assigned_bytes + unassigned_bytes ))
+        echo "Barcode assignment: assigned=${{assigned_bytes}} unassigned=${{unassigned_bytes}} total=${{total_bytes}}"
+        if [ "$total_bytes" -gt 0 ]; then
+            # Use awk for floating-point: fail if assigned fraction < 0.01%
+            awk -v a="$assigned_bytes" -v t="$total_bytes" 'BEGIN {{
+                pct = a / t * 100
+                printf "Assigned fraction: %.4f%%\n", pct
+                if (pct < 0.01) {{
+                    print "ERROR: fewer than 0.01% of reads were assigned to named barcodes."
+                    print "This is consistent with barcodes in the wrong orientation (e.g. reverse complement vs forward)."
+                    print "Check metadata/flexbar_barcodes_{wildcards.config_id}.txt and the awk transform in flexbar_r1_per_config."
+                    exit 1
+                }}
+            }}'
+        fi
         ) > {log} 2>&1
 
         touch {output}
@@ -1890,6 +1915,8 @@ rule flexbar_per_config:
         bcl_done = ".output/{config_id}/.done",
     threads: 32
     priority: 99
+    resources:
+        mem_mb = 32000
     output:
         touch("results/{config_id}/flexbar_{config_id}.done")
     log:
@@ -1904,38 +1931,57 @@ rule flexbar_per_config:
         (
         module load singularity
 
-        # Prepare headers and create each R2 with seqkit's internal threading.
+        # Step 1: build all header files in parallel (zcat is I/O bound, safe to parallelize).
+        pids=()
+        base_names=()
         for r1_out in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
             [ -e "$r1_out" ] || continue
             base_name=$(basename "$r1_out" .fastq.gz)
-            # Skip R2 conversion for unassigned reads
-            if [[ "$base_name" == *"unassigned"* ]]; then
-                echo "Skipping R2 conversion for unassigned: $base_name"
+            if [[ "$base_name" == *"unassigned"* ]] || [[ "$base_name" == *"_R2" ]]; then
+                echo "Skipping: $base_name"
                 continue
             fi
-
             echo "Preparing headers for $base_name"
-            zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 | sed 's/_[ATGCN]*$//' > "{params.outdir}/${{base_name}}_headers.txt"
-
-            if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
-                singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif seqkit grep -j {threads} -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz"
-            else
-                echo "No reads found for $base_name"
-            fi
-
-            rm -f "{params.outdir}/${{base_name}}_headers.txt"
+            ( zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 | sed 's/_[ATGCN]*$//' > "{params.outdir}/${{base_name}}_headers.txt" ) &
+            pids+=($!)
+            base_names+=("$base_name")
         done
+        for pid in "${{pids[@]}}"; do wait "$pid" || {{ echo "Header extraction failed (pid $pid)" >&2; exit 1; }}; done
+
+        # Step 2: run all seqkit greps in parallel, splitting threads evenly.
+        n_samples="${{#base_names[@]}}"
+        threads_each=$(( {threads} / n_samples < 1 ? 1 : {threads} / n_samples ))
+        echo "$(date): launching $n_samples seqkit greps with $threads_each threads each"
+        pids=()
+        declare -A pid_to_name
+        for base_name in "${{base_names[@]}}"; do
+            if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
+                echo "$(date): starting seqkit grep for $base_name"
+                seqkit grep -j "$threads_each" -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz" &
+                pid=$!
+                pids+=($pid)
+                pid_to_name[$pid]="$base_name"
+            else
+                echo "$(date): no reads found for $base_name"
+            fi
+        done
+        for pid in "${{pids[@]}}"; do
+            wait "$pid" && echo "$(date): done ${{pid_to_name[$pid]}}" || {{ echo "$(date): seqkit grep failed for ${{pid_to_name[$pid]}} (pid $pid)" >&2; exit 1; }}
+        done
+
+        rm -f {params.outdir}/*_headers.txt
 
         curr_dir=$PWD
         cd {params.outdir}
-        md5sum *.fastq.gz > md5sum.txt
+        # Exclude unassigned (can be hundreds of GB) from md5sum/size — it is not staged out.
+        md5sum flexbarOut_barcode_*_R2.fastq.gz > md5sum.txt
         count=$(wc -l < md5sum.txt)
-        echo "Generated md5sum.txt with $count entries for {wildcards.config_id}"
+        echo "$(date): generated md5sum.txt with $count R2 entries for {wildcards.config_id}"
         if [ "$count" -eq 0 ]; then
-            echo "ERROR: md5sum.txt is empty, no .fastq.gz files found in {params.outdir}" >&2
+            echo "ERROR: md5sum.txt is empty, no R2 .fastq.gz files found in {params.outdir}" >&2
             exit 1
         fi
-        du -h *.fastq.gz > size.txt
+        du -h flexbarOut_barcode_*_R2.fastq.gz > size.txt
         cd $curr_dir
         ) > {log} 2>&1
 

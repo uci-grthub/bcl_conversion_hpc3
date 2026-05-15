@@ -14,14 +14,11 @@ output/
 .output_rc/
 .snakemake/
 Reports/
-src/__pycache__/metadata_validation.cpython-312.pyc
-src/__pycache__/rename_fastqs.cpython-312.pyc
 RunInfo.xml
 snakemake_config_project.yaml
 scripts/parse-upload-1.2.1.sh
 scripts/parse-upload-1.2.1.py
 .claude/
-*.pyc
 src/RunInfo_nn.xml
-src/__pycache__/rename_fastqs.cpython-39.pyc
-src/__pycache__/rename_fastqs.cpython-39.pyc
+*.pyc
+__pycache__/
