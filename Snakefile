@@ -57,6 +57,7 @@ EMAIL_SENDER = config.get("email_sender", "kstachel@uci.edu")
 EMAIL_RECIPIENT = config.get("email_recipient", "kstachel@uci.edu")
 EMAIL_CC = config.get("email_cc", "kstachel@uci.edu")
 SEND_EMAILS = config.get("send_emails", True)
+LOW_READS_THRESHOLD = config.get("low_reads_threshold", 1_000)
 
 def _cfg_truthy(value):
     if isinstance(value, bool):
@@ -579,14 +580,25 @@ for _fconfig, _forder_id in FLEXBAR_ORDER_ID_MAP.items():
             break
     if _fgroup is None:
         continue
+    _ffasta_path = f"metadata/flexbar_barcodes_{_fconfig}.fasta"
+    _ffasta_names = []
+    if os.path.exists(_ffasta_path):
+        with open(_ffasta_path) as _fff:
+            for _fline in _fff:
+                if _fline.startswith('>'):
+                    _ffasta_names.append(_fline[1:].strip())
     _frows = []
+    _frow_idx = 0
     with open(_fbarcode_path) as _fbf:
         for _fi, _fbline in enumerate(_fbf):
             _fparts = _fbline.strip().split('\t')
             if len(_fparts) >= 2 and _fparts[0].strip() and _fparts[1].strip():
+                _fname = (_ffasta_names[_frow_idx]
+                          if _ffasta_names and _frow_idx < len(_ffasta_names)
+                          else _fparts[0].strip())
                 _frows.append({
                     'Sample_Project': _fproj,
-                    'Sample_Name': _fparts[0].strip(),
+                    'Sample_Name': _fname,
                     'Run': LIBRARY,
                     'Lane': _flane,
                     'Group': _fgroup,
@@ -594,6 +606,7 @@ for _fconfig, _forder_id in FLEXBAR_ORDER_ID_MAP.items():
                     'index2': '',
                     'Position': f'P{_fi+1:03d}',
                 })
+                _frow_idx += 1
     if _frows:
         FLEXBAR_CONFIG_RENAMING_MAP[_fconfig] = _frows
 
@@ -2839,6 +2852,58 @@ rule bcl_project_done:
                     removed += 1
             if removed:
                 print(f"Removed {removed} index FASTQ file(s) from {proj_dir}")
+
+        # --- Low-reads alert ---
+        if SEND_EMAILS:
+            import csv, subprocess as _sp
+            _stats_candidates = [
+                f"output/{config_id}/Reports/Demultiplex_Stats.csv",
+                f".output/{config_id}/Reports/Demultiplex_Stats.csv",
+                f".output_rc/{config_id}/Reports/Demultiplex_Stats.csv",
+            ]
+            _stats_path = next((p for p in _stats_candidates if os.path.exists(p)), None)
+            if _stats_path:
+                with open(_stats_path) as _sf:
+                    _proj_rows = [
+                        r for r in csv.DictReader(_sf)
+                        if r.get('Sample_Project') in (old_project, new_project)
+                        and r.get('SampleID', r.get('Sample_ID', '')) != 'Undetermined'
+                    ]
+                if _proj_rows:
+                    _zero, _low = [], []
+                    for _r in _proj_rows:
+                        _n = int(_r.get('# Reads', 0) or 0)
+                        _sid = _r.get('SampleID', _r.get('Sample_ID', '?'))
+                        if _n == 0:
+                            _zero.append((_sid, _n))
+                        elif _n < LOW_READS_THRESHOLD:
+                            _low.append((_sid, _n))
+                    _all_low = len(_low) == len(_proj_rows)
+                    if _zero or _all_low:
+                        _lines = [
+                            f"Low-reads alert for {LIBRARY}",
+                            f"Lane/config: {config_id}   Project: {new_project}",
+                            f"Stats file:  {_stats_path}",
+                            "",
+                        ]
+                        if _zero:
+                            _lines.append("Samples with ZERO reads:")
+                            for _sid, _n in _zero:
+                                _lines.append(f"  {_sid:<40} {_n:>12,}")
+                        if _all_low:
+                            _lines.append(f"ALL samples below threshold ({LOW_READS_THRESHOLD:,} reads):")
+                            for _sid, _n in _low:
+                                _lines.append(f"  {_sid:<40} {_n:>12,}")
+                        _body = "\n".join(_lines)
+                        _subject = f"[{LIBRARY}] Low reads: {config_id} {new_project}"
+                        try:
+                            _sp.run(
+                                ["python3", "src/send_email.py",
+                                 EMAIL_SENDER, EMAIL_RECIPIENT, _subject, _body, "none", EMAIL_CC],
+                                check=True, capture_output=True
+                            )
+                        except Exception as _e:
+                            print(f"Warning: low-reads alert email failed: {_e}")
 
 rule calculate_md5sums:
     input:
