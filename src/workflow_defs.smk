@@ -1740,6 +1740,50 @@ def _fastp_row_path(row, idx):
     stem = f"{run}-L{lane}-G{group}-{position}-{barcode}"
     return f"{output_project}/{stem}" if output_project and output_project.lower() != 'nan' else stem
 
+def _load_demux_barcode_lookup(config_id):
+    """Return {(project, sample_id): (index1, index2)} from Demultiplex_Stats.csv.
+
+    On NovaSeq X Plus, BCL-convert 4.4.6 outputs i5 as the reverse complement of
+    the sample-sheet sequence.  rename_fastqs.py already uses this lookup to name
+    files correctly; this helper lets the fastp input functions stay consistent.
+    """
+    demux_csv = f".output/{config_id}/Reports/Demultiplex_Stats.csv"
+    lookup = {}
+    if not os.path.exists(demux_csv):
+        return lookup
+    try:
+        demux_df = pd.read_csv(demux_csv)
+        for _, drow in demux_df.iterrows():
+            proj = str(drow.get('Sample_Project', '')).strip()
+            sid  = str(drow.get('SampleID', '')).strip()
+            idx  = str(drow.get('Index', '')).strip().rstrip('-')
+            if not (proj and sid and idx):
+                continue
+            parts = idx.split('-', 1)
+            i1 = parts[0]
+            i2 = parts[1] if len(parts) > 1 else ''
+            lookup[(proj, sid)] = (i1, i2)
+    except Exception as e:
+        print(f"Warning: could not load {demux_csv}: {e}")
+    return lookup
+
+
+def _patch_demux_barcodes(df, config_id):
+    """Overwrite index/index2 in df with actual barcodes from Demultiplex_Stats.csv."""
+    lookup = _load_demux_barcode_lookup(config_id)
+    if not lookup:
+        return df
+    df = df.copy()
+    for i in df.index:
+        proj = str(df.at[i, 'Sample_Project']).strip()
+        sid  = str(df.at[i, 'Sample_Name']).strip()
+        if (proj, sid) in lookup:
+            i1, i2 = lookup[(proj, sid)]
+            df.at[i, 'index']  = i1
+            df.at[i, 'index2'] = i2
+    return df
+
+
 def _fastp_rows_for_config(config_id):
     frames = []
     map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
@@ -1759,7 +1803,7 @@ def _fastp_rows_for_config(config_id):
 
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True)
+    return _patch_demux_barcodes(pd.concat(frames, ignore_index=True), config_id)
 
 def get_fastp_targets(wildcards):
     config_id = wildcards.config_id
@@ -1820,6 +1864,8 @@ def get_fastp_sample_input(wildcards):
 
     if df is None:
         raise ValueError(f"Renaming map not found and no flexbar/fqtk rows available: {config_id}")
+
+    df = _patch_demux_barcodes(df, config_id)
 
     try:
         for idx, row in df.iterrows():

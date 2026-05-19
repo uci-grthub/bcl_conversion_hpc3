@@ -2646,6 +2646,7 @@ rule bcl_convert:
             --bcl-input-directory {input.data_dir} \
             --output-directory "$dragen_out" \
             --force \
+            --run-info {params.run_info_path} \
             --bcl-sampleproject-subdirectories true \
             --sample-sheet "$sample_sheet_path" \
             --strict-mode false \
