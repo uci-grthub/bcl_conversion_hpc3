@@ -6,6 +6,7 @@ singularity-args: >-
   --bind /dfs9
   --bind /tmp/bcl-convert-logs:/var/log/bcl-convert
   --env PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+retries: 3
 cores: 16
 default-resources:
   slurm_partition: free

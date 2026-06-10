@@ -1865,8 +1865,6 @@ def get_fastp_sample_input(wildcards):
     if df is None:
         raise ValueError(f"Renaming map not found and no flexbar/fqtk rows available: {config_id}")
 
-    df = _patch_demux_barcodes(df, config_id)
-
     try:
         for idx, row in df.iterrows():
             path = _fastp_row_path(row, idx)
