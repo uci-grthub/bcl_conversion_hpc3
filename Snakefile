@@ -123,7 +123,7 @@ if _restrict_lanes:
 # Metadata path from merged config (project-specific if exists, otherwise base config)
 metadata = config.get("metadata", "metadata/SampleSheet.xlsx")
 METADATA_FILE = config.get("metadata")  # From merged config
-VALIDATION_XLSX = f"metadata/metadata_validation_{os.path.basename(metadata)}.xlsx" if metadata else None
+VALIDATION_XLSX = f"metadata/metadata_validation_{os.path.splitext(os.path.basename(metadata))[0]}.xlsx" if metadata else None
 LANE_CONFIGS = []
 PROJECT_LOOKUP = {}
 MASKING_LOOKUP = {}
@@ -195,9 +195,9 @@ if METADATA_FILE and os.path.exists(METADATA_FILE):
                         s = str(v).strip()
                         if not s or s.lower() == 'nan':
                             continue
-                        m = re.match(r'^\d+[iI]-\d+$', s)
+                        m = re.match(r'^(?:order_)?(\d+[iI]-\d+)$', s)
                         if m:
-                            order_ids.append(s.replace('i', 'I'))
+                            order_ids.append(m.group(1).replace('i', 'I'))
                         else:
                             project_candidates.append(s.replace(' ', '_'))
 
@@ -722,12 +722,14 @@ rule all:
         ORDER_ID_MD5S,
         expand("results/{config_id}/fastp_plots_summary_lane{lane}.done", config_id=CONFIG_IDS, lane=detected_lanes),
         expand("results/undetermined_indices/{config_id}.csv", config_id=CONFIG_IDS),
+        expand("results/undetermined_indices/{config_id}_rc.csv", config_id=CONFIG_IDS),
         expand("results/{config_id}/{project}/read_counts_{project}.csv", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         # expand("logs/{config_id}/project_link_{config_id}_{project}.log", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         expand("logs/{config_id}/project_links_{config_id}---{project}.yaml", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         f"results/{LIBRARY}-count.csv",
         f"Reports/{LIBRARY}_read_counts_email.done",
         expand("Reports/order_{order_id}/email_sent.done", order_id=ACTIVE_ORDER_IDS + FLEXBAR_ACTIVE_ORDER_IDS),
+        expand("output/{config_id}/{project}/.low_reads_checked", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         expand("logs/{config_id}/verify_project_link_{config_id}---{project}.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         ([VALIDATION_XLSX] if VALIDATION_XLSX else []),
         expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
@@ -2854,57 +2856,122 @@ rule bcl_project_done:
             if removed:
                 print(f"Removed {removed} index FASTQ file(s) from {proj_dir}")
 
-        # --- Low-reads alert ---
-        if SEND_EMAILS:
-            import csv, subprocess as _sp
-            _stats_candidates = [
-                f"output/{config_id}/Reports/Demultiplex_Stats.csv",
-                f".output/{config_id}/Reports/Demultiplex_Stats.csv",
-                f".output_rc/{config_id}/Reports/Demultiplex_Stats.csv",
-            ]
-            _stats_path = next((p for p in _stats_candidates if os.path.exists(p)), None)
-            if _stats_path:
-                with open(_stats_path) as _sf:
-                    _proj_rows = [
-                        r for r in csv.DictReader(_sf)
-                        if r.get('Sample_Project') in (old_project, new_project)
-                        and r.get('SampleID', r.get('Sample_ID', '')) != 'Undetermined'
-                    ]
-                if _proj_rows:
-                    _zero, _low = [], []
-                    for _r in _proj_rows:
-                        _n = int(_r.get('# Reads', 0) or 0)
-                        _sid = _r.get('SampleID', _r.get('Sample_ID', '?'))
-                        if _n == 0:
-                            _zero.append((_sid, _n))
-                        elif _n < LOW_READS_THRESHOLD:
-                            _low.append((_sid, _n))
-                    _all_low = len(_low) == len(_proj_rows)
-                    if _zero or _all_low:
-                        _lines = [
-                            f"Low-reads alert for {LIBRARY}",
-                            f"Lane/config: {config_id}   Project: {new_project}",
-                            f"Stats file:  {_stats_path}",
-                            "",
-                        ]
-                        if _zero:
-                            _lines.append("Samples with ZERO reads:")
-                            for _sid, _n in _zero:
-                                _lines.append(f"  {_sid:<40} {_n:>12,}")
-                        if _all_low:
-                            _lines.append(f"ALL samples below threshold ({LOW_READS_THRESHOLD:,} reads):")
-                            for _sid, _n in _low:
-                                _lines.append(f"  {_sid:<40} {_n:>12,}")
-                        _body = "\n".join(_lines)
-                        _subject = f"[{LIBRARY}] Low reads: {config_id} {new_project}"
-                        try:
-                            _sp.run(
-                                ["python3", "src/send_email.py",
-                                 EMAIL_SENDER, EMAIL_RECIPIENT, _subject, _body, "none", EMAIL_CC],
-                                check=True, capture_output=True
-                            )
-                        except Exception as _e:
-                            print(f"Warning: low-reads alert email failed: {_e}")
+rule check_low_reads:
+    """Send an alert email if any sample in a project has zero or low reads after bcl_project_done.
+
+    Reads Demultiplex_Stats.csv for the config_id and flags any sample belonging
+    to this project whose read count is below LOW_READS_THRESHOLD.  The sentinel
+    is always created so the pipeline is never blocked; the email is optional and
+    is gated on SEND_EMAILS (disabled on HPC3 where no mail relay is configured).
+    """
+    input:
+        project_done = "output/{config_id}/{project}/.project_done"
+    output:
+        sentinel = touch("output/{config_id}/{project}/.low_reads_checked")
+    wildcard_constraints:
+        config_id = "[^/]+",
+        project   = "[^/]+"
+    priority: 99
+    params:
+        sender    = EMAIL_SENDER,
+        receiver  = EMAIL_RECIPIENT,
+        cc        = EMAIL_CC,
+        threshold = LOW_READS_THRESHOLD,
+        library   = LIBRARY,
+    log:
+        "logs/{config_id}/check_low_reads_{config_id}_{project}.log"
+    run:
+        import os, subprocess, sys
+        import pandas as pd
+
+        config_id = wildcards.config_id
+        project   = wildcards.project
+        threshold = int(params.threshold)
+
+        log_fh = open(log[0], "w")
+        def _log(msg):
+            print(msg, file=log_fh, flush=True)
+
+        demux_path = os.path.join("output", config_id, "Reports", "Demultiplex_Stats.csv")
+        if not os.path.exists(demux_path):
+            _log(f"Demultiplex_Stats.csv not found at {demux_path}; skipping low-reads check.")
+            log_fh.close()
+        else:
+            try:
+                df = pd.read_csv(demux_path)
+            except Exception as e:
+                _log(f"Could not read {demux_path}: {e}")
+                log_fh.close()
+            else:
+                # Accept both old Sample_Project and new-name project
+                target_projects = {project}
+                for (cid, old_p), new_p in PROJECT_RENAME_MAP.items():
+                    if cid == config_id:
+                        if old_p == project:
+                            target_projects.add(new_p)
+                        elif new_p == project:
+                            target_projects.add(old_p)
+
+                if "Sample_Project" not in df.columns or "# Reads" not in df.columns:
+                    _log(f"Expected columns missing in {demux_path}; skipping.")
+                    log_fh.close()
+                else:
+                    proj_rows = df[df["Sample_Project"].astype(str).isin(target_projects)].copy()
+                    proj_rows["_reads"] = pd.to_numeric(proj_rows["# Reads"], errors="coerce").fillna(0).astype(int)
+                    low = proj_rows[proj_rows["_reads"] < threshold]
+
+                    if low.empty:
+                        _log(f"All samples in {project} ({config_id}) have >= {threshold} reads. No alert needed.")
+                        log_fh.close()
+                    else:
+                        lines = []
+                        for _, row in low.iterrows():
+                            sid   = str(row.get("SampleID", row.get("Sample_ID", "unknown"))).strip()
+                            reads = int(row["_reads"])
+                            lines.append(f"  {sid}: {reads:,} reads")
+                        sample_list = "\n".join(lines)
+                        all_zero = (low["_reads"] == 0).all()
+                        severity  = "ZERO" if all_zero else "LOW"
+                        n_affected = len(low)
+                        n_total    = len(proj_rows)
+
+                        subject = (
+                            f"[{severity} READS] {params.library} — {project} ({config_id}): "
+                            f"{n_affected}/{n_total} sample(s) below {threshold:,} reads"
+                        )
+                        body = (
+                            f"Low-reads alert for library {params.library}\n\n"
+                            f"Config:  {config_id}\n"
+                            f"Project: {project}\n"
+                            f"Threshold: {threshold:,} reads\n\n"
+                            f"{n_affected} of {n_total} sample(s) are below threshold:\n"
+                            f"{sample_list}\n\n"
+                            f"Please review the demultiplex report at:\n"
+                            f"  output/{config_id}/Reports/Demultiplex_Stats.csv\n"
+                        )
+                        if not SEND_EMAILS:
+                            _log(f"SEND_EMAILS disabled; would have sent {severity} READS alert for "
+                                 f"{n_affected} sample(s):\n{sample_list}")
+                            log_fh.close()
+                        else:
+                            _log(f"Sending {severity} READS alert for {n_affected} sample(s):\n{sample_list}")
+                            try:
+                                result = subprocess.run(
+                                    [
+                                        "python3", "src/send_email.py",
+                                        params.sender, params.receiver, subject, body,
+                                        "none", params.cc,
+                                    ],
+                                    capture_output=True, text=True
+                                )
+                                _log(result.stdout)
+                                if result.returncode != 0:
+                                    _log(f"Warning: email send returned exit code {result.returncode}:\n{result.stderr}")
+                                else:
+                                    _log("Alert email sent successfully.")
+                            except Exception as e:
+                                _log(f"Warning: failed to send alert email: {e}")
+                            log_fh.close()
 
 rule calculate_md5sums:
     input:
@@ -2922,10 +2989,8 @@ rule calculate_md5sums:
     shell:
         """
         (
-        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        
         cd output/{wildcards.config_id}/{wildcards.project}
-        ls -1 *.fastq.gz 2>/dev/null | while read f; do md5sum "$f"; done | sort -k2 > md5sums.txt
+        find . -name '*.fastq.gz' \\( -type f -o -type l \\) -print0 | xargs -0 -P 8 md5sum | sort -k2 > md5sums.txt
         count=$(wc -l < md5sums.txt)
         echo "Generated md5sums.txt with $count entries for {wildcards.project}"
         if [ "$count" -eq 0 ]; then
@@ -2989,6 +3054,54 @@ rule analyze_undetermined:
                     writer.writerow([count, itype, seq])
 
             logf.write(f"Converted {len(rows)} barcodes from {params.barcodes}\n")
+
+rule analyze_undetermined_rc:
+    """Convert RC-pass Top_Unknown_Barcodes to the same CSV format as analyze_undetermined.
+    Runs after pick_orientation so the RC pass is guaranteed to exist (or was skipped).
+    Writes an empty file if no RC pass was run for this config_id.
+    """
+    input:
+        decision = "logs/{config_id}/orientation_decision_{config_id}.json",
+        done_rc = ".output_rc/{config_id}/.done"
+    output:
+        csv = "results/undetermined_indices/{config_id}_rc.csv"
+    log:
+        "logs/{config_id}/analyze_undetermined_rc_{config_id}.log"
+    benchmark:
+        "benchmarks/analyze_undetermined_rc_{config_id}.bench"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    run:
+        import csv as csv_mod
+        import os
+
+        barcodes_path = f".output_rc/{wildcards.config_id}/Reports/Top_Unknown_Barcodes.csv"
+        os.makedirs(os.path.dirname(output.csv), exist_ok=True)
+        with open(log[0], 'w') as logf:
+            if not os.path.exists(barcodes_path):
+                logf.write(f"No RC pass barcodes file at {barcodes_path}; writing empty CSV.\n")
+                with open(output.csv, 'w', newline='') as f:
+                    csv_mod.writer(f).writerow(['Count', 'Type', 'Index Sequence'])
+                return
+
+            rows = []
+            with open(barcodes_path) as f:
+                reader = csv_mod.DictReader(f)
+                for r in reader:
+                    idx1 = r.get('index', '').strip()
+                    idx2 = r.get('index2', '').strip()
+                    count = int(r.get('# Reads', '0'))
+                    seq = f"{idx1}+{idx2}" if idx2 else idx1
+                    index_type = "Dual" if idx2 else "Single"
+                    rows.append((count, index_type, seq))
+
+            with open(output.csv, 'w', newline='') as f:
+                writer = csv_mod.writer(f)
+                writer.writerow(['Count', 'Type', 'Index Sequence'])
+                for count, itype, seq in rows:
+                    writer.writerow([count, itype, seq])
+
+            logf.write(f"Converted {len(rows)} barcodes from {barcodes_path}\n")
 
 rule detect_rc_candidates:
     """Detect projects with likely i7 reverse-complement orientation issues
@@ -3169,6 +3282,7 @@ rule bcl_convert_rc:
                 "--sample-sheet", str(input.rc_samplesheet),
                 "--strict-mode", "false",
                 "--bcl-only-lane", str(params.lane),
+                "--run-info", str(params.run_info_path),
                 "--bcl-num-parallel-tiles", "1",
                 "--bcl-num-conversion-threads", "8",
                 "--bcl-num-compression-threads", "8",
@@ -3295,18 +3409,24 @@ rule pick_orientation:
                             os_mod.remove(item_path)
 
         # Remove Undetermined*.fastq.gz from .output unless needed for flexbar.
+        # Also remove original project dirs for RC-winning projects — their reads
+        # came from the original (wrong-orientation) demux and are superseded by
+        # the RC pass already in .output_rc.
         orig_lane_dir = f".output/{wildcards.config_id}"
         if os_mod.path.isdir(orig_lane_dir):
             with open(log[0], 'a') as lf:
                 for item in os_mod.listdir(orig_lane_dir):
+                    item_path = os_mod.path.join(orig_lane_dir, item)
                     if item.startswith('Undetermined') and item.endswith('.fastq.gz'):
-                        item_path = os_mod.path.join(orig_lane_dir, item)
                         if os_mod.path.isfile(item_path):
                             if preserve_undetermined:
                                 lf.write(f"Preserving original undetermined reads for flexbar lane: {item_path}\n")
                             else:
                                 lf.write(f"Removing original undetermined reads: {item_path}\n")
                                 os_mod.remove(item_path)
+                    elif os_mod.path.isdir(item_path) and item in rc_projects:
+                        lf.write(f"Removing original staging dir for RC-winning project: {item_path}\n")
+                        _shutil_rc.rmtree(item_path)
 
 rule update_validation_workbook:
     """Regenerate the metadata validation workbook after all orientation decisions
@@ -3383,13 +3503,15 @@ rule project_link:
     run:
         import traceback
         import subprocess
+        import sys
         from pathlib import Path
         import time
         import urllib.parse
         import re
         import os
         import shlex
-        
+        import glob as _glob
+
         config_id = wildcards.config_id
         project = wildcards.project
         order_id = params.order_id
@@ -3448,6 +3570,11 @@ rule project_link:
                 return m2.group(1)
             return None
 
+        def extract_share_id(xml_text):
+            if not xml_text: return None
+            m = re.search(r'<id>(\d+)</id>', xml_text)
+            return m.group(1) if m else None
+
         def extract_internal_path(xml_text):
             if not xml_text: return None
             m = re.search(r'<path>(.*?)</path>', xml_text)
@@ -3483,6 +3610,8 @@ rule project_link:
                 retry_count = 0
                 share_url = None
                 share_token = None
+                share_id_num = None
+                share_xml = None
                 rate_limited = False
                 last_error = None
                 
@@ -3515,6 +3644,7 @@ rule project_link:
                             # Success - extract data from response
                             share_url = extract_share_url(share_xml)
                             share_token = extract_share_token(share_xml)
+                            share_id_num = extract_share_id(share_xml)
                             if share_url and share_token:
                                 try:
                                     owner = extract_share_owner(share_xml)
@@ -3532,6 +3662,7 @@ rule project_link:
                             share_xml = fetch_existing_share(nc_path, None)
                             share_url = extract_share_url(share_xml)
                             share_token = extract_share_token(share_xml)
+                            share_id_num = extract_share_id(share_xml)
                             if share_url and share_token:
                                 try:
                                     owner = extract_share_owner(share_xml)
@@ -3558,6 +3689,39 @@ rule project_link:
                         last_error = f"Exception: {str(e)}"
                         if retry_count < max_retries:
                             time.sleep(wait_time)
+
+                # --- RESTORE PRIOR TOKEN FROM EXISTING LOGS ---
+                # Nextcloud re-shares get a fresh token each run, which breaks links already
+                # sent to users. If a prior successful share for this nc_path recorded a token,
+                # push it back so the public URL stays stable across pipeline re-runs.
+                if share_url and share_token and share_id_num:
+                    old_token = None
+                    for lp in sorted(_glob.glob("logs/**/project_link_*.log", recursive=True)):
+                        if os.path.abspath(lp) == os.path.abspath(log_file):
+                            continue
+                        try:
+                            content = Path(lp).read_text()
+                            if f"NC_PATH: {nc_path}" in content and "Status: SUCCESS" in content:
+                                m = re.search(r'^WebDAV Token: (\S+)', content, re.MULTILINE)
+                                if m:
+                                    old_token = m.group(1)
+                                    break
+                        except Exception:
+                            pass
+                    if old_token and old_token != share_token:
+                        put_cmd = [
+                            sys.executable, "scripts/test_nextcloud_token.py",
+                            "--share-id", share_id_num,
+                            "--token", old_token
+                        ]
+                        executed_cmds.append(put_cmd)
+                        put_result = subprocess.run(put_cmd, capture_output=True, text=True, timeout=30)
+                        m_token = re.search(r'New Token\s*:\s*(\S+)', put_result.stdout)
+                        m_url = re.search(r'New URL\s*:\s*(\S+)', put_result.stdout)
+                        if m_token:
+                            share_token = m_token.group(1)
+                        if m_url:
+                            share_url = m_url.group(1)
 
                 # --- LOGGING WEB DAV CREDENTIALS AND EXECUTED COMMANDS ---
                 with open(log_file, 'w') as f:

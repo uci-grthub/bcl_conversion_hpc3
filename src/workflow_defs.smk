@@ -530,6 +530,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     # Produce a metadata validation workbook (highlighted copy + RECOMMENDED_CHANGES tab)
     # Regenerate if: xlsx missing, metadata newer, or any orientation_decision file is newer
     # (the RC_ORIENTATION sheet needs decision files that may not exist on first pass).
+    out_xlsx = None
     try:
         _base = os.path.splitext(os.path.basename(metadata_file))[0]
         out_xlsx = os.path.join('metadata', f"metadata_validation_{_base}.xlsx")
@@ -543,6 +544,11 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
             validate_metadata_and_write_report(metadata_file, out_xlsx=out_xlsx)
     except Exception as e:
         print(f"Warning: metadata validation report generation failed: {e}")
+
+    # Use validated xlsx as data source for sample sheet construction if available.
+    # RECOMMENDED_CHANGES and RC_ORIENTATION sheets are retained in the xlsx for
+    # inspection but skipped during sample iteration below.
+    _data_file = out_xlsx if (out_xlsx and os.path.exists(out_xlsx)) else metadata_file
     
     # Detect metadata format: MiSeq (simple) vs NovaSeqX (complex with Summary sheet)
     try:
@@ -582,8 +588,6 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     # must be excluded so we don't incorrectly override their multi-group assignments.
     sheet_tab_group_lookup = {}
     flexbar_groups = set()  # (lane, group) pairs whose demux is handled by flexbar, not bcl-convert
-    # (lane, group) -> project name (prefer values from Summary sheet when present)
-    summary_project_lookup = {}
     try:
         xl = pd.ExcelFile(metadata_file)
         if 'Summary' in xl.sheet_names:
@@ -616,54 +620,22 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                             sheet_tab_group_lookup[(l, tab_norm)] = g
                     except:
                         pass
-            # Build a summary_project_lookup from Summary rows when possible.
-            # Try common column names, otherwise pick a heuristic value.
-            summary_samplename_lookup = {}  # Sample_Name -> (lane, group) for fallback lookup
-            for _, row in df_summary.iterrows():
-                try:
-                    l = int(float(row['Lane']))
-                    g = int(float(row['Gr']))
-                    proj = None
-                    for col in ['Project', 'Sample_Project', 'Project name', 'Project Name', 'Lab ID', 'Sample project']:
-                        if col in df_summary.columns:
-                            v = row.get(col)
-                            if pd.notna(v) and str(v).strip() and str(v).lower() != 'nan':
-                                proj = str(v).strip().replace(' ', '_')
-                                break
-                    if not proj:
-                        # Heuristic: pick first string-like cell with an underscore and reasonable length
-                        for v in row.values:
-                            if isinstance(v, str) and '_' in v and len(v) > 6 and v.lower() != 'nan':
-                                proj = v.strip().replace(' ', '_')
-                                break
-                    if proj:
-                        summary_project_lookup[(l, g)] = proj
-                    # Build Sample_Name lookup for fallback when group is missing
-                    for col in ['Sample_Name', 'Sample Name', 'Sample ID', 'Sample_ID']:
-                        if col in df_summary.columns:
-                            sname = row.get(col)
-                            if pd.notna(sname) and str(sname).strip() and str(sname).lower() != 'nan':
-                                sname_clean = str(sname).strip()
-                                summary_samplename_lookup[sname_clean] = (l, g)
-                                break
-                except:
-                    pass
     except Exception as e:
         print(f"Note: Could not build sheet_tab_group_lookup: {e}")
     
     all_samples = pd.DataFrame()
     
     try:
-        xl = pd.ExcelFile(metadata_file)
+        xl = pd.ExcelFile(_data_file)
         for sheet in xl.sheet_names:
-            if sheet == "Summary":
+            if sheet in ("Summary", "RECOMMENDED_CHANGES", "RC_ORIENTATION"):
                 continue
-            
+
             # print(f"Reading sheet: {sheet}")
             try:
                 # Read raw to find header
-                df_raw = pd.read_excel(metadata_file, sheet_name=sheet, header=None)
-                
+                df_raw = pd.read_excel(_data_file, sheet_name=sheet, header=None)
+
                 header_row = -1
                 for i, row in df_raw.iterrows():
                     row_values = [str(x).strip() for x in row.values]
@@ -671,12 +643,12 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     if "Lane" in row_values and ("Sample_ID" in row_values or "Sample Name" in row_values or "Sample_Name" in row_values):
                         header_row = i
                         break
-                
+
                 if header_row == -1:
                     print(f"Could not find header in sheet {sheet}, skipping.")
                     continue
-                    
-                df = pd.read_excel(metadata_file, sheet_name=sheet, header=header_row)
+
+                df = pd.read_excel(_data_file, sheet_name=sheet, header=header_row)
                 
                 # Remove NBSP characters
                 for col in df.select_dtypes(include=['object']).columns:
@@ -696,16 +668,12 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     continue
                 
                 # Group (for project lookup)
-                # Accept multiple column name variations: 'Group', 'group', 'Gr', 'gr'
                 if 'Group' in df.columns:
                     df['Group'] = df['Group'].ffill()
                     sheet_samples['Group'] = df['Group']
                 elif 'group' in df.columns:
                     df['group'] = df['group'].ffill()
                     sheet_samples['Group'] = df['group']
-                elif 'Gr' in df.columns:
-                    df['Gr'] = df['Gr'].ffill()
-                    sheet_samples['Group'] = df['Gr']
                 elif 'gr' in df.columns:
                     df['gr'] = df['gr'].ffill()
                     sheet_samples['Group'] = df['gr']
@@ -732,7 +700,10 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                         pass
 
                 # Project
-                if 'Project name' in df.columns:
+                if 'Project' in df.columns and not (df['Project'].isna() | (df['Project'].astype(str).str.strip() == '')).all():
+                    df['Project'] = df['Project'].ffill()
+                    sheet_samples['Project'] = df['Project'].astype(str).str.strip().str.replace(' ', '_', regex=False)
+                elif 'Project name' in df.columns:
                     df['Project name'] = df['Project name'].ffill()
                     sheet_samples['Project'] = df['Project name'].astype(str).str.strip().str.replace(' ', '_', regex=False)
                 elif 'Sample_Project' in df.columns:
@@ -747,25 +718,12 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                         try:
                             l = int(float(row['Lane']))
                             g = int(float(row['Group']))
-                            # Prefer Summary-derived mapping when available
-                            if (l, g) in summary_project_lookup:
-                                return summary_project_lookup[(l, g)]
                             # First check Barcode List lookup
                             if (l, g) in barcode_list_lookup:
                                 return barcode_list_lookup[(l, g)]
-                            # Then fall back to project_lookup passed in
+                            # Then fall back to project_lookup
                             return project_lookup.get((l, g), "")
                         except:
-                            # Fallback: if group is missing, try to match by Sample_Name
-                            try:
-                                if pd.notna(row.get('Sample_Name')) and str(row.get('Sample_Name')).strip():
-                                    sname = str(row.get('Sample_Name')).strip()
-                                    if sname in summary_samplename_lookup:
-                                        l, g = summary_samplename_lookup[sname]
-                                        if (l, g) in summary_project_lookup:
-                                            return summary_project_lookup[(l, g)]
-                            except:
-                                pass
                             return row['Project']
                     return row['Project']
                 
@@ -920,11 +878,9 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
         return lane_prepped.reset_index(drop=True)
 
     lane_position_start = {}
-    _position_counter = 1
     all_lanes_for_positioning = sorted({int(float(l)) for l in df['Lane'].dropna().unique()})
     for lane_for_position in all_lanes_for_positioning:
-        lane_position_start[lane_for_position] = _position_counter
-        _position_counter += len(_prepare_lane_df(df, lane_for_position))
+        lane_position_start[lane_for_position] = 1
 
     for config in lane_configs:
         lane = config['lane']
@@ -1231,7 +1187,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                             if type_.startswith('R'):
                                 cycle_str = f"U{len_}" if actual_is_index else f"Y{len_}"
                             elif type_.startswith('I'):
-                                if type_ == 'I2' and special_atac_index_reads and not row_has_index2:
+                                if type_ == 'I2' and (special_10x_atac or special_atac_index_reads) and not row_has_index2:
                                     cycle_str = f"U{len_}"
                                 else:
                                     cycle_str = f"I{len_}"
@@ -1311,6 +1267,14 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                 lane_df = lane_df[~fqtk_mask].reset_index(drop=True)
                 override_cycles_list = [oc for oc, fq in zip(override_cycles_list, fqtk_mask.values) if not fq]
 
+        # Sort by Group so SampleSheet row order matches renaming map order (preserves S-number alignment)
+        if 'Group' in lane_df.columns:
+            group_order = pd.to_numeric(lane_df['Group'], errors='coerce').fillna(999).values
+            sort_idx = sorted(range(len(group_order)), key=lambda i: group_order[i])
+            ss_data = ss_data.iloc[sort_idx].reset_index(drop=True)
+            lane_df = lane_df.iloc[sort_idx].reset_index(drop=True)
+            override_cycles_list = [override_cycles_list[i] for i in sort_idx]
+
         # Reorder columns
         cols = ['Lane', 'Sample_ID', 'Sample_Name', 'index', 'index2', 'Sample_Project', 'OverrideCycles']
         # Add missing cols if any
@@ -1347,7 +1311,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                 if any(kw in name for name in names_to_check for kw in _INDEX_READ_KEYWORDS):
                     create_fastq_for_index = "1"
                 f.write(f"CreateFastqForIndexReads,{create_fastq_for_index}\n")
-            if special_10x_atac:
+            if special_10x_atac or special_atac_index_reads:
                 f.write("TrimUMI,0\n")
             f.write("MinimumTrimmedReadLength,8\n")
             f.write("MaskShortReads,8\n")
@@ -1426,9 +1390,14 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     return str(val)
             map_df['Group'] = lane_df['Group'].apply(format_group).values
             
-            # Add Position (P001, P002, etc.) using global lane offsets
+            # Add Position (P001, P002, ...) sorted by Group so Group 1 always gets lower positions
+            map_df = map_df.sort_values(
+                by='Group',
+                key=lambda col: col.apply(lambda v: int(v) if str(v).isdigit() else float('inf')),
+                kind='stable'
+            ).reset_index(drop=True)
             positions = []
-            for _ in range(len(ss_data)):
+            for _ in range(len(map_df)):
                 positions.append(f"P{lane_position_counter:03d}")
                 lane_position_counter += 1
             map_df['Position'] = positions
@@ -1707,10 +1676,11 @@ def read_sample_sheet(config_id):
 def _fastp_row_path(row, idx):
     project = str(row.get('Sample_Project', '')).strip()
     sample_name = str(row.get('Sample_Name', '')).strip()
-    output_project = PROJECT_RENAME_MAP.get((str(row.get('Run', '')).strip(), project), project)
 
     run = str(row.get('Run', '')).strip()
     lane = int(row.get('Lane', 0))
+    config_id = f"lane{lane}"
+    output_project = PROJECT_RENAME_MAP.get((config_id, project), project)
     try:
         group = str(int(float(row.get('Group', 0))))
     except:
@@ -1740,50 +1710,6 @@ def _fastp_row_path(row, idx):
     stem = f"{run}-L{lane}-G{group}-{position}-{barcode}"
     return f"{output_project}/{stem}" if output_project and output_project.lower() != 'nan' else stem
 
-def _load_demux_barcode_lookup(config_id):
-    """Return {(project, sample_id): (index1, index2)} from Demultiplex_Stats.csv.
-
-    On NovaSeq X Plus, BCL-convert 4.4.6 outputs i5 as the reverse complement of
-    the sample-sheet sequence.  rename_fastqs.py already uses this lookup to name
-    files correctly; this helper lets the fastp input functions stay consistent.
-    """
-    demux_csv = f".output/{config_id}/Reports/Demultiplex_Stats.csv"
-    lookup = {}
-    if not os.path.exists(demux_csv):
-        return lookup
-    try:
-        demux_df = pd.read_csv(demux_csv)
-        for _, drow in demux_df.iterrows():
-            proj = str(drow.get('Sample_Project', '')).strip()
-            sid  = str(drow.get('SampleID', '')).strip()
-            idx  = str(drow.get('Index', '')).strip().rstrip('-')
-            if not (proj and sid and idx):
-                continue
-            parts = idx.split('-', 1)
-            i1 = parts[0]
-            i2 = parts[1] if len(parts) > 1 else ''
-            lookup[(proj, sid)] = (i1, i2)
-    except Exception as e:
-        print(f"Warning: could not load {demux_csv}: {e}")
-    return lookup
-
-
-def _patch_demux_barcodes(df, config_id):
-    """Overwrite index/index2 in df with actual barcodes from Demultiplex_Stats.csv."""
-    lookup = _load_demux_barcode_lookup(config_id)
-    if not lookup:
-        return df
-    df = df.copy()
-    for i in df.index:
-        proj = str(df.at[i, 'Sample_Project']).strip()
-        sid  = str(df.at[i, 'Sample_Name']).strip()
-        if (proj, sid) in lookup:
-            i1, i2 = lookup[(proj, sid)]
-            df.at[i, 'index']  = i1
-            df.at[i, 'index2'] = i2
-    return df
-
-
 def _fastp_rows_for_config(config_id):
     frames = []
     map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
@@ -1803,7 +1729,7 @@ def _fastp_rows_for_config(config_id):
 
     if not frames:
         return None
-    return _patch_demux_barcodes(pd.concat(frames, ignore_index=True), config_id)
+    return pd.concat(frames, ignore_index=True)
 
 def get_fastp_targets(wildcards):
     config_id = wildcards.config_id
@@ -1871,7 +1797,9 @@ def get_fastp_sample_input(wildcards):
             if not path:
                 continue
             
-            if path == sample_path:
+            path_stem = path.split('/', 1)[1] if '/' in path else path
+            sample_stem = sample_path.split('/', 1)[1] if '/' in sample_path else sample_path
+            if path == sample_path or path_stem == sample_stem:
                 project = str(row.get('Sample_Project', '')).strip()
                 sample_name = str(row.get('Sample_Name', '')).strip()
                 run = str(row.get('Run', '')).strip()
@@ -1886,10 +1814,17 @@ def get_fastp_sample_input(wildcards):
                     prefix = f"{prefix}/{output_project}"
                 
                 if is_parse_or_10x(project):
-                    s_num = idx + 1
-                    r1 = f"{prefix}/{sample_name}_S{s_num}_L{lane:03d}_R1_001.fastq.gz"
+                    import glob as _glob
+                    matches = _glob.glob(f"{prefix}/{sample_name}_S*_L{lane:03d}_R1_001.fastq.gz")
+                    if not matches:
+                        # Directory doesn't exist yet (BCL convert hasn't run); return a
+                        # predictable placeholder so dry-run DAG evaluation doesn't abort.
+                        # The real path is resolved at execution time after normalize_project_fastq_names.
+                        r1 = f"{prefix}/{sample_name}_S1_L{lane:03d}_R1_001.fastq.gz"
+                    else:
+                        r1 = matches[0]
                     if NUM_READS > 1:
-                        r2 = f"{prefix}/{sample_name}_S{s_num}_L{lane:03d}_R2_001.fastq.gz"
+                        r2 = r1.replace('_R1_001.fastq.gz', '_R2_001.fastq.gz')
                         return [r1, r2]
                     else:
                         return [r1]
@@ -1908,6 +1843,8 @@ def get_fastp_sample_input(wildcards):
     raise ValueError(f"Could not find sample for config_id='{config_id}' and sample_path='{sample_path}' in renaming map.")
 
 def get_fastp_mem_mb(wildcards):
+    # HPC3-specific: scale fastp memory by input FASTQ size (DRAGEN instrument has fixed RAM,
+    # HPC3 jobs request mem dynamically). Kept on top of upstream igb_transition.
     try:
         fastqs = get_fastp_sample_input(wildcards)
         if fastqs and os.path.exists(fastqs[0]):
