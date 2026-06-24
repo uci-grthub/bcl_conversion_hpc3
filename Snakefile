@@ -1938,7 +1938,7 @@ rule flexbar_r1_per_config:
             /Read file:/ {{
                 name=$NF
                 sub(/.*flexbarOut_barcode_/,"",name)
-                sub(/\.fastq\.gz$/,"",name)
+                sub(/\\.fastq\\.gz$/,"",name)
                 if ($NF ~ /flexbarOut_barcode_/) cur=name; else cur=""
                 next
             }}
