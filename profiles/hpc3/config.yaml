@@ -1,4 +1,4 @@
-snakefile: Snakefile_hpc3
+snakefile: Snakefile
 configfile: snakemake_config.yaml
 executor: slurm
 use-singularity: true
