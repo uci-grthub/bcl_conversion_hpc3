@@ -8,10 +8,26 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from io import StringIO
 
+# NOTE: do NOT declare these as `envvars:`. Snakemake's envvars directive re-exports
+# the values inline into every spawned --mode subprocess command line and echoes that
+# command into .snakemake/log, leaking secrets. The values are read via os.environ
+# below and inherited by child processes from the launching shell, so the directive
+# is unnecessary.
+#
+# Unlike upstream, these are NOT hard-required here: ENABLE_NEXTCLOUD/SEND_EMAILS
+# (below) auto-disable when the corresponding credentials are absent, which is the
+# default/expected state on HPC3 (no Nextcloud instance, no mail relay).
 NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "")
 NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
 NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+# SSH target for `occ files:scan` on the Nextcloud host. Defaults to the same
+# user/host as NEXTCLOUD_URL; override via env for a different admin account.
+NEXTCLOUD_SSH_HOST = os.environ.get("NEXTCLOUD_SSH_HOST")
+if NEXTCLOUD_SSH_HOST is None:
+    from urllib.parse import urlparse as _urlparse
+    NEXTCLOUD_SSH_HOST = f"{NEXTCLOUD_USER}@{_urlparse(NEXTCLOUD_URL).hostname}"
 
 configfile: "snakemake_config.yaml"
 
@@ -43,12 +59,21 @@ DATA_DIR = config.get("data_dir", "/staging/nextcloud/NovaseqX/20260115_LH00626_
 TILES = config.get("tiles", "1_1101")
 FLEXBAR_BIN = config.get("flexbar_bin", "")
 USE_ANCIENT = config.get("use_ancient", True)
-KEEP_UNDETERMINED_CONFIGS = " ".join(config.get("keep_undetermined_configs", []))
+REPORT_UNDETERMINED_CONFIGS = config.get("report_undetermined_configs", [])
+_effective_keep = list(config.get("keep_undetermined_configs", []))
+for _c in REPORT_UNDETERMINED_CONFIGS:
+    if _c not in _effective_keep:
+        _effective_keep.append(_c)
+KEEP_UNDETERMINED_CONFIGS = " ".join(_effective_keep)
 
 def maybe_ancient(path):
     return ancient(path) if USE_ANCIENT else path
 
 SCRATCH_DIR = config.get("scratch_dir", "")
+
+# When true, force CreateFastqForIndexReads=1 in every generated SampleSheet so DRAGEN
+# emits index reads as FASTQs (no index-based demultiplexing). Default: false.
+NO_DEMUX = bool(config.get("no_demux", False))
 
 NEXTCLOUD_DIR_NAME = config.get("nextcloud_dir_name", "DragenExt3")
 NEXTCLOUD_DIR_PATH = config.get("nextcloud_dir_path", "nextcloud3")
@@ -453,21 +478,24 @@ PROJECT_LANES = get_project_lane_pairs(SAMPLE_SHEETS_DICT)
 PROJECT_LANE_REPORTS = [f"Reports/{p}/lane{l}/index.html" for p, l in PROJECT_LANES]
 PROJECT_LANE_MD5S = [f"Reports/{p}/lane{l}/md5sums.txt" for p, l in PROJECT_LANES]
 
+# NOTE: do not name the loop variable `config` here. Python leaks loop variables into
+# the enclosing scope, so that would rebind Snakemake's global `config` dict to the last
+# lane dict and make every later config.get(...) silently fall back to its default.
 FLEXBAR_CONFIGS = []
-for config in LANE_CONFIGS:
-    if config['id'] not in CONFIG_IDS:
+for _lane_cfg in LANE_CONFIGS:
+    if _lane_cfg['id'] not in CONFIG_IDS:
         continue
-    barcode_path = os.path.join("metadata", f"flexbar_barcodes_{config['id']}.txt")
+    barcode_path = os.path.join("metadata", f"flexbar_barcodes_{_lane_cfg['id']}.txt")
     if os.path.exists(barcode_path):
-        FLEXBAR_CONFIGS.append(config['id'])
+        FLEXBAR_CONFIGS.append(_lane_cfg['id'])
 
 FQTK_CONFIGS = []
-for config in LANE_CONFIGS:
-    if config['id'] not in CONFIG_IDS:
+for _lane_cfg in LANE_CONFIGS:
+    if _lane_cfg['id'] not in CONFIG_IDS:
         continue
-    fqtk_tsv = os.path.join("metadata", f"fqtk_barcodes_{config['id']}.tsv")
+    fqtk_tsv = os.path.join("metadata", f"fqtk_barcodes_{_lane_cfg['id']}.tsv")
     if os.path.exists(fqtk_tsv):
-        FQTK_CONFIGS.append(config['id'])
+        FQTK_CONFIGS.append(_lane_cfg['id'])
 
 # _CONFIG_PROJECT_PAIRS_RAW keeps the *original* Sample_Project names from the
 # renaming-map CSVs.  These are the names under which fastp JSONs and BCL
@@ -1509,6 +1537,34 @@ rule summarize_project_reads:
                         'Total_Reads': read_pairs,
                         'Passed_Reads': read_pairs,
                     })
+
+                # If this project owns the lane's Undetermined pseudo-sample
+                # (report_undetermined_configs), include its count too. The
+                # Undetermined demux row has Sample_Project='Undetermined', so it
+                # isn't captured by the project filter above.
+                if wildcards.config_id in REPORT_UNDETERMINED_CONFIGS:
+                    map_path = f"results/{wildcards.config_id}/renaming_map_{wildcards.config_id}.csv"
+                    owns_undetermined = False
+                    if os.path.exists(map_path):
+                        try:
+                            _m = pd.read_csv(map_path)
+                            owns_undetermined = (
+                                (_m['Sample_Name'].astype(str).str.strip() == 'Undetermined')
+                                & (_m['Sample_Project'].astype(str).str.strip() == wildcards.project)
+                            ).any()
+                        except Exception as e:
+                            print(f"Could not check undetermined ownership in {map_path}: {e}")
+                    if owns_undetermined:
+                        u_rows = demux_df[demux_df['SampleID'].astype(str).str.strip() == 'Undetermined']
+                        for _, row in u_rows.iterrows():
+                            read_pairs = int(row.get('# Reads', 0))
+                            data.append({
+                                'Config': wildcards.config_id,
+                                'Project': wildcards.project,
+                                'Sample': 'Undetermined',
+                                'Total_Reads': read_pairs,
+                                'Passed_Reads': read_pairs,
+                            })
             else:
                 print(f"Missing Sample_Project column in {demux_path}")
 
@@ -1618,13 +1674,22 @@ rule compile_read_counts:
                 # Match by Lane, Sample_Project, and SampleID
                 read_pairs = 0
                 try:
-                    # Filter by lane and project
-                    matches = demux_df[
-                        (demux_df['Lane'] == lane) & 
-                        (demux_df['Sample_Project'] == project) &
-                        (demux_df['SampleID'] == sample_name)
-                    ]
-                    
+                    if sample_name == "Undetermined":
+                        # Undetermined is its own SampleID/Sample_Project in
+                        # Demultiplex_Stats even though we attach it to a real
+                        # project directory; match on the lane's Undetermined row.
+                        matches = demux_df[
+                            (demux_df['Lane'] == lane) &
+                            (demux_df['SampleID'] == 'Undetermined')
+                        ]
+                    else:
+                        # Filter by lane and project
+                        matches = demux_df[
+                            (demux_df['Lane'] == lane) &
+                            (demux_df['Sample_Project'] == project) &
+                            (demux_df['SampleID'] == sample_name)
+                        ]
+
                     if len(matches) > 0:
                         # BCL Convert reports '# Reads' as read pairs (clusters), not individual reads
                         read_pairs = int(matches.iloc[0]['# Reads'])
@@ -1826,7 +1891,7 @@ rule fastp_plots_lane:
     wildcard_constraints:
         lane = r"\d+"
 
-rule flexbar_r1_per_config:
+rule flexbar_per_config:
     input:
         bcl_done = ".output/{config_id}/.done",
         raw_barcodes = "metadata/flexbar_barcodes_{config_id}.txt",
@@ -1834,17 +1899,20 @@ rule flexbar_r1_per_config:
     threads: 32
     priority: 99
     output:
-        touch("results/{config_id}/flexbar_r1_{config_id}.done")
+        touch("results/{config_id}/flexbar_demux_{config_id}.done")
     log:
-        "logs/{config_id}/flexbar_r1_{config_id}.log"
+        "logs/{config_id}/flexbar_{config_id}.log"
     benchmark:
-        "benchmarks/flexbar_r1_per_config_{config_id}.bench"
+        "benchmarks/flexbar_per_config_{config_id}.bench"
     params:
         outdir = "output/{config_id}/flexbar",
+        lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
+        r1 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz",
+        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz",
         raw_barcodes_abs = lambda wildcards, input: os.path.abspath(input.raw_barcodes),
         barcodes_abs = lambda wildcards: os.path.abspath(f"metadata/flexbar_barcodes_{wildcards.config_id}.fasta"),
         adapter_abs = lambda wildcards, input: os.path.abspath(input.adapter),
-        r1_abs = lambda wildcards: os.path.abspath(f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz"),
+        r1_abs = lambda wildcards, input: os.path.abspath(f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R1_001.fastq.gz"),
         flexbar_bin = FLEXBAR_BIN,
         retry_min_reads = config.get("flexbar_retry_min_reads", 1000000),
         barcode_leader = config.get("flexbar_barcode_leader_n", 0)
@@ -1853,7 +1921,7 @@ rule flexbar_r1_per_config:
         (
         mkdir -p {params.outdir}
 
-        echo "Starting Flexbar R1 processing for {wildcards.config_id}"
+        echo "Starting Flexbar processing for {wildcards.config_id}"
 
         flexbar_cmd="{params.flexbar_bin}"
         if [ -z "$flexbar_cmd" ]; then
@@ -1869,6 +1937,7 @@ rule flexbar_r1_per_config:
             fi
         fi
 
+
         # If any assigned barcode falls below this many reads after the primary
         # run, retry with the opposite index orientation and keep whichever
         # orientation assigns the most reads overall.
@@ -1878,13 +1947,12 @@ rule flexbar_r1_per_config:
         # $1 = orientation: "rc" reverse-complements each listed barcode
         # (historical default), "fwd" uses each barcode as listed. $2 = output FASTA.
         #
-        # Column layout is "<name>\t<barcode>" (NF >= 2). The pattern written is
-        # "<lead N's><barcode>", matched at the read start (LTAIL). `lead` is the
-        # number of leading bases (e.g. a UMI) before the inline barcode; it comes
-        # from config.flexbar_barcode_leader_n and defaults to 0 because the active
-        # KY26SPI libraries carry the 6 bp index at R1 position 1 with no leader.
-        # A non-zero leader was only correct for the PAREseq (U5I6) libraries,
-        # which have since moved to BCL Convert inline extraction.
+        # The pattern is "<lead N's><barcode>", matched at the read start (LTAIL).
+        # `lead` is the number of leading bases (e.g. a UMI) before the inline
+        # barcode; it comes from config.flexbar_barcode_leader_n and defaults to 0
+        # because the active KY26SPI libraries carry the 6 bp index at R1 position 1
+        # with no leader. A non-zero leader was only correct for the PAREseq (U5I6)
+        # libraries, which have since moved to BCL Convert inline extraction.
         build_barcode_fasta() {{
             awk -F'\t' -v orient="$1" -v lead="{params.barcode_leader}" '
             NF >= 2 {{
@@ -1938,7 +2006,7 @@ rule flexbar_r1_per_config:
             /Read file:/ {{
                 name=$NF
                 sub(/.*flexbarOut_barcode_/,"",name)
-                sub(/\\.fastq\\.gz$/,"",name)
+                sub(/[.]fastq[.]gz$/,"",name)
                 if ($NF ~ /flexbarOut_barcode_/) cur=name; else cur=""
                 next
             }}
@@ -2013,88 +2081,60 @@ rule flexbar_r1_per_config:
 
         # Drop the large unassigned FASTQ now that orientation is settled. It is
         # not needed downstream (read counts are read from the log, not the file)
-        # and keeps the scratch dir from accumulating tens of GB of unassigned reads.
+        # and mirrors fqtk_per_config's removal of unmatched reads. This keeps the
+        # scratch dir from accumulating tens of GB of unassigned reads.
         rm -f {params.outdir}/flexbarOut_barcode_unassigned*.fastq.gz
         ) > {log} 2>&1
 
         touch {output}
         """
 
-rule flexbar_per_config:
+
+rule flexbar_pair_r2:
+    """Pull the R2 mates for each flexbar-assigned R1 and checksum the results.
+
+    Split out of flexbar_per_config so that a failure here (e.g. a missing seqkit,
+    or an OOM on the read-ID list) does not discard the hours-long demultiplexing
+    pass. The R1 FASTQs and the settled orientation are already committed by the
+    flexbar_demux sentinel; this rule only adds the paired R2 files.
+    """
     input:
-        r1_done = "results/{config_id}/flexbar_r1_{config_id}.done",
-        bcl_done = ".output/{config_id}/.done",
+        demux_done = "results/{config_id}/flexbar_demux_{config_id}.done"
     threads: 32
     priority: 99
-    resources:
-        mem_mb = 32000
     output:
         touch("results/{config_id}/flexbar_{config_id}.done")
     log:
-        "logs/{config_id}/flexbar_{config_id}.log"
+        "logs/{config_id}/flexbar_pair_r2_{config_id}.log"
     benchmark:
-        "benchmarks/flexbar_per_config_{config_id}.bench"
+        "benchmarks/flexbar_pair_r2_{config_id}.bench"
     params:
         outdir = "output/{config_id}/flexbar",
-        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz",
+        r2 = lambda wildcards: f".output/{wildcards.config_id}/Undetermined_S0_L00{wildcards.config_id.split('_')[0].replace('lane', '')}_R2_001.fastq.gz"
     shell:
         """
         (
-        module load singularity
-
-        # Step 1: build all header files in parallel (zcat is I/O bound, safe to parallelize).
-        pids=()
-        base_names=()
-        for r1_out in {params.outdir}/flexbarOut_barcode_*.fastq.gz; do
-            [ -e "$r1_out" ] || continue
-            base_name=$(basename "$r1_out" .fastq.gz)
-            if [[ "$base_name" == *"unassigned"* ]] || [[ "$base_name" == *"_R2" ]]; then
-                echo "Skipping: $base_name"
-                continue
-            fi
-            echo "Preparing headers for $base_name"
-            # set +o pipefail so a barcode with zero " 1:N" reads (grep exits 1)
-            # doesn't kill the backgrounded subshell under the global pipefail.
-            ( set +o pipefail; zcat "$r1_out" | grep " 1:N" | sed 's/^@//' | cut -d ' ' -f1 | sed 's/_[ATGCN]*$//' > "{params.outdir}/${{base_name}}_headers.txt" ) &
-            pids+=($!)
-            base_names+=("$base_name")
-        done
-        for pid in "${{pids[@]}}"; do wait "$pid" || {{ echo "Header extraction failed (pid $pid)" >&2; exit 1; }}; done
-
-        # Step 2: run all seqkit greps in parallel, splitting threads evenly.
-        n_samples="${{#base_names[@]}}"
-        threads_each=$(( {threads} / n_samples < 1 ? 1 : {threads} / n_samples ))
-        echo "$(date): launching $n_samples seqkit greps with $threads_each threads each"
-        pids=()
-        declare -A pid_to_name
-        for base_name in "${{base_names[@]}}"; do
-            if [ -s "{params.outdir}/${{base_name}}_headers.txt" ]; then
-                echo "$(date): starting seqkit grep for $base_name"
-                seqkit grep -j "$threads_each" -f "{params.outdir}/${{base_name}}_headers.txt" "{params.r2}" -o "{params.outdir}/${{base_name}}_R2.fastq.gz" &
-                pid=$!
-                pids+=($pid)
-                pid_to_name[$pid]="$base_name"
-            else
-                echo "$(date): no reads found for $base_name"
-            fi
-        done
-        for pid in "${{pids[@]}}"; do
-            wait "$pid" && echo "$(date): done ${{pid_to_name[$pid]}}" || {{ echo "$(date): seqkit grep failed for ${{pid_to_name[$pid]}} (pid $pid)" >&2; exit 1; }}
-        done
-
-        rm -f {params.outdir}/*_headers.txt
+        # Recover the R2 mates in a single pass over R2. The previous approach ran
+        # `seqkit grep` once per barcode, re-reading the whole 32 GB / 417M-read R2
+        # file every time (6 passes) and holding a 40M+ entry ID hash in memory.
+        # pair_r2_stream.py exploits flexbar's order-preserving output to merge-walk
+        # R2 against the per-barcode R1 streams in one pass with O(1) memory, and
+        # produces byte-identical output.
+        python3 src/flexbar/pair_r2_stream.py \
+            --r2 "{params.r2}" \
+            --outdir "{params.outdir}" \
+            --threads {threads}
 
         curr_dir=$PWD
         cd {params.outdir}
-        # Exclude unassigned (can be hundreds of GB) from md5sum/size — it is not staged out.
-        md5sum flexbarOut_barcode_*_R2.fastq.gz > md5sum.txt
+        md5sum *.fastq.gz > md5sum.txt
         count=$(wc -l < md5sum.txt)
-        echo "$(date): generated md5sum.txt with $count R2 entries for {wildcards.config_id}"
+        echo "Generated md5sum.txt with $count entries for {wildcards.config_id}"
         if [ "$count" -eq 0 ]; then
-            echo "ERROR: md5sum.txt is empty, no R2 .fastq.gz files found in {params.outdir}" >&2
+            echo "ERROR: md5sum.txt is empty, no .fastq.gz files found in {params.outdir}" >&2
             exit 1
         fi
-        du -h flexbarOut_barcode_*_R2.fastq.gz > size.txt
+        du -h *.fastq.gz > size.txt
         cd $curr_dir
         ) > {log} 2>&1
 
@@ -2261,7 +2301,7 @@ rule fqtk_per_config:
         fi
         echo "I1 read length: ${{I1_LEN}}bp -> read structure: $I1_READ_STRUCT"
 
-        conda run -n bcl_convert fqtk demux \
+        fqtk demux \
             --inputs "$R1" "$I1" "$R2" \
             --read-structures "151T" "$I1_READ_STRUCT" "151T" \
             --sample-metadata {input.barcode_tsv} \
@@ -2650,9 +2690,63 @@ rule generate_renaming_map:
             print(f"Generated fallback renaming map from SampleSheet: {out_path}")
             return True
 
+        def _finish():
+            """If this lane is flagged in report_undetermined_configs, append an
+            'Undetermined' pseudo-sample row so the lane's Undetermined reads flow
+            through the standard pipeline (fastp, read counts, md5sums, report) as
+            a normal sample. Attached to the lane's first (alphabetical) project.
+            Idempotent and gated by REPORT_UNDETERMINED_CONFIGS, so default runs
+            are unaffected.
+            """
+            if wildcards.config_id not in REPORT_UNDETERMINED_CONFIGS:
+                return
+            if not os.path.exists(output.map):
+                return
+            try:
+                cur = pd.read_csv(output.map)
+            except Exception as e:
+                print(f"Undetermined injection: could not read {output.map}: {e}")
+                return
+
+            _names = cur.get("Sample_Name")
+            if _names is not None and (_names.astype(str).str.strip() == "Undetermined").any():
+                print("Undetermined row already present; skipping injection.")
+                return
+
+            _proj_col = cur["Sample_Project"].astype(str).str.strip()
+            _real = cur[_proj_col.ne("") & _proj_col.str.lower().ne("nan")]
+            if _real.empty:
+                print("No real project rows; skipping Undetermined injection.")
+                return
+
+            first_project = sorted(_real["Sample_Project"].astype(str).str.strip().unique())[0]
+            owner = _real[_real["Sample_Project"].astype(str).str.strip() == first_project].iloc[0]
+
+            new_row = {col: "" for col in cur.columns}
+            new_row.update({
+                "Sample_Name": "Undetermined",
+                "Sample_Project": first_project,
+                "Lane": owner.get("Lane", ""),
+                "index": "Undetermined",
+                "index2": "",
+                "Run": params.library,
+                "Group": owner.get("Group", ""),
+                "Position": f"P{len(cur) + 1:03d}",
+            })
+            if "Sample_ID" in cur.columns:
+                new_row["Sample_ID"] = "Undetermined"
+
+            cur = pd.concat([cur, pd.DataFrame([new_row])], ignore_index=True)
+            cur.to_csv(output.map, index=False)
+            print(
+                f"Injected Undetermined row into {output.map} "
+                f"(project={first_project}, lane={owner.get('Lane')}, group={owner.get('Group')})"
+            )
+
         # If map already exists and looks valid, keep it
         if has_required_columns(output.map):
             print(f"Renaming map already valid: {output.map}")
+            _finish()
             return
 
         # Attempt to regenerate via metadata-driven function (preferred)
@@ -2669,12 +2763,14 @@ rule generate_renaming_map:
                 )
                 if has_required_columns(output.map):
                     print(f"Regenerated renaming map using metadata: {output.map}")
+                    _finish()
                     return
             except Exception as e:
                 print(f"Error regenerating renaming map from metadata: {e}")
 
         # Fallback: derive from SampleSheet data section
         build_map_from_samplesheet(input.sample_sheet, output.map, params.library)
+        _finish()
 
 rule validate_barcode_hamming_distances:
     """Pre-flight validation: check barcode Hamming distances for a single config_id.
@@ -2878,7 +2974,11 @@ rule bcl_project_done:
     """
     input:
         done = maybe_ancient(".output/{config_id}/.done"),
-        decision = maybe_ancient("logs/{config_id}/orientation_decision_{config_id}.json")
+        decision = maybe_ancient("logs/{config_id}/orientation_decision_{config_id}.json"),
+        # CONFIG_PROJECT_PAIRS is derived from this map at Snakefile parse time, and each
+        # job is parsed fresh in its own spawned subprocess. Without this dependency the
+        # rule can run before the map exists, leaving the lane's project list empty.
+        renaming_map = maybe_ancient("results/{config_id}/renaming_map_{config_id}.csv")
     output:
         sentinel = touch("output/{config_id}/{project}/.project_done")
     wildcard_constraints:
@@ -2957,7 +3057,24 @@ rule bcl_project_done:
 
         old_project_dirs = {p for cid, p in _CONFIG_PROJECT_PAIRS_RAW if cid == config_id}
         all_lane_projects = sorted([p for cid, p in CONFIG_PROJECT_PAIRS if cid == config_id])
-        is_primary_copier = new_project == (all_lane_projects[0] if all_lane_projects else new_project)
+
+        # Fail closed. Electing every project primary when the lane list is unavailable
+        # makes all of the lane's concurrent bcl_project_done jobs bulk-copy the same
+        # staging dir while each moves its own project dir out of it, and the copiers
+        # crash on the vanishing directories.
+        if new_project not in all_lane_projects:
+            _plog(
+                f"ERROR: {new_project} not in project list for {config_id} "
+                f"(found {all_lane_projects})"
+            )
+            _logf.close()
+            raise RuntimeError(
+                f"Cannot determine the primary accessory copier for {config_id}: "
+                f"{new_project} is absent from the lane's project list "
+                f"({all_lane_projects or 'empty'}). Verify that "
+                f"results/{config_id}/renaming_map_{config_id}.csv exists and lists it."
+            )
+        is_primary_copier = new_project == all_lane_projects[0]
 
         # Bulk accessory copy (primary project only). Skip old Sample_Project subdirs —
         # those are moved by their own bcl_project_done.
@@ -3007,9 +3124,12 @@ rule bcl_project_done:
         # Remove extraneous I1/I2 FASTQs for projects that don't need index reads.
         # CreateFastqForIndexReads is set globally per lane, so these files are produced
         # for all projects whenever any project on the lane (e.g. SMK) requires them.
+        # When no_demux is set the index reads are the point of the run (DRAGEN emits
+        # them as FASTQs instead of index-based demultiplexing), so keep them for every
+        # project rather than stripping them here.
         _INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
         check_name = old_project if old_project else new_project
-        if not any(kw in check_name for kw in _INDEX_READ_KEYWORDS):
+        if not NO_DEMUX and not any(kw in check_name for kw in _INDEX_READ_KEYWORDS):
             proj_dir = f"output/{config_id}/{new_project}"
             removed = 0
             for pattern in ["**/*-I1.fastq.gz", "**/*-I2.fastq.gz"]:
@@ -3545,10 +3665,12 @@ rule pick_orientation:
         with open(input.candidates) as f:
             suspects = json_mod.load(f)
 
-        # Keep Undetermined FASTQs for lanes configured for flexbar demux.
-        # Match bcl_convert behavior to avoid deleting inputs needed by flexbar_per_config.
-        preserve_undetermined = os_mod.path.isfile(
-            f"metadata/flexbar_barcodes_{wildcards.config_id}.txt"
+        # Keep Undetermined FASTQs for lanes configured for flexbar demux, or for
+        # lanes explicitly listed in keep_undetermined_configs / report_undetermined_configs.
+        # Match bcl_convert behavior to avoid deleting reads it was told to keep.
+        preserve_undetermined = (
+            os_mod.path.isfile(f"metadata/flexbar_barcodes_{wildcards.config_id}.txt")
+            or wildcards.config_id in _effective_keep
         )
 
         # Build fix_type lookup: project -> label (rc_i7 / rc_i5 / rc_both)
@@ -3782,6 +3904,11 @@ rule project_link:
                 return m2.group(1)
             return None
 
+        def extract_share_id(xml_text):
+            if not xml_text: return None
+            m = re.search(r'<id>(\d+)</id>', xml_text)
+            return m.group(1) if m else None
+
         # Capture executed commands for logging
         executed_cmds = []
 
@@ -3988,7 +4115,8 @@ rule rescan_nextcloud:
         project = ".+"
     params:
         nc_path = lambda wildcards: f"/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{wildcards.config_id}/{wildcards.project}",
-        enable_nextcloud = ENABLE_NEXTCLOUD
+        enable_nextcloud = ENABLE_NEXTCLOUD,
+        ssh_host = NEXTCLOUD_SSH_HOST
     shell:
         """
         if [ "{params.enable_nextcloud}" != "True" ]; then
@@ -4019,7 +4147,7 @@ rule rescan_nextcloud:
             exit 1
         fi
 
-        ssh kstachel@precision.biochem.uci.edu "docker exec --user www-data nextcloud-aio-nextcloud php occ files:scan --path='$occ_path'" > {log} 2>&1
+        ssh {params.ssh_host} "docker exec --user www-data nextcloud-aio-nextcloud php occ files:scan --path='$occ_path'" > {log} 2>&1
 
         # OCC can report malformed --path usage while still returning quickly.
         if grep -q "Unknown user" {log}; then
@@ -4113,10 +4241,10 @@ rule verify_project_links:
                     # Using curl to query the share with basic auth
                     cmd = [
                         'curl', '-s',
-                        '-u', 'kstachel:ucightf2025',
+                        '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
                         '-X', 'PROPFIND',
                         '-H', 'Depth: 1',
-                        f'https://precision.biochem.uci.edu/remote.php/dav/files/kstachel/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{config_id}/{project}/'
+                        f'{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USER}/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{config_id}/{project}/'
                     ]
                     
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)

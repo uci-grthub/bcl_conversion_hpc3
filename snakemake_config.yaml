@@ -1,12 +1,13 @@
-# Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud)
+# Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud by default)
 send_emails: false
 enable_nextcloud: false
-sample_sheet: "src/SampleSheet_default.csv"
 num_reads: 2
 library_name: ""
 start_s: 1
 lanes: [1,2,3,4,5,6,7,8]
 fastp_threads: 4
+# Custom speedup build. Point at the pixi-provided "flexbar" (or set FLEXBAR_BIN) to
+# drop the custom build.
 flexbar_bin: "/dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar"
 # Number of leading bases (e.g. a UMI) before the inline barcode in R1. The
 # barcode FASTA is built as "<this many N's><barcode>" and matched at the read
@@ -19,6 +20,15 @@ flexbar_retry_min_reads: 1000000
 metadata: ""
 data_dir: ""
 tiles: ""
+# Set these per run in snakemake_config_project.yaml (see SOP). Left blank in the
+# base config so a fresh clone never silently emails the previous operator, and
+# so it never rsyncs/shares unless a project explicitly enables it.
+email_sender: ""
+email_recipient: ""
+email_cc: ""
+nextcloud_dir_name: "dragenshare"
+nextcloud_dir_path: "nextcloud"
+external_drive_path: ""
 
 # Fast local NVMe scratch for bcl-convert output (avoids writing directly to slow storage).
 # bcl-convert writes FASTQs here first; files are moved to the final output/ path after conversion.
@@ -27,11 +37,24 @@ scratch_dir: ""
 
 use_ancient: true  # Whether to use ancient files for bcl-convert outputs if available (default: true). Set to false to always re-run bcl-convert.
 
+# Force CreateFastqForIndexReads=1 in every generated SampleSheet so DRAGEN emits index
+# reads as FASTQs (i.e. no index-based demultiplexing). Default: false.
+no_demux: false
+
 # Which configs (lanes) should keep Undetermined reads? Others will have them deleted.
 # Default is empty list (delete all Undetermined reads).
 # Example: keep_undetermined_configs: ["lane1", "lane3"]
 # Note: Undetermined reads are automatically kept if flexbar_barcodes_{config_id}.txt exists.
 keep_undetermined_configs: []
+
+# Which configs (lanes) should treat Undetermined reads as a normal sample?
+# For each listed lane the Undetermined FASTQs are kept, renamed into the lane's
+# first project directory (output/{config_id}/{project}/), and flow through the
+# standard pipeline: fastp QC, read counts, md5sums, nextcloud links, and the
+# per-order HTML report. Membership in this list is the on/off switch per lane.
+# Configs listed here are automatically added to keep_undetermined_configs.
+# Example: report_undetermined_configs: ["lane1"]
+report_undetermined_configs: []
 
 # Order IDs whose projects should be excluded from rule all (e.g. skip processing for a specific order).
 # Also excludes the order-level reports and emails for those order IDs.

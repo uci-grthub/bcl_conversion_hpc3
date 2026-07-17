@@ -4,8 +4,10 @@
 
 set -e
 
-CONDA_BASE=/home/kstachel/miniforge3
-source "$CONDA_BASE/etc/profile.d/conda.sh"
+# Resolve the pixi binary. cron runs with a minimal PATH, so fall back to the
+# default install location under $HOME when pixi is not already on PATH.
+PIXI="$(command -v pixi 2>/dev/null || true)"
+[ -z "$PIXI" ] && PIXI="$HOME/.pixi/bin/pixi"
 
 cd "$(realpath "$(dirname "$0")")"
 
@@ -26,8 +28,10 @@ if [ -f "$TARGET_FILE" ]; then
   if tmux has-session -t "$LIBRARY" 2>/dev/null; then
     echo "tmux session $LIBRARY already exists. Not starting a new one."
   else
-    # Start tmux session: source .env, run snakemake via container wrapper, then drop to bash
-    tmux new-session -d -c "$(pwd)" -s "$LIBRARY" "if [ -f ../.env ]; then source ../.env; fi; bash run_hpc3.sh; exec bash"
+    # Start tmux session, then drop into an activated shell. pixi's activation
+    # loads .env (secrets), and run_hpc3.sh pins --profile profiles/hpc3
+    # (singularity/slurm), so no manual env sourcing or profile flag is needed.
+    tmux new-session -d -c "$(pwd)" -s "$LIBRARY" "$PIXI run bash run_hpc3.sh; exec $PIXI run bash"
     if [ $? -ne 0 ]; then
       echo "Failed to start tmux session $LIBRARY."
     else

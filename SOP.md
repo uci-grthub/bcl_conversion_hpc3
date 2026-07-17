@@ -1,155 +1,133 @@
-# SOP: Run the NovaSeqX Snakemake Workflow
+# SOP: Run the BCL Conversion Snakemake Workflow (HPC3)
 
-This SOP provides clear, human‑readable steps to execute the NovaSeqX BCL conversion pipeline from start to finish.
+Supports **MiSeq i100** and **NovaSeqX** — the platform is auto-detected from the metadata
+workbook. `pixi run` auto-loads `.env` and provisions the Python/CLI environment, so
+day-to-day commands take no extra flags. bcl-convert itself runs inside a Singularity
+container via `run_hpc3.sh` (slurm executor, `profiles/hpc3`) — there is no DRAGEN
+instrument involved on HPC3.
 
-## 1) Verify prerequisites
+## Quickstart (a normal run)
 
-- You have access to the run directory where bcl data is stored on dragen.
-- The run has finished copying (there is a CopyComplete.txt file in the run directory)
-- You have a SampleSheet (.xslx) Excel file from the lab.
-- Conda/mamba is installed, otherwise: 
+```bash
+# 1. Clone into a run-named directory and enter it
+cd /dfs9/ucightf-lab/kstachel/test_bcl
+git clone https://github.com/whtns/grthub_bclconvert {RUN_NAME}
+cd {RUN_NAME}
 
-    ```
-    curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-    bash Miniforge3-$(uname)-$(uname -m).sh
-    ```
+# 2. Set up the run: creates snakemake_config_project.yaml and prefills
+#    metadata / library_name / data_dir from the newest run in the HPC3 staging dir
+pixi run init                 # or: pixi run init --staging-dir /dfs3b/ucightf_lab/NSRaw
 
-## 1) Copy the project template.
+# 3. Drop the metadata .xlsx into metadata/ (if not already there), then confirm
+#    the prefilled config
+$EDITOR snakemake_config_project.yaml         # confirm data_dir, library_name, metadata
 
-- Navigate to the processing directory on dragen 
-`cd /staging/nextcloud/testing_illumina/NovaseqX`
-- Clone the github repository
-`git clone https://github.com/whtns/igb_transition {RUN_NAME}`
-- Enter the project directory
-`/staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}` 
+# 4. Validate metadata + preview the plan (no processing happens)
+pixi run validate
+bash run_hpc3.sh --dryrun
 
-## 2) Ensure the Singularity container is available.
+# 5. Run the full workflow (singularity + slurm via profiles/hpc3)
+bash run_hpc3.sh
+```
 
-- The workflow runs inside a Singularity container (`bcl_convert.sif`).
-- Set `BCL_CONVERT_SIF` to the container path if it differs from the default,
-  or rely on the default path in `run_hpc3.sh`.
+That's the whole loop. `enable_nextcloud`/`send_emails` are **off by default** on HPC3
+(`snakemake_config.yaml`), so no `.env` is required unless a project explicitly turns
+Nextcloud sharing or email alerts back on.
 
-## 3) Copy the SampleSheet into the new project
+### Prerequisites
 
-- Upload the excel SampleSheet {SampleSheet.xlsx} into the `metadata` directory 
-`/staging/nextcloud/testing_illumina/NovaseqX/{RUN_NAME}/metadata`
+- Run has finished copying (a `CopyComplete.txt` exists in the run directory under
+  `/dfs3b/ucightf_lab/NSRaw/...`).
+- A SampleSheet `.xlsx` from the lab, placed in `metadata/`.
+- **pixi** installed once: `curl -fsSL https://pixi.sh/install.sh | bash`, then
+  `pixi install` to build the environment from `pixi.lock`.
+- **Singularity** available via `module load singularity` (already wired into the rules
+  that need it); the bcl-convert container image path is set in the Snakefile / profile.
 
-## 4) Review and update configuration
+---
 
-Open and update the project settings:
+## Reference
 
-- `snakemake_config.yaml`
+### Credentials (`.env`) — optional on HPC3
 
-Key fields to update: {example values}
+Only needed if a project sets `enable_nextcloud: true` or `send_emails: true` in
+`snakemake_config_project.yaml` (both default `false`). If enabled, the workflow needs:
 
-- `library_name`: {xR083} (the name of the run)
-- `metadata`: {`metadata/SampleSheet.xlsx`} (path to the Excel file)
-- `data_dir`: {`/staging/nextcloud/NovaseqX/20260129_LH00626_0090_B233NGJLT4`} (BCL run directory)
-- `email_sender`: {kstachel@uci.edu} (the sender of email reports)
-- `email_recipient`: {kstachel@uci.edu} (the recipient of email reports)
-- `external_drive_path`: {`/mnt/extusb3/nextcloud3/`} (the mount point of the external usb connected to dragen for rsync)
+| Variable | What it is |
+| --- | --- |
+| `NEXTCLOUD_URL` | Nextcloud instance, e.g. `https://precision.biochem.uci.edu` |
+| `NEXTCLOUD_USER` | Nextcloud account owning the share directory |
+| `NEXTCLOUD_PASSWORD` | **App password** for that account (not the login password) |
+| `GMAIL_APP_PASSWORD` | App password for the `email_sender` account |
 
-## 3) Validate metadata
-The Excel metadata file must contain:
+Copy `.env.example` to `.env` and fill in; `pixi run` sources it automatically
+(`scripts/load_dotenv.sh`). Generate a Nextcloud app password under **Settings >
+Personal > Security > Devices & sessions > Create new app password**.
 
-- **Summary sheet** (header at row 3):
-  - `Lane`, `Gr` (Group), `Project Name`, `Masking`, `Fastq Link`
-- **Per-project sheets** with sample details:
-  - `Lane`, `Group`, `Sample Name`, `i7 Barcode Sequence`, `i5 Barcode Sequence`
-- Ensure Masking strings match run cycle structure in RunInfo.xml
+Verify access before relying on it:
 
-## 4) Dry run (recommended)
+```bash
+pixi run python scripts/test_nextcloud_token.py
+```
 
-Run a dry run to validate the workflow plan before any processing:
+### Configuration files
 
-- `snakemake -n`
+- `snakemake_config_project.yaml` — per-run overrides (gitignored). `pixi run init`
+  prefills `library_name`, `metadata`, `data_dir`. Set `email_sender` /
+  `email_recipient` / `email_cc` only if enabling email (base config ships these blank
+  so a run never emails the previous operator), plus optional `external_drive_path`,
+  `scratch_dir`, `tiles`, `flexbar_bin`.
+- `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
+  `send_emails: false` / `enable_nextcloud: false` live here.
+- `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor, Singularity
+  enabled, resource defaults. Used automatically by `run_hpc3.sh`.
+- `profiles/default/config.yaml` — non-HPC3 resource-limit profile (kept for parity with
+  upstream / single-host use); not used by `run_hpc3.sh`.
 
-If the dry run shows missing files or configuration errors, fix those before proceeding.
+### Metadata format (auto-detected)
 
-## 5) Run the full workflow
+- **NovaSeqX** (has a `Summary` sheet):
+  - Summary sheet (header row 3): `Lane`, `Gr` (Group), `Project Name`, `Masking`, `Fastq Link`
+  - Per-project sheets: `Lane`, `Group`, `Sample Name`, `i7 Barcode Sequence`, `i5 Barcode Sequence`
+  - Masking strings must match the run cycle structure in `RunInfo.xml`.
+- **MiSeq i100** (has a `Barcode Entries` sheet, no `Summary` sheet):
+  - Per-sample barcodes; Order IDs inferred from the `Lab ID` column; all samples in `lane1`.
 
-Execute the entire pipeline:
+### Run specific stages
 
-- `snakemake --cores 8`
+Configs are per lane (`lane1`…`lane8`; MiSeq uses only `lane1`). Pass a target through
+`run_hpc3.sh` (or `pixi run snakemake --profile profiles/hpc3` directly):
 
-Adjust `--cores` based on system resources (max 32).
+```bash
+bash run_hpc3.sh output/lane1                                       # BCL conversion, one lane
+pixi run snakemake --profile profiles/hpc3 --cores 4 results/fastp_lane1.done
+pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
+pixi run snakemake --profile profiles/hpc3 --cores 1 results/{RUN}-count.csv
+pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a rule to re-run
+```
 
-## 6) Run specific workflow stages (optional)
+### Validate outputs
 
-If you only need certain outputs, you can run specific targets:
+- `output/lane{N}/` — project FASTQ files
+- `results/fastp/` — JSON stats; `results/fastp_plots/` — PNG plots
+- `Reports/` — order/project HTML reports, md5sums, PDFs (if enabled)
+- `results/{RUN}-count.csv` — read counts
 
-- BCL conversion for a lane/masking:
-`snakemake --cores 8 output/lane1_R1-151_I1-8_I2-8_R2-151`
+### Automated launch (cron)
 
-- FastP analysis for a lane/masking:
-`snakemake --cores 4 results/fastp_lane1_R1-151_I1-8_I2-8_R2-151.done`
+`monitor_and_run_snakemake.sh` waits for `CopyComplete.txt` in `data_dir` and launches
+`run_hpc3.sh` in a tmux session named after the library. See `CRON_INSTRUCTIONS.txt`.
 
-- FastP plots for a lane/masking:
-`snakemake --cores 4 results/fastp_plots_lane1_R1-151_I1-8_I2-8_R2-151.done`
+### Dependency graphs
 
-- Project or Order report:
-`snakemake --cores 1 Reports/order_12345/index.html`
+```bash
+pixi run rulegraph            # rulegraph.png
+pixi run dag                  # dag.pdf
+```
 
-- Read count CSV:
-     `snakemake --cores 1 results/xR083-count.csv`
+### Troubleshooting quick checks
 
-## 7) Validate outputs
-
-Check that outputs are generated and complete:
-
-- `output/` contains lane and project FASTQ files.
-- `results/fastp/` has JSON stats.
-- `results/fastp_plots/` has PNG plots.
-- `Reports/` contains order and project HTML reports plus md5sums and PDFs.
-- `results/{library}-count.csv` exists and looks correct.
-
-## 8) Re-run or update specific steps (if needed)
-
-If you need to re-run a specific rule (e.g., read counts):
-
-- `snakemake --cores 4 -R compile_read_counts`
-
-## 9) Troubleshooting quick checks
-
-- Missing lanes: confirm `basecalls_path` and detected lanes.
-- BCL conversion failures: verify DRAGEN availability and run paths.
+- Missing lanes: confirm `data_dir` and detected lanes in the dry run.
+- BCL conversion failures: check the Singularity module/image, and slurm job logs.
 - Empty reports: verify metadata sheet names and headers.
 - md5 mismatch: regenerate the specific project report outputs.
-
-## Email Configuration
-
-The workflow uses `src/send_email.py` with support for:
-- Plain text or HTML content
-- File attachments
-- Configurable SMTP settings (default: smtp.uci.edu:25)
-
-For OAuth2 (Gmail):
-- Set up Google Cloud OAuth2 credentials
-- Store `client_secret.json` and `token.json` in workspace
-- Modify `send_email.py` to use `google-auth` libraries
-- Set environment variables for credential paths
-
-## Advanced Features
-
-**View rule graph:**
-```bash
-snakemake --rulegraph | dot -Tpdf > rulegraph.pdf
-```
-
-**View complete dependency graph:**
-```bash
-snakemake --dag | dot -Tpdf > dag.pdf
-```
-
-**Flexbar demultiplexing** (for Flexbar-tagged projects):
-- Enable by uncommenting flexbar rule in Snakefile
-- Requires barcode FASTA files (auto-generated from metadata)
-- Processes undetermined reads
-
-**Tile-specific processing:**
-- Set `tiles: "1_1101"` in config for subset processing
-- Useful for test runs or debugging
-
-**Custom naming schemes:**
-- Modify renaming map generation in Snakefile
-- Update `src/run_rename.sh` script

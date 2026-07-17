@@ -232,6 +232,37 @@ def write_renaming_map(map_df, map_file):
                     positions.append(map_df["Position"].iloc[i])
             map_df["Position"] = positions
 
+    # Treat the lane's Undetermined reads as a normal sample when this lane is
+    # listed in report_undetermined_configs. The row is attached to the lane's
+    # first (alphabetical) real project so it flows through fastp, read counts,
+    # md5sums, nextcloud links, and the per-order report. This is the single
+    # source of truth for the renaming map, so injecting here keeps the row
+    # present across every rewrite (including the parse-time regeneration).
+    # Gated by REPORT_UNDETERMINED_CONFIGS; default runs are unaffected.
+    _report_undet = globals().get("REPORT_UNDETERMINED_CONFIGS", [])
+    _cfg_id = os.path.basename(os.path.dirname(map_file))
+    if _cfg_id in _report_undet and len(map_df) > 0:
+        _names = map_df["Sample_Name"].astype(str).str.strip()
+        if not (_names == "Undetermined").any():
+            _proj = map_df["Sample_Project"].astype(str).str.strip()
+            _real = map_df[_proj.ne("") & _proj.str.lower().ne("nan")]
+            if len(_real) > 0:
+                _first = sorted(_real["Sample_Project"].astype(str).str.strip().unique())[0]
+                _owner = _real[_real["Sample_Project"].astype(str).str.strip() == _first].iloc[0]
+                _run = str(_owner.get("Run", "")).strip() or globals().get("LIBRARY", "")
+                _new = {
+                    "Sample_ID": "Undetermined",
+                    "Sample_Name": "Undetermined",
+                    "Sample_Project": _first,
+                    "Lane": _owner.get("Lane", ""),
+                    "index": "Undetermined",
+                    "index2": "",
+                    "Run": _run,
+                    "Group": _owner.get("Group", ""),
+                    "Position": f"P{len(map_df) + 1:03d}",
+                }
+                map_df = pd.concat([map_df, pd.DataFrame([_new])], ignore_index=True)
+
     map_df = map_df[required_cols]
     map_df.to_csv(map_file, index=False, quoting=csv.QUOTE_MINIMAL)
 
@@ -455,14 +486,15 @@ def generate_miseq_samplesheets(metadata_file, out_dir, run_info_path, run_name)
         f.write("\n")
         
         f.write("[BCLConvert_Settings]\n")
-        # BD_Rhapsody_ATACseq / 10xMultiomeATACseq special settings
+        # BD_Rhapsody_ATACseq / 10xMultiomeATACseq special settings.
+        # The global NO_DEMUX config flag also forces index-read FASTQs.
         special_atac_index_reads = False
         if 'Sample_Project' in df_samples.columns:
             for proj in df_samples['Sample_Project'].unique():
                 if is_special_atac_project_or_sheet(proj):
                     special_atac_index_reads = True
                     break
-        if special_atac_index_reads:
+        if special_atac_index_reads or NO_DEMUX:
             f.write("CreateFastqForIndexReads,1\n")
         else:
             f.write("CreateFastqForIndexReads,0\n")
@@ -532,23 +564,68 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
     # (the RC_ORIENTATION sheet needs decision files that may not exist on first pass).
     out_xlsx = None
     try:
+        import fcntl
+        import tempfile
+
         _base = os.path.splitext(os.path.basename(metadata_file))[0]
         out_xlsx = os.path.join('metadata', f"metadata_validation_{_base}.xlsx")
-        _dec_files = glob.glob('logs/*/orientation_decision_*.json')
-        _needs_regen = (
-            not os.path.exists(out_xlsx)
-            or os.path.getmtime(metadata_file) > os.path.getmtime(out_xlsx)
-            or any(os.path.getmtime(d) > os.path.getmtime(out_xlsx) for d in _dec_files)
-        )
-        if _needs_regen:
-            validate_metadata_and_write_report(metadata_file, out_xlsx=out_xlsx)
+
+        def _regen_needed():
+            _dec_files = glob.glob('logs/*/orientation_decision_*.json')
+            if not os.path.exists(out_xlsx):
+                return True
+            _xlsx_mtime = os.path.getmtime(out_xlsx)
+            if os.path.getmtime(metadata_file) > _xlsx_mtime:
+                return True
+            return any(os.path.getmtime(d) > _xlsx_mtime for d in _dec_files)
+
+        # This function runs at parse time in every spawned --mode subprocess job.
+        # Concurrent parses would otherwise both rewrite out_xlsx while another reads
+        # it as the sample-sheet data source below, yielding a truncated/empty parse.
+        # Serialize on a lock file, re-check under the lock (another process may have
+        # just regenerated), and publish via an atomic temp-write + os.replace so a
+        # reader never sees a half-written workbook.
+        os.makedirs(os.path.dirname(out_xlsx) or '.', exist_ok=True)
+        _lock_path = out_xlsx + '.lock'
+        with open(_lock_path, 'w') as _lockf:
+            fcntl.flock(_lockf, fcntl.LOCK_EX)
+            if _regen_needed():
+                _tmp_fd, _tmp_path = tempfile.mkstemp(
+                    dir=os.path.dirname(out_xlsx) or '.',
+                    prefix='.metadata_validation_', suffix='.xlsx')
+                os.close(_tmp_fd)
+                try:
+                    validate_metadata_and_write_report(metadata_file, out_xlsx=_tmp_path)
+                    # validate_metadata_and_write_report has fallback paths that write a
+                    # .txt log and return WITHOUT producing the xlsx, leaving the 0-byte
+                    # mkstemp file. Only publish a genuine, readable workbook; otherwise
+                    # keep the existing out_xlsx (or none) rather than promoting garbage.
+                    _ok = os.path.getsize(_tmp_path) > 0
+                    if _ok:
+                        try:
+                            pd.ExcelFile(_tmp_path).close()
+                        except Exception:
+                            _ok = False
+                    if _ok:
+                        os.replace(_tmp_path, out_xlsx)
+                finally:
+                    if os.path.exists(_tmp_path):
+                        os.remove(_tmp_path)
     except Exception as e:
         print(f"Warning: metadata validation report generation failed: {e}")
 
     # Use validated xlsx as data source for sample sheet construction if available.
     # RECOMMENDED_CHANGES and RC_ORIENTATION sheets are retained in the xlsx for
     # inspection but skipped during sample iteration below.
-    _data_file = out_xlsx if (out_xlsx and os.path.exists(out_xlsx)) else metadata_file
+    # Fall back to the raw metadata if the validation workbook is absent, empty, or
+    # unreadable — a stray 0-byte workbook must never yield an empty sample-sheet parse.
+    _data_file = metadata_file
+    if out_xlsx and os.path.exists(out_xlsx) and os.path.getsize(out_xlsx) > 0:
+        try:
+            pd.ExcelFile(out_xlsx).close()
+            _data_file = out_xlsx
+        except Exception:
+            _data_file = metadata_file
     
     # Detect metadata format: MiSeq (simple) vs NovaSeqX (complex with Summary sheet)
     try:
@@ -1299,7 +1376,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
             # (DRAGEN 4.x does not support CreateFastqForIndexReads as a per-sample column.)
             _INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
             create_fastq_for_index = "0"
-            if special_atac_index_reads:
+            if special_atac_index_reads or NO_DEMUX:
                 f.write("CreateFastqForIndexReads,1\n")
             else:
                 # Check both Project Name and Sample Sheet tab columns for index-read keywords

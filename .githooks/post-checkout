@@ -1,68 +1,9 @@
 #!/bin/bash
-# Adapted from whtns/igb_transition for the HPC3 environment.
+# Back-compat shim. Real setup logic lives in scripts/init_run.sh so it can be
+# run as a plain `pixi run init` (no git-hook wiring needed). This wrapper only
+# exists for anyone who still does `git config core.hooksPath .githooks`.
 #
-# Generates snakemake_config_project.yaml from snakemake_config.yaml and fills in
-# metadata, library_name, and data_dir.
-#
-# Differences from the igb_transition version:
-#   * No sequencer / Nextcloud staging branching. BCL run folders live in a single
-#     HPC3 staging path (default: /dfs3b/ucightf_lab/NSRaw).
-#   * No ../SampleSheets copy step. The metadata .xlsx is expected to already be in
-#     metadata/ (use whatever .xlsx is there).
-#
-# git invokes post-checkout with 3 positional args (prev HEAD, new HEAD, branch flag);
-# they are ignored. Run manually with:
-#   bash .githooks/post-checkout
-#   bash .githooks/post-checkout --staging-dir /dfs3b/ucightf_lab/NSRaw
-#   bash .githooks/post-checkout --data-dir /dfs3b/ucightf_lab/NSRaw/20260505_LH00626_0102_A23WFC3LT4
-
-staging_dir="/dfs3b/ucightf_lab/NSRaw"
-data_dir_override=""
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --staging-dir) staging_dir="$2"; shift 2 ;;
-        --data-dir)    data_dir_override="$2"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-
-# Use the .xlsx already present in metadata/ (excluding validation outputs).
-metadata_file=$(find metadata/ -maxdepth 1 -name "*.xlsx" ! -name "metadata_validation*" | head -1)
-
-if [ ! -f snakemake_config_project.yaml ]; then
-    cp snakemake_config.yaml snakemake_config_project.yaml
-fi
-
-if [ -f snakemake_config_project.yaml ]; then
-    if [ -n "$metadata_file" ]; then
-        sed -i "s|^metadata:.*|metadata: \"$metadata_file\"|" snakemake_config_project.yaml
-        echo "  metadata --> $metadata_file"
-
-        library_name=$(basename "$metadata_file" .xlsx | grep -oE '[ix]R[0-9]+')
-        if [ -n "$library_name" ]; then
-            sed -i "s|^library_name:.*|library_name: \"$library_name\"|" snakemake_config_project.yaml
-            echo "  library_name --> $library_name"
-        else
-            echo "  WARNING: Could not infer library_name from $metadata_file — set it manually."
-        fi
-    else
-        echo "  WARNING: No .xlsx found in metadata/ — set metadata and library_name manually."
-    fi
-
-    # Determine the BCL run folder (data_dir).
-    if [ -n "$data_dir_override" ]; then
-        data_dir="$data_dir_override"
-    else
-        # Newest run directory in the HPC3 staging path.
-        data_dir=$(find "$staging_dir" -maxdepth 1 -mindepth 1 -type d -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
-    fi
-    if [ -n "$data_dir" ]; then
-        sed -i "s|^data_dir:.*|data_dir: \"$data_dir\"|" snakemake_config_project.yaml
-        echo "  data_dir --> $data_dir"
-    else
-        echo "  WARNING: Could not find a run dir in $staging_dir — set data_dir manually."
-    fi
-
-    echo "Created/updated snakemake_config_project.yaml — review and adjust if needed."
-fi
+# git passes 3 positional args to post-checkout; init_run.sh ignores them and
+# reads only --staging-dir/--data-dir, so forward everything through.
+here="$(cd "$(dirname "$0")/.." && pwd)"
+exec bash "$here/scripts/init_run.sh" "$@"
