@@ -8,8 +8,26 @@ singularity-args: >-
   --env PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 retries: 3
 cores: 16
+keep-going: True
 default-resources:
   slurm_partition: free
   slurm_account: sbsandme_lab
   mem_mb: 8000
   runtime: 60
+
+# No serial_operation cap here: that exists in profiles/default to serialize
+# DRAGEN-FPGA-bound jobs on the dragen server. hpc3 runs software bcl-convert
+# via singularity/SLURM (no FPGA), and lanes are already forced serial by the
+# bcl_convert DAG chain (get_prev_bcl_done), so the cap would only throttle
+# bcl_convert_rc/project_link/flexbar_project_link against each other for no
+# hardware reason.
+resources:
+  - nextcloud_api=3
+  - precision_ssh=3
+
+# dfs9 (JBOD/NFS) can take a while to make outputs visible after a job exits.
+latency-wait: 120
+
+# Only mtime triggers a re-run, so an unrelated Snakefile edit doesn't
+# re-run bcl-convert.
+rerun-triggers: mtime
