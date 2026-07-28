@@ -3752,9 +3752,13 @@ rule bcl_convert_rc:
     wildcard_constraints:
         config_id = "[^/]+"
     priority: 90
+    # The RC pass converts a whole lane with the same bcl-convert thread counts as
+    # the primary pass, so it needs the same footprint. Under the profile's 8000MB
+    # default every attempt was OOM-killed within a minute.
     resources:
-        serial_operation=1
-    threads: 1
+        serial_operation=1,
+        mem_mb=144000
+    threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
