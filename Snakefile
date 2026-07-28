@@ -2390,6 +2390,12 @@ rule fqtk_per_config:
         "logs/{config_id}/fqtk_{config_id}.log"
     benchmark:
         "benchmarks/fqtk_per_config_{config_id}.bench"
+    # A lane's Undetermined set runs to hundreds of millions of records; single
+    # threaded under the profile's 60m default this gets killed mid-demux by SLURM.
+    threads: 8
+    resources:
+        runtime = 480,
+        mem_mb  = 16000
     params:
         outdir  = "output/{config_id}/fqtk",
         lane    = lambda wildcards: wildcards.config_id.replace('lane', ''),
@@ -2445,6 +2451,7 @@ rule fqtk_per_config:
             --read-structures "151T" "$I1_READ_STRUCT" "151T" \
             --sample-metadata "$RESOLVED" \
             --output {params.outdir} \
+            --threads {threads} \
             --max-mismatches "$FQTK_MAX_MISMATCHES" \
             --min-mismatch-delta "$FQTK_MIN_MISMATCH_DELTA"
 
