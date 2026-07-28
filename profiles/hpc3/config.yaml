@@ -8,9 +8,10 @@ singularity-args: >-
   --env PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 retries: 3
 cores: 16
+jobs: 32
 keep-going: True
 default-resources:
-  slurm_partition: free
+  slurm_partition: standard
   slurm_account: sbsandme_lab
   mem_mb: 8000
   runtime: 60

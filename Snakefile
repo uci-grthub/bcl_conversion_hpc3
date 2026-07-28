@@ -152,6 +152,7 @@ VALIDATION_XLSX = f"metadata/metadata_validation_{os.path.splitext(os.path.basen
 LANE_CONFIGS = []
 PROJECT_LOOKUP = {}
 MASKING_LOOKUP = {}
+MISSING_MASKING_ROWS = []  # (lane, group, project) for Summary rows missing a Masking value
 PROJECT_LINKS = {}
 PROJECT_LINKS_BY_LANE = {}
 ORDER_ID_LOOKUP = {}
@@ -285,6 +286,9 @@ if METADATA_FILE and os.path.exists(METADATA_FILE):
                          if 'Masking' in df.columns:
                             m = str(row['Masking']).strip()
                             MASKING_LOOKUP[(l, g)] = m
+                            if not m or m.lower() == 'nan':
+                                _proj = str(row.get('Project Name', '')).strip()
+                                MISSING_MASKING_ROWS.append((l, g, '' if _proj.lower() == 'nan' else _proj))
                          
                          if 'Order ID' in df.columns:
                             order_id = str(row['Order ID']).strip().replace(' ', '_')
@@ -316,6 +320,20 @@ if METADATA_FILE and os.path.exists(METADATA_FILE):
                     })
     except Exception as e:
         print(f"Error reading metadata: {e}")
+
+    # Hard gate: a blank Masking on a populated Summary row is a fatal metadata
+    # error. Raised OUTSIDE the try/except above so it is not swallowed. Bypass
+    # with ALLOW_MISSING_MASKING=1 for the rare intentional-blank workflow.
+    if MISSING_MASKING_ROWS and os.environ.get('ALLOW_MISSING_MASKING', '').lower() not in ('1', 'true', 'yes'):
+        _details = ', '.join(
+            f"lane {l} group {g}" + (f" ({p})" if p else '')
+            for l, g, p in MISSING_MASKING_ROWS
+        )
+        raise ValueError(
+            f"Missing Masking value in Summary tab for: {_details}. "
+            f"Add a Masking (e.g. 'I1:8;I2:8') to each row, or set "
+            f"ALLOW_MISSING_MASKING=1 to bypass."
+        )
 
 # Read Barcode List to fill in PROJECT_ORDER_ID for projects not in Summary sheet
 try:
@@ -380,6 +398,23 @@ for (lane, group), project in PROJECT_LOOKUP.items():
         new_name = f"{lab_id}_{order_id}_{LIBRARY}_L{lane}_G{group}"
         PROJECT_RENAME_MAP[(config_id, project)] = new_name
         PROJECT_RENAME_MAP_INV[(config_id, new_name)] = project
+
+# Projects whose names contain one of these keywords need the index reads delivered
+# as FASTQs; every other project has its I1/I2 files stripped in bcl_project_done.
+INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
+
+def project_keeps_index_reads(config_id, project):
+    """True when the I1/I2 FASTQs for this project survive bcl_project_done.
+
+    Accepts either the original or the renamed project folder name and always
+    tests the original, matching the check bcl_project_done performs. Callers
+    that glob the project directory must agree with that rule, otherwise
+    Snakemake records index FASTQs as inputs that the pipeline then deletes.
+    """
+    if NO_DEMUX:
+        return True
+    check_name = PROJECT_RENAME_MAP_INV.get((config_id, project), project)
+    return any(kw in check_name for kw in INDEX_READ_KEYWORDS)
 
 # Helper definitions are sourced from src/workflow_defs.smk
 
@@ -1314,124 +1349,134 @@ rule normalize_project_fastq_names:
     wildcard_constraints:
         config_id = "[^/]+",
         project = ".+"
+    log:
+        "logs/{config_id}/normalize_project_fastq_names_{config_id}_{project}.log"
     run:
         import os
         import shutil
+        import traceback
 
-        config_id = wildcards.config_id
-        new_project = wildcards.project
-        old_project = PROJECT_RENAME_MAP_INV.get((config_id, new_project), new_project)
-        project_dir = os.path.abspath(f"output/{config_id}/{new_project}")
+        _logf = open(log[0], "w")
+        try:
+            config_id = wildcards.config_id
+            new_project = wildcards.project
+            old_project = PROJECT_RENAME_MAP_INV.get((config_id, new_project), new_project)
+            project_dir = os.path.abspath(f"output/{config_id}/{new_project}")
 
-        if not os.path.isdir(project_dir):
-            os.makedirs(project_dir, exist_ok=True)
-            return
+            if not os.path.isdir(project_dir):
+                os.makedirs(project_dir, exist_ok=True)
+                return
 
-        check_name = old_project or new_project
-        lowered = check_name.lower()
-        if any(token in lowered for token in ["10x", "parse", "bd"]):
-            return
+            check_name = old_project or new_project
+            lowered = check_name.lower()
+            if any(token in lowered for token in ["10x", "parse", "bd"]):
+                return
 
-        def _materialize_and_backlink(src_abs, dst_abs):
-            if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
-                os.unlink(dst_abs)
-            if not os.path.exists(dst_abs):
-                try:
-                    os.link(src_abs, dst_abs)
-                except Exception:
-                    shutil.copy2(src_abs, dst_abs)
-            if os.path.lexists(src_abs):
-                try:
-                    if os.path.islink(src_abs) and os.path.realpath(src_abs) == os.path.realpath(dst_abs):
-                        return
-                    os.unlink(src_abs)
-                except Exception:
-                    pass
-            os.symlink(os.path.abspath(dst_abs), src_abs)
+            def _materialize_and_backlink(src_abs, dst_abs):
+                if os.path.lexists(dst_abs) and os.path.islink(dst_abs):
+                    os.unlink(dst_abs)
+                if not os.path.exists(dst_abs):
+                    try:
+                        os.link(src_abs, dst_abs)
+                    except Exception:
+                        shutil.copy2(src_abs, dst_abs)
+                if os.path.lexists(src_abs):
+                    try:
+                        if os.path.islink(src_abs) and os.path.realpath(src_abs) == os.path.realpath(dst_abs):
+                            return
+                        os.unlink(src_abs)
+                    except Exception:
+                        pass
+                os.symlink(os.path.abspath(dst_abs), src_abs)
 
-        _all_flex_rows = globals().get('FLEXBAR_CONFIG_RENAMING_MAP', {}).get(config_id, [])
-        _flexbar_orig_proj = globals().get('FLEXBAR_ORDER_ID_PROJECT', {}).get(config_id, '')
-        _flexbar_proj = PROJECT_RENAME_MAP.get((config_id, _flexbar_orig_proj), _flexbar_orig_proj)
-        flex_rows = _all_flex_rows if new_project == _flexbar_proj else []
-        for idx, row in enumerate(flex_rows):
-            sample_name = str(row.get("Sample_Name", "")).strip()
-            if not sample_name or sample_name.lower() == "nan":
-                continue
-
-            run_name = str(row.get("Run", "")).strip()
-            lane = int(row.get("Lane", 0))
-            try:
-                group = str(int(float(row.get("Group", 0))))
-            except Exception:
-                group = str(row.get("Group", "")).strip()
-            if not group or group.lower() == "nan":
-                group = "Undetermined"
-
-            index1 = str(row.get("index", "")).strip()
-            if index1.lower() == "nan":
-                index1 = ""
-            index2 = str(row.get("index2", "")).strip()
-            if index2.lower() == "nan":
-                index2 = ""
-
-            barcode = f"{index1}-{index2}" if index2 else index1
-            position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
-            stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
-
-            src_r1 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}.fastq.gz")
-            dst_r1 = os.path.abspath(f"{project_dir}/{stem}-R1.fastq.gz")
-            if os.path.exists(src_r1) or os.path.islink(src_r1):
-                _materialize_and_backlink(src_r1, dst_r1)
-
-            if NUM_READS > 1:
-                src_r2 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}_R2.fastq.gz")
-                dst_r2 = os.path.abspath(f"{project_dir}/{stem}-R2.fastq.gz")
-                if os.path.exists(src_r2) or os.path.islink(src_r2):
-                    _materialize_and_backlink(src_r2, dst_r2)
-
-        df = pd.read_csv(input.renaming_map)
-        project_rows = df[df["Sample_Project"].astype(str).str.strip() == old_project]
-
-        for idx, row in project_rows.iterrows():
-            sample_name = str(row.get("Sample_Name", "")).strip()
-            if not sample_name or sample_name.lower() == "nan":
-                continue
-
-            try:
-                lane = int(float(row.get("Lane", 0)))
-            except Exception:
-                lane = 0
-
-            try:
-                group = str(int(float(row.get("Group", 0))))
-            except Exception:
-                group = str(row.get("Group", "")).strip()
-            if not group or group.lower() == "nan":
-                group = "Undetermined"
-
-            run_name = str(row.get("Run", "")).strip()
-            index1 = str(row.get("index", "")).strip()
-            if index1.lower() == "nan":
-                index1 = ""
-            index2 = str(row.get("index2", "")).strip()
-            if index2.lower() == "nan":
-                index2 = ""
-            barcode = f"{index1}-{index2}" if index2 else index1
-            position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
-            s_num = idx + 1
-            stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
-
-            for read_type in ["R1", "R2", "I1", "I2"]:
-                legacy_name = f"{sample_name}_S{s_num}_L{lane:03d}_{read_type}_001.fastq.gz"
-                canonical_name = f"{stem}-{read_type}.fastq.gz"
-                legacy_path = os.path.join(project_dir, legacy_name)
-                canonical_path = os.path.join(project_dir, canonical_name)
-
-                if os.path.exists(canonical_path):
+            _all_flex_rows = globals().get('FLEXBAR_CONFIG_RENAMING_MAP', {}).get(config_id, [])
+            _flexbar_orig_proj = globals().get('FLEXBAR_ORDER_ID_PROJECT', {}).get(config_id, '')
+            _flexbar_proj = PROJECT_RENAME_MAP.get((config_id, _flexbar_orig_proj), _flexbar_orig_proj)
+            flex_rows = _all_flex_rows if new_project == _flexbar_proj else []
+            for idx, row in enumerate(flex_rows):
+                sample_name = str(row.get("Sample_Name", "")).strip()
+                if not sample_name or sample_name.lower() == "nan":
                     continue
-                if not os.path.exists(legacy_path):
+
+                run_name = str(row.get("Run", "")).strip()
+                lane = int(row.get("Lane", 0))
+                try:
+                    group = str(int(float(row.get("Group", 0))))
+                except Exception:
+                    group = str(row.get("Group", "")).strip()
+                if not group or group.lower() == "nan":
+                    group = "Undetermined"
+
+                index1 = str(row.get("index", "")).strip()
+                if index1.lower() == "nan":
+                    index1 = ""
+                index2 = str(row.get("index2", "")).strip()
+                if index2.lower() == "nan":
+                    index2 = ""
+
+                barcode = f"{index1}-{index2}" if index2 else index1
+                position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
+                stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
+
+                src_r1 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}.fastq.gz")
+                dst_r1 = os.path.abspath(f"{project_dir}/{stem}-R1.fastq.gz")
+                if os.path.exists(src_r1) or os.path.islink(src_r1):
+                    _materialize_and_backlink(src_r1, dst_r1)
+
+                if NUM_READS > 1:
+                    src_r2 = os.path.abspath(f"output/{config_id}/flexbar/flexbarOut_barcode_{sample_name}_R2.fastq.gz")
+                    dst_r2 = os.path.abspath(f"{project_dir}/{stem}-R2.fastq.gz")
+                    if os.path.exists(src_r2) or os.path.islink(src_r2):
+                        _materialize_and_backlink(src_r2, dst_r2)
+
+            df = pd.read_csv(input.renaming_map)
+            project_rows = df[df["Sample_Project"].astype(str).str.strip() == old_project]
+
+            for idx, row in project_rows.iterrows():
+                sample_name = str(row.get("Sample_Name", "")).strip()
+                if not sample_name or sample_name.lower() == "nan":
                     continue
-                os.rename(legacy_path, canonical_path)
+
+                try:
+                    lane = int(float(row.get("Lane", 0)))
+                except Exception:
+                    lane = 0
+
+                try:
+                    group = str(int(float(row.get("Group", 0))))
+                except Exception:
+                    group = str(row.get("Group", "")).strip()
+                if not group or group.lower() == "nan":
+                    group = "Undetermined"
+
+                run_name = str(row.get("Run", "")).strip()
+                index1 = str(row.get("index", "")).strip()
+                if index1.lower() == "nan":
+                    index1 = ""
+                index2 = str(row.get("index2", "")).strip()
+                if index2.lower() == "nan":
+                    index2 = ""
+                barcode = f"{index1}-{index2}" if index2 else index1
+                position = str(row.get("Position", f"P{idx + 1:03d}")).strip()
+                s_num = idx + 1
+                stem = f"{run_name}-L{lane}-G{group}-{position}-{barcode}"
+
+                for read_type in ["R1", "R2", "I1", "I2"]:
+                    legacy_name = f"{sample_name}_S{s_num}_L{lane:03d}_{read_type}_001.fastq.gz"
+                    canonical_name = f"{stem}-{read_type}.fastq.gz"
+                    legacy_path = os.path.join(project_dir, legacy_name)
+                    canonical_path = os.path.join(project_dir, canonical_name)
+
+                    if os.path.exists(canonical_path):
+                        continue
+                    if not os.path.exists(legacy_path):
+                        continue
+                    os.rename(legacy_path, canonical_path)
+        except Exception:
+            _logf.write(traceback.format_exc())
+            raise
+        finally:
+            _logf.close()
 
 rule fastp_per_config:
     input:
@@ -1491,7 +1536,14 @@ rule fastp_plots_per_config:
 rule summarize_project_reads:
     input:
         project_done = "output/{config_id}/{project}/.project_done",
-        bcl_done = ".output/{config_id}/.done"
+        bcl_done = ".output/{config_id}/.done",
+        # fqtk-routed projects are absent from Demultiplex_Stats.csv; their counts
+        # come from output/{config_id}/fqtk/demux-metrics.txt instead. Depending on
+        # the done flag also makes this rule rerun after a re-demux.
+        fqtk_done = lambda wildcards: (
+            f"results/{wildcards.config_id}/fqtk_{wildcards.config_id}.done"
+            if wildcards.config_id in FQTK_CONFIGS else []
+        )
     output:
         "results/{config_id}/{project}/read_counts_{project}.csv"
     log:
@@ -1568,7 +1620,49 @@ rule summarize_project_reads:
             else:
                 print(f"Missing Sample_Project column in {demux_path}")
 
-        df = pd.DataFrame(data)
+        # fqtk fallback: this project's samples were demultiplexed post-hoc from the
+        # lane's Undetermined reads, so DRAGEN never reported them. Read the counts
+        # fqtk wrote instead. Same parsing as compile_read_counts.
+        if not data and FQTK_ORDER_ID_PROJECT.get(wildcards.config_id) in target_projects:
+            metrics_path = f"output/{wildcards.config_id}/fqtk/demux-metrics.txt"
+            if not os.path.exists(metrics_path):
+                print(f"Skipping missing {metrics_path}")
+            else:
+                try:
+                    metrics_df = pd.read_csv(metrics_path, sep='\t')
+                except Exception as e:
+                    print(f"Error reading {metrics_path}: {e}")
+                    metrics_df = pd.DataFrame()
+
+                sample_col = 'barcode_name' if 'barcode_name' in metrics_df.columns else 'sample_id'
+                if sample_col not in metrics_df.columns:
+                    print(f"Missing sample column in {metrics_path}")
+                else:
+                    for _, row in metrics_df.iterrows():
+                        sample_name = str(row.get(sample_col, '')).strip()
+                        # unmatched/undetermined are not samples; decoy__* entries exist
+                        # only to absorb reads belonging to the lane's DRAGEN indexes.
+                        if not sample_name or sample_name.lower() in ('unmatched', 'undetermined'):
+                            continue
+                        if sample_name.startswith('decoy__'):
+                            continue
+                        try:
+                            read_pairs = int(row.get('templates', row.get('reads', 0)))
+                        except (ValueError, TypeError):
+                            read_pairs = 0
+                        data.append({
+                            'Config': wildcards.config_id,
+                            'Project': wildcards.project,
+                            'Sample': sample_name,
+                            'Total_Reads': read_pairs,
+                            'Passed_Reads': read_pairs,
+                        })
+                    print(f"Read {len(data)} fqtk sample counts from {metrics_path}")
+
+        df = pd.DataFrame(
+            data,
+            columns=['Config', 'Project', 'Sample', 'Total_Reads', 'Passed_Reads'],
+        )
         if not df.empty:
             df = df.sort_values(['Sample'])
         df.to_csv(output[0], index=False)
@@ -1764,7 +1858,9 @@ rule compile_read_counts:
                         lane_group_counts[lane_group_key][label][3] += reads
                         current_barcode = None
 
-        # Parse fqtk demux-metrics.txt and add per-sample read counts as a "fqtk" group
+        # Parse fqtk demux-metrics.txt and add per-sample read counts. These samples
+        # carry a real group number in the metadata even though DRAGEN never demuxed
+        # them, so they get their own lane/group column like every other project.
         for config_id in FQTK_CONFIGS:
             lane_num = None
             try:
@@ -1781,12 +1877,23 @@ rule compile_read_counts:
                 print(f"Skipping missing fqtk metrics: {fqtk_metrics}")
                 continue
 
-            lane_group_key = (lane_num, "fqtk")
+            fqtk_rows = FQTK_CONFIG_RENAMING_MAP.get(config_id) or []
+            fqtk_group = str(fqtk_rows[0].get("Group", "")).strip() if fqtk_rows else ""
+            if not fqtk_group:
+                print(f"No group number for fqtk config {config_id}; labelling column 'fqtk'")
+                fqtk_group = "fqtk"
+            try:
+                fqtk_group_order = int(fqtk_group)
+            except (ValueError, TypeError):
+                fqtk_group_order = float("inf")
+
+            lane_group_key = (lane_num, fqtk_group)
             lane_group_counts.setdefault(lane_group_key, {})
 
             try:
                 with open(fqtk_metrics) as _fh:
                     header_line = None
+                    fqtk_idx = 0
                     for _line in _fh:
                         _line = _line.rstrip('\n')
                         if not _line or _line.startswith('#'):
@@ -1799,13 +1906,23 @@ rule compile_read_counts:
                         sample = row_dict.get('barcode_name', row_dict.get('sample_id', ''))
                         if not sample or sample.lower() in ('unmatched', 'undetermined', ''):
                             continue
+                        # decoy__* entries are not samples: they exist to absorb reads
+                        # belonging to lanes' DRAGEN-assigned indexes (see
+                        # scripts/resolve_fqtk_barcodes.py).
+                        if sample.startswith('decoy__'):
+                            continue
                         try:
                             reads = int(row_dict.get('templates', row_dict.get('reads', 0)))
                         except (ValueError, TypeError):
                             reads = 0
                         label = sample
                         if label not in lane_group_counts[lane_group_key]:
-                            lane_group_counts[lane_group_key][label] = [0, 0, "fqtk", 0]
+                            # (group_order, row_index, group, reads) -- row_index keeps
+                            # the samples in demux-metrics.txt order within the column.
+                            lane_group_counts[lane_group_key][label] = [
+                                fqtk_group_order, fqtk_idx, fqtk_group, 0,
+                            ]
+                            fqtk_idx += 1
                         lane_group_counts[lane_group_key][label][3] += reads
             except Exception as _e:
                 print(f"Warning: could not parse fqtk metrics {fqtk_metrics}: {_e}")
@@ -2261,7 +2378,12 @@ rule fqtk_per_config:
     """
     input:
         bcl_done    = ".output/{config_id}/.done",
-        barcode_tsv = "metadata/fqtk_barcodes_{config_id}.tsv"
+        barcode_tsv = "metadata/fqtk_barcodes_{config_id}.tsv",
+        # The barcode resolver reads this sheet to know which indexes DRAGEN claimed.
+        # It must be declared, not just referenced in the shell: .done can outlive a
+        # deleted sample sheet, and without the dependency this rule starts alongside
+        # the validation that regenerates it.
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}_validated.csv")
     output:
         touch("results/{config_id}/fqtk_{config_id}.done")
     log:
@@ -2301,19 +2423,41 @@ rule fqtk_per_config:
         fi
         echo "I1 read length: ${{I1_LEN}}bp -> read structure: $I1_READ_STRUCT"
 
+        # Samples routed here by an index collision carry a short index (e.g. 6bp),
+        # but the read structure above matches 8 bases. Measure what those samples
+        # actually sequenced at the remaining cycles rather than padding a guess;
+        # this fails loudly when the result would collide with a real sample index.
+        RESOLVED="metadata/fqtk_barcodes_{wildcards.config_id}_resolved.tsv"
+        python3 scripts/resolve_fqtk_barcodes.py \
+            --barcodes {input.barcode_tsv} \
+            --undetermined-i1 "$I1" \
+            --samplesheet {input.samplesheet} \
+            --target-length 8 \
+            --output "$RESOLVED"
+
+        # Matching thresholds come from how close the resolved barcodes and decoys
+        # actually are. Hardcoding --min-mismatch-delta 2 silently emptied a sample
+        # sitting one mismatch from a decoy: every read tied and went to unmatched.
+        . "$RESOLVED.params"
+
         fqtk demux \
             --inputs "$R1" "$I1" "$R2" \
             --read-structures "151T" "$I1_READ_STRUCT" "151T" \
-            --sample-metadata {input.barcode_tsv} \
+            --sample-metadata "$RESOLVED" \
             --output {params.outdir} \
-            --max-mismatches 1 \
-            --min-mismatch-delta 2
+            --max-mismatches "$FQTK_MAX_MISMATCHES" \
+            --min-mismatch-delta "$FQTK_MIN_MISMATCH_DELTA"
 
         echo "fqtk demux complete"
         cat "{params.outdir}/demux-metrics.txt" 2>/dev/null || true
 
         # Remove unmatched reads — not needed downstream and can be large.
         rm -f "{params.outdir}"/unmatched.*.fq.gz
+
+        # Decoy entries exist only to keep reads belonging to DRAGEN-demultiplexed
+        # samples out of the recovered ones; their FASTQs are duplicates of reads that
+        # already failed assignment once and are not deliverables.
+        rm -f "{params.outdir}"/decoy__*.fq.gz
 
         curr_dir=$PWD
         cd {params.outdir}
@@ -2890,7 +3034,7 @@ rule bcl_convert:
             dragen_out="$final_out"
         fi
 
-        rm -f "$dragen_out"/*.fastq.gz 2>/dev/null || true
+        find "$dragen_out" -name "*.fastq.gz" -delete 2>/dev/null || true
         mkdir -p "$dragen_out"
 
         run_bcl_convert {input.sample_sheet}
@@ -3076,6 +3220,13 @@ rule bcl_project_done:
             )
         is_primary_copier = new_project == all_lane_projects[0]
 
+        # Undetermined FASTQs are normally deleted before this rule runs. A lane that
+        # demultiplexes with fqtk or flexbar keeps them so the post-hoc demux has input,
+        # which put hundreds of GB of staging-only reads into the delivery tree as a side
+        # effect. Copy them only when the run actually asked for them; the fqtk path
+        # reads from .output/ directly and never wants a second copy here.
+        deliver_undetermined = config_id in _effective_keep
+
         # Bulk accessory copy (primary project only). Skip old Sample_Project subdirs —
         # those are moved by their own bcl_project_done.
         if is_primary_copier and os.path.isdir(staging):
@@ -3087,6 +3238,9 @@ rule bcl_project_done:
                 dst_item = os.path.join(dest_base, item)
                 if os.path.isdir(src_item) and item in old_project_dirs:
                     continue  # handled by that project's bcl_project_done
+                if item.startswith('Undetermined') and not deliver_undetermined:
+                    _plog(f"Skipping staging-only Undetermined file: {item}")
+                    continue
                 if os.path.isdir(src_item):
                     # Force-overwrite so RC-corrected Demultiplex_Stats and summaries
                     # replace any stale copy previously written from .output.
@@ -3127,9 +3281,9 @@ rule bcl_project_done:
         # When no_demux is set the index reads are the point of the run (DRAGEN emits
         # them as FASTQs instead of index-based demultiplexing), so keep them for every
         # project rather than stripping them here.
-        _INDEX_READ_KEYWORDS = ["10x", "BD", "parse", "Parse", "SMK", "smk", "CITE", "cite", "Hashtag", "hashtag"]
-        check_name = old_project if old_project else new_project
-        if not NO_DEMUX and not any(kw in check_name for kw in _INDEX_READ_KEYWORDS):
+        # Keyword list and NO_DEMUX exemption live in project_keeps_index_reads so
+        # _project_fastqs_for_md5 applies exactly the same rule when it globs.
+        if not project_keeps_index_reads(config_id, new_project):
             proj_dir = f"output/{config_id}/{new_project}"
             removed = 0
             for pattern in ["**/*-I1.fastq.gz", "**/*-I2.fastq.gz"]:
@@ -3256,9 +3410,33 @@ rule check_low_reads:
                                 _log(f"Warning: failed to send alert email: {e}")
                             log_fh.close()
 
+def _project_fastqs_for_md5(wildcards):
+    """List the fastq.gz files feeding md5sums.txt so Snakemake ties the checksum
+    file to the actual data, not just the .fastq_names_done sentinel.
+
+    Without this, regenerating the fastqs (e.g. a re-demux) without renewing the
+    sentinel newer than md5sums.txt leaves the checksum file stale — Snakemake sees
+    its only input unchanged and skips the recompute, shipping wrong md5sums.
+    The .fastq_names_done sentinel still gates ordering so the glob only matters
+    once the fastqs exist; when they do, their mtimes force a rerun on any change.
+
+    Index FASTQs are excluded for projects bcl_project_done strips them from.
+    The glob runs at DAG-build time, so a leftover I1/I2 from an earlier run would
+    otherwise be recorded as an input and then deleted mid-run by bcl_project_done,
+    leaving this job waiting on files the pipeline itself removed.
+    """
+    import glob as _glob
+    files = sorted(_glob.glob(
+        f"output/{wildcards.config_id}/{wildcards.project}/*.fastq.gz"
+    ))
+    if not project_keeps_index_reads(wildcards.config_id, wildcards.project):
+        files = [f for f in files if not f.endswith(("-I1.fastq.gz", "-I2.fastq.gz"))]
+    return files
+
 rule calculate_md5sums:
     input:
-        done = "output/{config_id}/{project}/.fastq_names_done"
+        done = "output/{config_id}/{project}/.fastq_names_done",
+        fastqs = _project_fastqs_for_md5
     output:
         md5 = "output/{config_id}/{project}/md5sums.txt"
     log:
@@ -3665,11 +3843,14 @@ rule pick_orientation:
         with open(input.candidates) as f:
             suspects = json_mod.load(f)
 
-        # Keep Undetermined FASTQs for lanes configured for flexbar demux, or for
-        # lanes explicitly listed in keep_undetermined_configs / report_undetermined_configs.
-        # Match bcl_convert behavior to avoid deleting reads it was told to keep.
+        # Keep Undetermined FASTQs for lanes configured for flexbar or fqtk demux, or
+        # for lanes explicitly listed in keep_undetermined_configs / report_undetermined_configs.
+        # Match bcl_convert behavior to avoid deleting reads it was told to keep: fqtk
+        # lanes demultiplex their samples out of these files, so losing them here means
+        # losing those samples entirely and having to re-convert the lane.
         preserve_undetermined = (
             os_mod.path.isfile(f"metadata/flexbar_barcodes_{wildcards.config_id}.txt")
+            or os_mod.path.isfile(f"metadata/fqtk_barcodes_{wildcards.config_id}.tsv")
             or wildcards.config_id in _effective_keep
         )
 

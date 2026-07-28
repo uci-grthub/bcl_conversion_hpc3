@@ -25,7 +25,10 @@ for arg in "$@"; do
     esac
 done
 
-SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3)
+# --workflow-profile none: without this, snakemake auto-merges profiles/default
+# (the dragen-server profile) and its settings win over --profile, silently
+# reimposing serial_operation=1 and blocking hpc3 job parallelism.
+SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3 --workflow-profile none)
 if [[ "$DRY_RUN" -eq 1 ]]; then
     SNAKEMAKE_ARGS+=(--dry-run)
 fi
