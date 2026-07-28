@@ -34,6 +34,15 @@ That's the whole loop. `enable_nextcloud`/`send_emails` are **off by default** o
 (`snakemake_config.yaml`), so no `.env` is required unless a project explicitly turns
 Nextcloud sharing or email alerts back on.
 
+Two things the workflow now decides on its own, with no operator action:
+
+- **Index collisions.** If a sample's index is a prefix of a longer index on the same lane
+  (`GTAGAG` vs `GTAGAGGA`), bcl-convert would abort the lane. That project is dropped from
+  the sample sheet and recovered afterwards from Undetermined reads with `fqtk`. Watch for
+  `Index collision on lane{N}: ...` in the output; nothing to change in the workbook.
+- **Blank `Masking`.** A populated Summary row with an empty `Masking` cell stops the run
+  before any conversion. Fix the workbook (see Troubleshooting).
+
 ### Prerequisites
 
 - Run has finished copying (a `CopyComplete.txt` exists in the run directory under
@@ -80,9 +89,15 @@ pixi run python scripts/test_nextcloud_token.py
 - `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
   `send_emails: false` / `enable_nextcloud: false` live here.
 - `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor, Singularity
-  enabled, resource defaults. Used automatically by `run_hpc3.sh`.
+  enabled, `standard` partition, account `sbsandme_lab`, up to 32 concurrent jobs,
+  `keep-going`, `latency-wait: 120` (dfs9 is slow to expose outputs), `rerun-triggers: mtime`
+  (an unrelated Snakefile edit won't re-run bcl-convert), and 8000 MB / 60 min defaults.
+  Used automatically by `run_hpc3.sh`. Heavy rules override these in the `Snakefile`:
+  `bcl_convert`/`bcl_convert_rc` 24 threads / 48 GB, `flexbar_per_config` 32 / 64 GB / 480 min,
+  `fqtk_per_config` 8 / 16 GB / 480 min.
 - `profiles/default/config.yaml` — non-HPC3 resource-limit profile (kept for parity with
-  upstream / single-host use); not used by `run_hpc3.sh`.
+  upstream / single-host use); not used by `run_hpc3.sh`, which passes
+  `--workflow-profile none` so this profile cannot silently override the hpc3 one.
 
 ### Metadata format (auto-detected)
 
@@ -90,8 +105,27 @@ pixi run python scripts/test_nextcloud_token.py
   - Summary sheet (header row 3): `Lane`, `Gr` (Group), `Project Name`, `Masking`, `Fastq Link`
   - Per-project sheets: `Lane`, `Group`, `Sample Name`, `i7 Barcode Sequence`, `i5 Barcode Sequence`
   - Masking strings must match the run cycle structure in `RunInfo.xml`.
+  - Every populated Summary row **must** carry a `Masking` value — a blank one is a fatal error.
 - **MiSeq i100** (has a `Barcode Entries` sheet, no `Summary` sheet):
   - Per-sample barcodes; Order IDs inferred from the `Lab ID` column; all samples in `lane1`.
+
+### Post-hoc demultiplexing (fqtk)
+
+Runs automatically for a lane when `metadata/fqtk_barcodes_lane{N}.tsv` exists — written by
+sample-sheet generation for projects named `*fqtk*` and for projects routed there by an index
+prefix collision. Those samples are demultiplexed from the lane's Undetermined I1 reads after
+conversion, then staged into the project directory under normal names; their read counts come
+from `output/lane{N}/fqtk/demux-metrics.txt` instead of `Demultiplex_Stats.csv`.
+
+Nothing to run by hand. To inspect one lane:
+
+```bash
+bash run_hpc3.sh results/lane2/fqtk_lane2.done
+cat logs/lane2/fqtk_lane2.log                        # resolved barcodes + thresholds
+cat metadata/fqtk_barcodes_lane2_resolved.tsv        # full-length barcodes and decoys
+```
+
+Details in [README.md](README.md#fqtk-post-hoc-demultiplexing).
 
 ### Run specific stages
 
@@ -109,6 +143,7 @@ pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a ru
 ### Validate outputs
 
 - `output/lane{N}/` — project FASTQ files
+- `output/lane{N}/fqtk/` — post-hoc demux output + `demux-metrics.txt` (routed lanes only)
 - `results/fastp/` — JSON stats; `results/fastp_plots/` — PNG plots
 - `Reports/` — order/project HTML reports, md5sums, PDFs (if enabled)
 - `results/{RUN}-count.csv` — read counts
@@ -131,3 +166,12 @@ pixi run dag                  # dag.pdf
 - BCL conversion failures: check the Singularity module/image, and slurm job logs.
 - Empty reports: verify metadata sheet names and headers.
 - md5 mismatch: regenerate the specific project report outputs.
+- `Missing Masking value in Summary tab for: lane N group G` — fill that cell in the workbook.
+  Bypass only when the blank is intentional: `ALLOW_MISSING_MASKING=1 bash run_hpc3.sh`.
+- `UNRESOLVABLE i7 prefix collision` from the barcode validator — mixed index lengths that no
+  `BarcodeMismatchesIndex` value can separate. Pad/replace the short index in the workbook, or
+  let the fqtk routing handle it (it normally does, before bcl-convert sees the sheet).
+- Job OOM-killed / hit the time limit — compare `benchmarks/{rule}_{config_id}.bench` and raise
+  that rule's `resources:` block in the `Snakefile`; the profile default is 8000 MB / 60 min.
+- Only one job running at a time — confirm `run_hpc3.sh` was used (it passes
+  `--workflow-profile none`); a bare `snakemake` picks up `profiles/default` and serializes.

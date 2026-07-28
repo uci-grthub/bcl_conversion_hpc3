@@ -10,12 +10,15 @@ Automated workflow for Illumina (MiSeq i100 / NovaSeqX) sequencing data processi
 
 This Snakemake pipeline handles the complete sequencing data processing workflow:
 1. **BCL Conversion** - bcl-convert (via Singularity) to FASTQ with per-lane sample sheets
-2. **File Renaming** - Systematic renaming based on lane, group, position, and barcode
-3. **Quality Analysis** - FastP quality metrics for all samples
-4. **Visualization** - Quality plots (mean Phred scores, base composition)
-5. **Report Generation** - Comprehensive HTML reports grouped by Order ID with embedded plots and download instructions
-6. **Read Count Compilation** - Lane-level read counts formatted as CSV, aggregated per library
-7. **Email Notifications** - Automated email delivery of reports and read counts (optional, off by default)
+2. **Post-hoc Demultiplexing** - fqtk recovers samples that bcl-convert cannot demultiplex
+   (index collisions, `*fqtk*` projects) from the lane's Undetermined reads; flexbar handles
+   inline-barcode libraries
+3. **File Renaming** - Systematic renaming based on lane, group, position, and barcode
+4. **Quality Analysis** - FastP quality metrics for all samples
+5. **Visualization** - Quality plots (mean Phred scores, base composition)
+6. **Report Generation** - Comprehensive HTML reports grouped by Order ID with embedded plots and download instructions
+7. **Read Count Compilation** - Lane-level read counts formatted as CSV, aggregated per library
+8. **Email Notifications** - Automated email delivery of reports and read counts (optional, off by default)
 
 ## Installation
 
@@ -66,8 +69,15 @@ installed by pixi:
 - **`Snakefile`** - Main workflow definition; imports rules from `src/workflow_defs.smk`
 - **`snakemake_config.yaml`** - Base configuration (paths, threads, email settings)
 - **`snakemake_config_project.yaml`** - Project-specific configuration (overrides base settings)
+- **`profiles/hpc3/config.yaml`** - HPC3 executor profile (slurm, Singularity, resource defaults)
 - **`metadata/*.xlsx`** - Excel metadata with Summary sheet and per-project sheets
 - **`src/RunInfo_nn.xml`** - Normalized run configuration (auto-generated)
+- **`src/barcode_collisions.py`** - Detects unresolvable index collisions and routes those
+  projects to the fqtk path
+- **`scripts/resolve_fqtk_barcodes.py`** - Extends short fqtk barcodes to the run's full index
+  length from observed Undetermined reads, adds decoy entries, and derives fqtk's matching thresholds
+- **`scripts/validate_barcode_hamming_distance.py`** - Sample-sheet barcode distance check
+  (prefix-aware; can auto-fix `BarcodeMismatchesIndex`)
 
 ## Platforms & Auto-Detection
 
@@ -112,6 +122,44 @@ lanes: [1,2,3,4,5,6,7,8]                 # Lanes to process (auto-detected from 
 
 `email_sender`/`email_recipient` only need setting if `send_emails: true`.
 
+`bcl_convert_order` defaults to `[]` (empty) — lanes are already serialized by the
+`bcl_convert` DAG chain, so an explicit order is only needed to force a non-default sequence.
+
+## HPC3 Execution Profile
+
+`profiles/hpc3/config.yaml` drives slurm submission:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `executor` | `slurm` | Jobs submitted to HPC3 |
+| `slurm_partition` | `standard` | `free` gets preempted mid-conversion |
+| `slurm_account` | `sbsandme_lab` | Pinned; auto-guessing was unreliable |
+| `jobs` | `32` | Concurrent slurm jobs |
+| `keep-going` | `True` | One failed project doesn't stall the rest of the run |
+| `latency-wait` | `120` | dfs9 (JBOD/NFS) is slow to expose outputs after a job exits |
+| `rerun-triggers` | `mtime` | An unrelated Snakefile edit won't re-run bcl-convert |
+| `default-resources` | 8000 MB / 60 min | Per-rule overrides below |
+
+There is **no** `serial_operation` cap here — that exists in `profiles/default` to serialize
+DRAGEN-FPGA jobs. HPC3 runs software bcl-convert, and lanes are already serial via the DAG.
+
+`run_hpc3.sh` passes `--workflow-profile none`. Without it Snakemake auto-merges
+`profiles/default` (the DRAGEN-server profile), whose settings win over `--profile` and
+silently reimpose `serial_operation=1`, blocking all job parallelism.
+
+**Per-rule resource overrides** (in the `Snakefile`, measured from `benchmarks/`):
+
+| Rule | Threads | Memory | Runtime |
+|------|---------|--------|---------|
+| `bcl_convert` / `bcl_convert_rc` | 24 | 48 GB | profile default |
+| `flexbar_per_config` | 32 | 64 GB | 480 min |
+| `flexbar_pair_r2` | 32 | 32 GB | 480 min |
+| `fqtk_per_config` | 8 | 16 GB | 480 min |
+| `calculate_md5sums` | 8 | profile default | profile default |
+
+Peak bcl-convert RSS across all 8 lanes measured ~23 GB, so 48 GB keeps 2× headroom without
+queueing for a 144 GB block.
+
 ## Metadata Format
 
 ### NovaSeqX (Summary-sheet format)
@@ -121,6 +169,10 @@ lanes: [1,2,3,4,5,6,7,8]                 # Lanes to process (auto-detected from 
   - `Lane`, `Group`, `Sample Name`, `i7 Barcode Sequence`, `i5 Barcode Sequence`
 
 **Masking format**: `R1:151, I1:8, I2:8, R2:151` → generates OverrideCycles
+
+A blank `Masking` cell on a populated Summary row is a **fatal** error — the workflow stops
+before any conversion with the offending lane/group listed. Fill the cell, or set
+`ALLOW_MISSING_MASKING=1` in the environment for the rare intentional-blank case.
 
 ### MiSeq i100 (simple format)
 - A **`Barcode Entries`** sheet with per-sample barcodes (no `Summary` sheet)
@@ -148,44 +200,61 @@ bash run_hpc3.sh output/lane1
 - Applies OverrideCycles from metadata masking field
 - Creates project subdirectories
 - Renames FASTQ files using renaming map: `{Run}-L{Lane}-G{Group}-P{Position}-{Barcode}`
+- Index reads (I1/I2) are deleted per project unless the project name contains one of
+  `10x`, `BD`, `parse`, `SMK`, `CITE`, `Hashtag` (case variants included), or `no_demux` is set
 
-### 3. Quality Analysis (FastP)
+### 3. Post-hoc Demultiplexing (fqtk)
+```bash
+pixi run snakemake --profile profiles/hpc3 results/lane2/fqtk_lane2.done
+```
+- Runs automatically for any lane with a `metadata/fqtk_barcodes_{config_id}.tsv`
+- Demultiplexes the lane's Undetermined reads by I1 (see [fqtk Post-Hoc Demultiplexing](#fqtk-post-hoc-demultiplexing))
+- Outputs to `output/{config_id}/fqtk/` plus `demux-metrics.txt`, then stages files into the
+  project directory under canonical names
+
+### 4. Quality Analysis (FastP)
 ```bash
 pixi run snakemake --profile profiles/hpc3 --cores 4 results/fastp_lane1.done
 ```
 - Runs FastP on all samples per config
 - Outputs JSON stats to `results/fastp/lane{N}/{project}/{sample}.json`
 
-### 4. Quality Plots
+### 5. Quality Plots
 ```bash
 pixi run snakemake --profile profiles/hpc3 --cores 4 results/lane1/fastp_plots_lane1.done
 ```
 - Generates mean Phred and base composition plots
 - Outputs PNG files to `results/fastp_plots/lane{N}/{project}/{sample}-*.png`
 
-### 5. Project/Order Reports
+### 6. Project/Order Reports
 ```bash
 pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
 ```
 - Creates comprehensive HTML reports grouped by `Order ID`
 - Includes summary of all projects associated with the order
 - Embeds quality plots as base64 images
-- Includes download instructions (browser, wget, HPC) and sorted md5 checksums
+- Includes download instructions (browser, wget, HPC) and sorted md5 checksums; the WebDAV
+  instructions require **Cyberduck 9.5.2+** (older versions fail with a misleading
+  "DNS lookup failed" error) and keep host and path in separate fields
+- Read counts resolve against reverse-complemented index orientations, so a lane demuxed from
+  an RC'd sample sheet still reports counts
 - Outputs:
   - `Reports/order_{id}/index.html`
   - `Reports/order_{id}/md5sums.txt`
   - `Reports/order_{id}/Download_Instructions.pdf`
   - `Reports/{project}/lane{lane}/index.html`
 
-### 6. Read Count Compilation
+### 7. Read Count Compilation
 ```bash
 pixi run snakemake --profile profiles/hpc3 --cores 1 results/iR011-count.csv
 ```
 - Aggregates read counts across all lanes
 - Formats as CSV with lane/group/sample/counts columns
 - Sorted by read count (descending) per lane
+- fqtk-demultiplexed samples never appear in `Demultiplex_Stats.csv`; their counts are read
+  from `output/{config_id}/fqtk/demux-metrics.txt` and placed in their real lane/group column
 
-### 7. Email Delivery
+### 8. Email Delivery
 ```bash
 pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/iR011_read_counts_email.done
 ```
@@ -237,11 +306,20 @@ output/
     {project}/
       {Run}-L{Lane}-G{Group}-P{Position}-{Barcode}-R1.fastq.gz
       {Run}-L{Lane}-G{Group}-P{Position}-{Barcode}-R2.fastq.gz
+    fqtk/                       # only on lanes routed to post-hoc demux
+      {sample}.R1.fq.gz
+      {sample}.R2.fq.gz
+      demux-metrics.txt
+
+metadata/
+  fqtk_barcodes_lane{N}.tsv               # routed samples (generated)
+  fqtk_barcodes_lane{N}_resolved.tsv      # full-length barcodes + decoys (generated)
 
 results/
   lane{N}/
     SampleSheet_lane{N}.csv
     renaming_map_lane{N}.csv
+    fqtk_lane{N}.done
   fastp/
     lane{N}/{project}/{sample}.json
   fastp_plots/
@@ -277,7 +355,45 @@ Two config options control how Undetermined (unassigned) reads are handled per l
   Example: `report_undetermined_configs: ['lane1']`
 
 Undetermined reads are also kept automatically when a
-`flexbar_barcodes_{config_id}.txt` file exists for the lane.
+`flexbar_barcodes_{config_id}.txt` or `fqtk_barcodes_{config_id}.tsv` file exists for the lane.
+
+## fqtk Post-Hoc Demultiplexing
+
+Some samples cannot be demultiplexed by bcl-convert at all. They are pulled out of the lane's
+sample sheet and recovered afterwards from the Undetermined reads with `fqtk`. **No config
+flag or metadata annotation is needed** — routing is decided from the generated sample sheet.
+
+**A project is routed to fqtk when:**
+1. Its name contains `fqtk` (case-insensitive), or
+2. One of its indexes is a **prefix collision** with a longer index on the same lane
+   (e.g. `GTAGAG` vs `GTAGAGGA`). bcl-convert compares mixed-length indexes at their common
+   value and aborts the whole lane with `hamming distance errors occurred in the Sample Sheet`;
+   no `BarcodeMismatchesIndex` value fixes it. The *shorter*-index project is dropped from the
+   sheet so the longer, more specific index wins, and its reads are recovered from Undetermined.
+
+**How it runs** (`rule fqtk_per_config`, 8 threads / 16 GB / 480 min):
+- Sample sheet generation writes `metadata/fqtk_barcodes_{config_id}.tsv` (`sample_id`, `barcode`)
+  and removes those rows from the bcl-convert sheet
+- The lane's I1 read length is probed to build the fqtk read structure (`8B{n}S`)
+- `scripts/resolve_fqtk_barcodes.py` extends short barcodes to the full sequenced index length
+  using the dominant matching form observed in the Undetermined I1 reads, and writes every index
+  from the bcl-convert sheet as a **decoy** entry so reads belonging to already-demultiplexed
+  samples cannot leak into a recovered one. It fails loudly if a resolved barcode is identical
+  to a sheet index. Matching thresholds (`--max-mismatches`, `--min-mismatch-delta`) are derived
+  from the finished table and written to `{resolved}.params`
+- `fqtk demux` runs; `unmatched.*` and `decoy__*` FASTQs are deleted afterwards
+- `rule fqtk_stage_project` stages the result into the project directory under canonical
+  `{Run}-L{Lane}-G{Group}-P{Position}-{Barcode}` names (DRAGEN-style names for BD/10x projects)
+
+**Files produced:**
+- `metadata/fqtk_barcodes_{config_id}.tsv` — routed samples and their sheet indexes
+- `metadata/fqtk_barcodes_{config_id}_resolved.tsv` (+ `.params`) — full-length barcodes, decoys, thresholds
+- `output/{config_id}/fqtk/` — `{sample}.R1.fq.gz`, `{sample}.R2.fq.gz`, `demux-metrics.txt`, `md5sum.txt`, `size.txt`
+- `results/{config_id}/fqtk_{config_id}.done`
+
+fqtk lanes require the Pass-1 conversion to have written index FASTQs
+(`CreateFastqForIndexReads=1`); the rule fails with an explicit message if the Undetermined
+R1/I1/R2 files are missing.
 
 ## Email Configuration
 
@@ -295,6 +411,26 @@ Off by default on HPC3 (`send_emails: false`). When enabled, the workflow uses
 - Verify `data_dir` and `run_info_path` are correct
 - Check Singularity is available: `module load singularity`
 - Review OverrideCycles match actual run cycles
+
+**`Missing Masking value in Summary tab for: lane N group G`:**
+- Fill the `Masking` cell for that Summary row; the workflow refuses to start otherwise
+- Bypass only if the blank is intentional: `ALLOW_MISSING_MASKING=1 bash run_hpc3.sh`
+
+**`hamming distance errors occurred in the Sample Sheet` (bcl-convert aborts a lane):**
+- Mixed index lengths colliding on their common prefix. The pipeline now detects this at
+  sample-sheet generation and routes the short-index project to fqtk automatically — look for
+  `Index collision on lane{N}: ...` in the workflow output
+- If the validator reports `UNRESOLVABLE i7 prefix collision`, `BarcodeMismatchesIndex=0` and
+  reverse-complementing will not help; pad/replace the short index or split the lane
+
+**fqtk lane produced no reads for a sample:**
+- Check `logs/{config_id}/fqtk_{config_id}.log` for the resolved barcodes and thresholds
+- A sample that ties against a decoy sends every read to `unmatched`; the thresholds in
+  `metadata/fqtk_barcodes_{config_id}_resolved.tsv.params` show how close the call was
+
+**Jobs OOM-killed or hit the slurm time limit:**
+- Compare against `benchmarks/{rule}_{config_id}.bench` and raise the rule's `resources:`
+  block in the `Snakefile`; the profile default is only 8000 MB / 60 min
 
 **No samples in report:**
 - Check metadata Excel file has correct sheet names and headers
