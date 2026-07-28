@@ -2013,7 +2013,13 @@ rule flexbar_per_config:
         bcl_done = ".output/{config_id}/.done",
         raw_barcodes = "metadata/flexbar_barcodes_{config_id}.txt",
         adapter = "src/flexbar/adapter.3.fa"
+    # flexbar runs -n {threads} over a whole lane's R1 and may run twice (forward,
+    # then the RC retry), so it needs both the memory to back 32 threads and more
+    # than the profile's 60m default.
     threads: 32
+    resources:
+        mem_mb=64000,
+        runtime=480
     priority: 99
     output:
         touch("results/{config_id}/flexbar_demux_{config_id}.done")
@@ -2217,7 +2223,12 @@ rule flexbar_pair_r2:
     """
     input:
         demux_done = "results/{config_id}/flexbar_demux_{config_id}.done"
+    # pair_r2_stream.py merge-walks a whole lane at {threads}, then checksums every
+    # output; the profile's 8000MB/60m defaults cover neither.
     threads: 32
+    resources:
+        mem_mb=32000,
+        runtime=480
     priority: 99
     output:
         touch("results/{config_id}/flexbar_{config_id}.done")
@@ -2984,9 +2995,11 @@ rule bcl_convert:
     wildcard_constraints:
         config_id = "[^/]+"
     priority: 100
+    # Measured peak RSS across all 8 lanes is ~23GB (benchmarks/bcl_convert_lane6);
+    # 48GB keeps 2x headroom without waiting on a 144GB block to free up.
     resources:
         serial_operation=1,
-        mem_mb=144000
+        mem_mb=48000
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
@@ -3450,6 +3463,9 @@ rule calculate_md5sums:
         "logs/{config_id}/calculate_md5sums_{config_id}_{project}.log"
     benchmark:
         "benchmarks/calculate_md5sums_{config_id}_{project}.bench"
+    # Matches the `xargs -P 8` in the shell; without it SLURM hands 8 md5sum
+    # processes a single CPU.
+    threads: 8
     wildcard_constraints:
         # Relaxed to accept any lane-prefixed config with additional underscore-separated tokens
         config_id = "[^/]+",
@@ -3757,7 +3773,7 @@ rule bcl_convert_rc:
     # default every attempt was OOM-killed within a minute.
     resources:
         serial_operation=1,
-        mem_mb=144000
+        mem_mb=48000
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
