@@ -5,7 +5,7 @@
 # Idempotent: safe to re-run. It:
 #   1. creates snakemake_config_project.yaml from the base config (if missing),
 #   2. prefills metadata / library_name / data_dir in that project config.
-# Review the result and fill .env (secrets) before running the workflow, if
+# Review the result and fill ~/.env (secrets) before running the workflow, if
 # enable_nextcloud/SEND_EMAILS are turned on.
 #
 # Differences from the upstream (Nextcloud-staged) version:

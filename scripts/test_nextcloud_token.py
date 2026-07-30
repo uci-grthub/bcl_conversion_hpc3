@@ -23,7 +23,10 @@ import subprocess
 import sys
 import urllib.parse
 
-DEFAULT_ENV_FILE = "/staging/nextcloud/testing_illumina/.env"
+# Matches the search order in scripts/load_dotenv.sh: personal ~/.env, then a
+# per-run ./.env override. The old default pointed at /staging/nextcloud/... on
+# the dragen server, a path that does not exist on HPC3.
+DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".env")
 
 
 def load_env_file(path):

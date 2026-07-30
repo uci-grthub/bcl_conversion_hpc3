@@ -10,8 +10,8 @@ instrument involved on HPC3.
 
 ```bash
 # 1. Clone into a run-named directory and enter it
-cd /dfs9/ucightf-lab/kstachel/test_bcl
-git clone https://github.com/whtns/grthub_bclconvert {RUN_NAME}
+cd /path/to/your/runs          # e.g. /dfs9/ucightf-lab/$USER/runs
+git clone https://github.com/uci-grthub/bcl_conversion_hpc3 {RUN_NAME}
 cd {RUN_NAME}
 
 # 2. Set up the run: creates snakemake_config_project.yaml and prefills
@@ -45,13 +45,30 @@ Two things the workflow now decides on its own, with no operator action:
 
 ### Prerequisites
 
+First time on HPC3, verify access before anything else — a missing group looks like
+"No such file or directory" on a path that plainly exists:
+
+```bash
+id | grep -o 'ucightf[a-z_]*'                          # need ucightf AND ucightf_lab_share
+sacctmgr -nP show assoc user=$USER format=Account      # need a slurm account
+ls /dfs9/ucightf-lab/containers/bcl_convert.sif        # need the container
+```
+
+- **Group `ucightf`** — `/dfs9/ucightf-lab` (container, lab scratch) is `drwxrws---`.
+- **Group `ucightf_lab_share`** — `/dfs3b/ucightf_lab/NSRaw` (BCL staging) likewise.
+- **A slurm account.** The profile pins `sbsandme_lab`; if that is not yours,
+  `export SLURM_ACCOUNT=<your_account>` and `run_hpc3.sh` uses it instead.
 - Run has finished copying (a `CopyComplete.txt` exists in the run directory under
   `/dfs3b/ucightf_lab/NSRaw/...`).
 - A SampleSheet `.xlsx` from the lab, placed in `metadata/`.
 - **pixi** installed once: `curl -fsSL https://pixi.sh/install.sh | bash`, then
   `pixi install` to build the environment from `pixi.lock`.
 - **Singularity** available via `module load singularity` (already wired into the rules
-  that need it); the bcl-convert container image path is set in the Snakefile / profile.
+  that need it).
+- **The bcl-convert container.** Not installed by pixi, not in the repo. Lives at
+  `/dfs9/ucightf-lab/containers/bcl_convert.sif`, readable by group `ucightf`, and is
+  hardcoded as `CONTAINER_SIF` near the top of the `Snakefile`. Nothing to configure.
+  See [README.md](README.md#container-image) for how the image is built.
 
 ---
 
@@ -69,9 +86,18 @@ Only needed if a project sets `enable_nextcloud: true` or `send_emails: true` in
 | `NEXTCLOUD_PASSWORD` | **App password** for that account (not the login password) |
 | `GMAIL_APP_PASSWORD` | App password for the `email_sender` account |
 
-Copy `.env.example` to `.env` and fill in; `pixi run` sources it automatically
-(`scripts/load_dotenv.sh`). Generate a Nextcloud app password under **Settings >
-Personal > Security > Devices & sessions > Create new app password**.
+Credentials live in **`~/.env`** — written once, reused by every run directory you
+clone, and outside every repo so they cannot be committed by accident:
+
+```bash
+cp .env.example ~/.env && chmod 600 ~/.env
+$EDITOR ~/.env
+```
+
+`pixi run` sources it automatically (`scripts/load_dotenv.sh`), then layers a
+run-local `./.env` on top if one exists — use that only when a single run needs
+different credentials than your usual ones. Generate a Nextcloud app password under
+**Settings > Personal > Security > Devices & sessions > Create new app password**.
 
 Verify access before relying on it:
 
@@ -89,7 +115,8 @@ pixi run python scripts/test_nextcloud_token.py
 - `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
   `send_emails: false` / `enable_nextcloud: false` live here.
 - `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor, Singularity
-  enabled, `standard` partition, account `sbsandme_lab`, up to 32 concurrent jobs,
+  enabled, `standard` partition, account `sbsandme_lab` (override with `$SLURM_ACCOUNT`),
+  `cores: 32` (must stay >= the largest rule `threads:`), up to 32 concurrent jobs,
   `keep-going`, `latency-wait: 120` (dfs9 is slow to expose outputs), `rerun-triggers: mtime`
   (an unrelated Snakefile edit won't re-run bcl-convert), and 8000 MB / 60 min defaults.
   Used automatically by `run_hpc3.sh`. Heavy rules override these in the `Snakefile`:
@@ -164,6 +191,14 @@ pixi run dag                  # dag.pdf
 
 - Missing lanes: confirm `data_dir` and detected lanes in the dry run.
 - BCL conversion failures: check the Singularity module/image, and slurm job logs.
+- `bcl_convert.sif: No such file or directory` — you are almost certainly not in group
+  `ucightf` (`id | grep ucightf`); the image is there, the directory is just unreadable
+  to you. Ask RCIC or the PI to add you.
+- `sbatch: error: Invalid account` — `export SLURM_ACCOUNT=$(sacctmgr -nP show assoc
+  user=$USER format=Account | head -1)` and rerun.
+- Container cannot see your files (`No such file or directory` on a path that exists) —
+  your working directory or `data_dir` is on a filesystem outside `SINGULARITY_BINDS`
+  (`/dfs3b,/dfs9` in the `Snakefile`). Add it there, or work under one of those.
 - Empty reports: verify metadata sheet names and headers.
 - md5 mismatch: regenerate the specific project report outputs.
 - `Missing Masking value in Summary tab for: lane N group G` — fill that cell in the workbook.

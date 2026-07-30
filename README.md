@@ -23,9 +23,69 @@ This Snakemake pipeline handles the complete sequencing data processing workflow
 ## Installation
 
 ```bash
-git clone https://github.com/whtns/grthub_bclconvert.git {RUN_NAME}
+git clone https://github.com/uci-grthub/bcl_conversion_hpc3.git {RUN_NAME}
 cd {RUN_NAME}
 ```
+
+### HPC3 access prerequisites
+
+This workflow reads and writes lab-group paths. Before anything else, confirm you
+have all three — none of them are things the workflow can grant itself:
+
+| Need | Check | Why |
+|------|-------|-----|
+| Group `ucightf` | `id \| grep ucightf` | `/dfs9/ucightf-lab` is `drwxrws---`; without it you cannot even traverse into the container or the lab share |
+| Group `ucightf_lab_share` | `id \| grep ucightf_lab_share` | `/dfs3b/ucightf_lab/NSRaw` (the BCL staging dir) is likewise group-only |
+| A slurm account | `sacctmgr -nP show assoc user=$USER format=Account` | Every job is submitted with `--account`; see [HPC3 Execution Profile](#hpc3-execution-profile) |
+
+Ask RCIC / the lab PI to be added to the groups. A missing group shows up as a
+"No such file or directory" on a path that plainly exists — the directory is
+unreadable, not absent.
+
+### Container image
+
+bcl-convert is **not** installed by pixi (Illumina does not redistribute it through
+conda). It runs from a Singularity image kept on the lab share and readable by group
+`ucightf`, declared near the top of the `Snakefile`:
+
+```python
+CONTAINER_SIF = "/dfs9/ucightf-lab/containers/bcl_convert.sif"
+SINGULARITY_BINDS = "/dfs3b,/dfs9"
+```
+
+Nothing to configure — being in group `ucightf` is the only requirement. If that path
+reports "No such file or directory", you are not in the group; check with
+`id | grep ucightf`.
+
+The image is built from the private `whtns/containers` repo (`bcl_convert/Dockerfile`:
+Rocky 8 + the `bcl-convert-4.4.6` RPM + a pixi environment on
+`/app/.pixi/envs/default/bin`) and pushed to a **private** GHCR package. Neither the
+repo nor the package is publicly pullable, so the group-readable `.sif` above is the
+supported way to get it. To rebuild it yourself you need access to that repo plus a
+manual download of the bcl-convert RPM from
+[Illumina](https://support.illumina.com/sequencing/sequencing_software/bcl-convert/downloads.html):
+
+```bash
+# with access to ghcr.io/whtns/bcl_convert
+module load singularity
+singularity pull bcl_convert.sif docker://ghcr.io/whtns/bcl_convert:latest
+```
+
+Verify access to whichever copy you use:
+
+```bash
+module load singularity
+singularity exec --writable-tmpfs /dfs9/ucightf-lab/containers/bcl_convert.sif \
+    bcl-convert --version                                  # bcl-convert Version 4.4.6
+```
+
+`--writable-tmpfs` is required: bcl-convert writes to `/var/log/bcl-convert` inside
+the container and aborts if that path is read-only.
+
+`SINGULARITY_BINDS` covers `/dfs3b` (the BCL run directories) and `/dfs9` (the lab
+share and run working directories). Cloning a run somewhere else — `/pub/$USER`, say —
+means adding that filesystem to the list, or the container cannot see its own inputs
+and outputs.
 
 ## Environment
 
@@ -46,11 +106,20 @@ pixi run all                  # full workflow (run_hpc3.sh; slurm + Singularity)
 pixi run convert output/lane1 # BCL conversion for a single lane
 ```
 
-> `pixi run` auto-loads secrets from `.env` if present (only needed when
-> `enable_nextcloud`/`send_emails` are turned on) and forces
-> `SNAKEMAKE_PROFILE=profiles/hpc3` (see `[activation]` in `pixi.toml` and
+> `pixi run` auto-loads secrets from **`~/.env`**, then from a run-local `./.env` if
+> one exists (only needed when `enable_nextcloud`/`send_emails` are turned on), and
+> forces `SNAKEMAKE_PROFILE=profiles/hpc3` (see `[activation]` in `pixi.toml` and
 > `scripts/load_dotenv.sh`). `run_hpc3.sh` also passes `--profile profiles/hpc3`
 > explicitly, so no manual `--profile` flag or `source .env` is needed.
+
+Credentials belong in `~/.env` — one personal copy, reused by every run directory you
+clone, outside every repo so it cannot be committed by accident:
+
+```bash
+cp .env.example ~/.env && chmod 600 ~/.env
+```
+
+A `./.env` inside a run directory overrides it for that run only, and is gitignored.
 
 pixi manages Python (pandas, openpyxl, numpy, matplotlib, pillow, pyyaml, reportlab),
 Snakemake (+ the slurm executor plugin), and the bioconda CLIs (`fastqc`, `flexbar`,
@@ -58,9 +127,12 @@ Snakemake (+ the slurm executor plugin), and the bioconda CLIs (`fastqc`, `flexb
 installed by pixi:
 
 - **Singularity**, via `module load singularity` — runs the bcl-convert container
-  (see `run_hpc3.sh` and the rules that shell out to it in the Snakefile).
-- An **optional custom `flexbar` build** referenced by `flexbar_bin` in the config. A
-  bioconda `flexbar` is provided by pixi; point `flexbar_bin` at it to drop the custom build.
+  (see `run_hpc3.sh` and the rules that shell out to it in the Snakefile). The image
+  itself is a separate artifact; see [Container image](#container-image).
+- An **optional custom `flexbar` build**. `flexbar_bin` defaults to `""`, which uses the
+  bioconda flexbar pixi installs. Set it to an absolute path only for a speedup build
+  (e.g. `/dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar`); a non-executable
+  path there is a hard error rather than a fallback.
 
 > The legacy `bcl_convert` mamba/conda environment is being retired in favor of pixi.
 
@@ -133,7 +205,8 @@ lanes: [1,2,3,4,5,6,7,8]                 # Lanes to process (auto-detected from 
 |---------|-------|-----|
 | `executor` | `slurm` | Jobs submitted to HPC3 |
 | `slurm_partition` | `standard` | `free` gets preempted mid-conversion |
-| `slurm_account` | `sbsandme_lab` | Pinned; auto-guessing was unreliable |
+| `slurm_account` | `sbsandme_lab` | Pinned; auto-guessing was unreliable. **Not yours?** `export SLURM_ACCOUNT=<your_account>` — `run_hpc3.sh` picks it up, no file edit needed |
+| `cores` | `32` | Snakemake downscales a rule's `threads:` to this, so it must be >= the largest one (32) |
 | `jobs` | `32` | Concurrent slurm jobs |
 | `keep-going` | `True` | One failed project doesn't stall the rest of the run |
 | `latency-wait` | `120` | dfs9 (JBOD/NFS) is slow to expose outputs after a job exits |
@@ -151,7 +224,7 @@ silently reimpose `serial_operation=1`, blocking all job parallelism.
 
 | Rule | Threads | Memory | Runtime |
 |------|---------|--------|---------|
-| `bcl_convert` / `bcl_convert_rc` | 24 | 48 GB | profile default |
+| `bcl_convert` / `bcl_convert_rc` | 24 | 48 GB | 480 min |
 | `flexbar_per_config` | 32 | 64 GB | 480 min |
 | `flexbar_pair_r2` | 32 | 32 GB | 480 min |
 | `fqtk_per_config` | 8 | 16 GB | 480 min |
@@ -259,7 +332,8 @@ pixi run snakemake --profile profiles/hpc3 --cores 1 results/iR011-count.csv
 pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/iR011_read_counts_email.done
 ```
 - Sends read count CSV as attachment
-- Uses SMTP (smtp.uci.edu:25)
+- Uses SMTP over SSL (`smtp.gmail.com:465`, see `src/send_email.py`); authenticates as
+  `email_sender` with `GMAIL_APP_PASSWORD` from `.env`
 
 ## Common Commands
 

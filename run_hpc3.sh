@@ -29,6 +29,23 @@ done
 # (the dragen-server profile) and its settings win over --profile, silently
 # reimposing serial_operation=1 and blocking hpc3 job parallelism.
 SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3 --workflow-profile none)
+
+# The profile pins slurm_account to the lab's usual account. An operator on a
+# different account exports SLURM_ACCOUNT instead of editing a tracked file.
+# List yours with: sacctmgr -nP show assoc user=$USER format=Account
+#
+# --default-resources on the command line REPLACES the profile's whole
+# default-resources block rather than merging into it, so the other three
+# defaults have to be repeated here or they silently revert to snakemake's
+# built-ins (no partition, dynamic mem_mb, no runtime).
+if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
+    SNAKEMAKE_ARGS+=(--default-resources
+        "slurm_account=$SLURM_ACCOUNT"
+        "slurm_partition=standard"
+        "mem_mb=8000"
+        "runtime=60")
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
     SNAKEMAKE_ARGS+=(--dry-run)
 fi

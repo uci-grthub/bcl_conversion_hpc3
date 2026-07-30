@@ -71,6 +71,37 @@ def maybe_ancient(path):
 
 SCRATCH_DIR = config.get("scratch_dir", "")
 
+# Singularity image providing bcl-convert (and the python3 that draws the fastp
+# plots). Illumina does not redistribute bcl-convert through conda, so this is the
+# one dependency pixi cannot install. The image lives on the lab share and is
+# readable by group ucightf — if this path errors with "No such file or directory",
+# you are not in that group (`id | grep ucightf`); ask RCIC or the PI to add you.
+# Rebuilding it is documented in README > Container image.
+CONTAINER_SIF = "/dfs9/ucightf-lab/containers/bcl_convert.sif"
+
+# Host filesystems bind-mounted into the container: /dfs3b holds the BCL run
+# directories, /dfs9 the lab share and the run working directories. A clone
+# somewhere else (e.g. /pub/$USER) must add its filesystem here or the container
+# will not see its own inputs and outputs.
+SINGULARITY_BINDS = "/dfs3b,/dfs9"
+
+# The shell rules get singularity from `module load singularity`, but that is a
+# shell function and so unavailable inside a Snakemake `run:` block. Resolve a
+# real path for those, without pinning a module version that the next HPC3
+# upgrade will retire.
+def singularity_bin():
+    import shutil
+    exe = shutil.which("singularity")
+    if exe:
+        return exe
+    candidates = sorted(glob.glob("/opt/apps/singularity/*/bin/singularity"))
+    if candidates:
+        return candidates[-1]
+    raise SystemExit(
+        "Error: singularity not found on PATH and no /opt/apps/singularity/*/bin/singularity. "
+        "Run `module load singularity` before invoking the workflow."
+    )
+
 # When true, force CreateFastqForIndexReads=1 in every generated SampleSheet so DRAGEN
 # emits index reads as FASTQs (no index-based demultiplexing). Default: false.
 NO_DEMUX = bool(config.get("no_demux", False))
@@ -1506,16 +1537,18 @@ rule fastp_plots_sample:
     params:
         mean_script = "src/mean_phred_plot_fastp.py",
         base_script = "src/base_composition_plot_fastp.py",
-        sample_name = lambda wildcards: wildcards.sample_path
+        sample_name = lambda wildcards: wildcards.sample_path,
+        sif = CONTAINER_SIF,
+        binds = SINGULARITY_BINDS
     threads: 1
     shell:
         """
         module load singularity
         mkdir -p $(dirname {output.mean})
         (
-        singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+        singularity exec --writable-tmpfs --bind {params.binds} {params.sif} \
             python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
-        singularity exec --writable-tmpfs --bind /dfs3b,/dfs9 /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+        singularity exec --writable-tmpfs --bind {params.binds} {params.sif} \
             python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
         ) > {log} 2>&1
         """
@@ -2997,16 +3030,25 @@ rule bcl_convert:
     priority: 100
     # Measured peak RSS across all 8 lanes is ~23GB (benchmarks/bcl_convert_lane6);
     # 48GB keeps 2x headroom without waiting on a 144GB block to free up.
+    # Measured wall time is ~47 min on a full NovaSeqX lane (benchmarks/bcl_convert_lane2),
+    # which the profile's 60 min default would clip on a busier lane; the in-shell
+    # `timeout 7200` is the real ceiling, so match it here.
     resources:
         serial_operation=1,
-        mem_mb=48000
+        mem_mb=48000,
+        runtime=480
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
         tiles = TILES,
         scratch_dir = SCRATCH_DIR,
-        keep_undetermined_configs = KEEP_UNDETERMINED_CONFIGS
+        keep_undetermined_configs = KEEP_UNDETERMINED_CONFIGS,
+        sif = CONTAINER_SIF,
+        binds = SINGULARITY_BINDS,
+        conversion_threads = config.get("bcl_conversion_threads", 8),
+        compression_threads = config.get("bcl_compression_threads", 8),
+        decompression_threads = config.get("bcl_decompression_threads", 8)
     shell:
         """
         (
@@ -3022,8 +3064,8 @@ rule bcl_convert:
             local sample_sheet_path="$1"
             timeout 7200 singularity exec \
             --writable-tmpfs \
-            --bind /dfs3b,/dfs9 \
-            /dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif \
+            --bind {params.binds} \
+            {params.sif} \
             bcl-convert \
             --bcl-input-directory {input.data_dir} \
             --output-directory "$dragen_out" \
@@ -3034,9 +3076,9 @@ rule bcl_convert:
             --strict-mode false \
             --bcl-only-lane {params.lane} \
             --bcl-num-parallel-tiles 1 \
-            --bcl-num-conversion-threads 8 \
-            --bcl-num-compression-threads 8 \
-            --bcl-num-decompression-threads 8 \
+            --bcl-num-conversion-threads {params.conversion_threads} \
+            --bcl-num-compression-threads {params.compression_threads} \
+            --bcl-num-decompression-threads {params.decompression_threads} \
             $tiles_arg
         }}
 
@@ -3773,12 +3815,18 @@ rule bcl_convert_rc:
     # default every attempt was OOM-killed within a minute.
     resources:
         serial_operation=1,
-        mem_mb=48000
+        mem_mb=48000,
+        runtime=480
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
         tiles = TILES,
+        sif = CONTAINER_SIF,
+        binds = SINGULARITY_BINDS,
+        conversion_threads = config.get("bcl_conversion_threads", 8),
+        compression_threads = config.get("bcl_compression_threads", 8),
+        decompression_threads = config.get("bcl_decompression_threads", 8)
     run:
         import json as json_mod, subprocess, sys as sys_mod, os as os_mod
         with open(input.candidates) as f:
@@ -3791,10 +3839,10 @@ rule bcl_convert_rc:
             lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
             tiles_args = ["--tiles", str(params.tiles)] if params.tiles else []
             cmd = [
-                "/opt/apps/singularity/3.11.3/bin/singularity", "exec",
+                singularity_bin(), "exec",
                 "--writable-tmpfs",
-                "--bind", "/dfs3b,/dfs9",
-                "/dfs9/ucightf-lab/kstachel/containers/bcl_convert.sif",
+                "--bind", str(params.binds),
+                str(params.sif),
                 "bcl-convert",
                 "--bcl-input-directory", str(input.data_dir),
                 "--output-directory", str(output.output_dir),
@@ -3805,9 +3853,9 @@ rule bcl_convert_rc:
                 "--bcl-only-lane", str(params.lane),
                 "--run-info", str(params.run_info_path),
                 "--bcl-num-parallel-tiles", "1",
-                "--bcl-num-conversion-threads", "8",
-                "--bcl-num-compression-threads", "8",
-                "--bcl-num-decompression-threads", "8",
+                "--bcl-num-conversion-threads", str(params.conversion_threads),
+                "--bcl-num-compression-threads", str(params.compression_threads),
+                "--bcl-num-decompression-threads", str(params.decompression_threads),
             ] + tiles_args
             lf.write(f"Running: {' '.join(cmd)}\n")
             lf.flush()
