@@ -4,7 +4,9 @@ import yaml
 import pandas as pd
 import xml.etree.ElementTree as ET
 from io import StringIO
+import contextlib
 import csv
+import tempfile
 try:
     import openpyxl
     from openpyxl.styles import PatternFill, Font
@@ -18,6 +20,38 @@ from barcode_collisions import select_projects_for_fqtk
 
 # Re-export for backward compatibility (in case it's called as workflow_defs.validate_metadata_and_write_report)
 __all__ = ['validate_metadata_and_write_report']
+
+
+@contextlib.contextmanager
+def atomic_output(path, mode='w'):
+    """Write `path` via a temp file in the same directory, published with os.replace.
+
+    Sample sheets and renaming maps are rewritten at Snakefile parse time, which
+    happens again in every spawned job subprocess. Writing them in place lets a
+    concurrent parse read a truncated file — an empty renaming map yields an empty
+    CONFIG_PROJECT_PAIRS and jobs then fail on a project "missing" from its own lane.
+    os.replace is atomic on POSIX, so a reader sees either the old file or the new
+    one, never a partial one. On error the temp file is removed and the existing
+    file is left untouched.
+    """
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix='.' + os.path.basename(path) + '.', suffix='.tmp')
+    os.close(fd)
+    try:
+        with open(tmp_path, mode) as fh:
+            yield fh
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def atomic_to_csv(df, path, **kwargs):
+    """DataFrame.to_csv(path) with the atomic publish of atomic_output."""
+    with atomic_output(path) as fh:
+        df.to_csv(fh, **kwargs)
 
 
 # Sanitize Masking strings for filenames: strip appended project-like suffixes
@@ -265,7 +299,7 @@ def write_renaming_map(map_df, map_file):
                 map_df = pd.concat([map_df, pd.DataFrame([_new])], ignore_index=True)
 
     map_df = map_df[required_cols]
-    map_df.to_csv(map_file, index=False, quoting=csv.QUOTE_MINIMAL)
+    atomic_to_csv(map_df, map_file, index=False, quoting=csv.QUOTE_MINIMAL)
 
 def filldown_and_make_unique_sample_names(df):
     """
@@ -480,12 +514,12 @@ def generate_miseq_samplesheets(metadata_file, out_dir, run_info_path, run_name)
     outfile = os.path.join(out_dir, config_id, f"SampleSheet_{config_id}.csv")
 
     os.makedirs(os.path.join(out_dir, config_id), exist_ok=True)
-    
-    with open(outfile, 'w') as f:
+
+    with atomic_output(outfile) as f:
         f.write("[Header]\n")
         f.write("FileFormatVersion,2\n")
         f.write("\n")
-        
+
         f.write("[BCLConvert_Settings]\n")
         # BD_Rhapsody_ATACseq / 10xMultiomeATACseq special settings.
         # The global NO_DEMUX config flag also forces index-read FASTQs.
@@ -1387,7 +1421,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
         
         outfile = os.path.join(out_dir, config_id, f"SampleSheet_{config_id}.csv")
         os.makedirs(os.path.join(out_dir, config_id), exist_ok=True)
-        with open(outfile, 'w') as f:
+        with atomic_output(outfile) as f:
             f.write("[Header]\n")
             f.write("FileFormatVersion,2\n")
             f.write("\n")

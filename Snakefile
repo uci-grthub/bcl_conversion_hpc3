@@ -2848,7 +2848,7 @@ rule generate_renaming_map:
                 positions.append(f"P{i+1:03d}")
             map_df["Position"] = positions
 
-            map_df.to_csv(out_path, index=False)
+            atomic_to_csv(map_df, out_path, index=False)
             print(f"Generated fallback renaming map from SampleSheet: {out_path}")
             return True
 
@@ -2899,7 +2899,7 @@ rule generate_renaming_map:
                 new_row["Sample_ID"] = "Undetermined"
 
             cur = pd.concat([cur, pd.DataFrame([new_row])], ignore_index=True)
-            cur.to_csv(output.map, index=False)
+            atomic_to_csv(cur, output.map, index=False)
             print(
                 f"Injected Undetermined row into {output.map} "
                 f"(project={first_project}, lane={owner.get('Lane')}, group={owner.get('Group')})"
