@@ -23,13 +23,19 @@ read_config_key_from() {
         | tail -n 1
 }
 
+# Resolved when this file is sourced, not when the function runs: the configs
+# live at the repo root, and a caller may legitimately be somewhere else
+# (scripts/container_exec.sh runs from whatever directory the user is in).
+# Relative names here would silently return nothing and read as "key not set".
+_READ_CONFIG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Same precedence Snakemake applies: the per-run project config overrides the
 # tracked base config.
 read_config_key() {
     local key="$1" value
-    value="$(read_config_key_from "$key" snakemake_config_project.yaml || true)"
+    value="$(read_config_key_from "$key" "$_READ_CONFIG_ROOT/snakemake_config_project.yaml" || true)"
     [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
-    value="$(read_config_key_from "$key" snakemake_config.yaml || true)"
+    value="$(read_config_key_from "$key" "$_READ_CONFIG_ROOT/snakemake_config.yaml" || true)"
     [[ -n "$value" ]] && { printf '%s\n' "$value"; return 0; }
     return 1
 }

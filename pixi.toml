@@ -65,7 +65,12 @@ dry-run = "bash run_hpc3.sh --dryrun"
 # Same, but with the Snakemake driver inside the container (no host env needed)
 container = "bash run_hpc3_container.sh"
 container-dry-run = "bash run_hpc3_container.sh --dryrun"
+# Run one command in the image: `pixi run container-exec bcl-convert --version`. This is
+# the no-pixi form of every task below that needs python or snakemake -- `validate`
+# becomes `bash scripts/container_exec.sh python run_validation.py`, and so on.
+container-exec = "bash scripts/container_exec.sh"
 # One-time per-run setup: project config + samplesheet (copy/prefill). Idempotent.
+# Plain bash, so `bash scripts/init_run.sh` works with no pixi and no container.
 init = "bash scripts/init_run.sh"
 # Validate the metadata workbook before a real run
 validate = "python run_validation.py"

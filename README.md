@@ -143,8 +143,18 @@ the container cannot see its own inputs and outputs.
 
 ```bash
 module load singularity
+bash scripts/init_run.sh              # one-time per-run setup — plain bash, no image needed
 bash run_hpc3_container.sh --dryrun   # preview what would run
 bash run_hpc3_container.sh            # full workflow
+```
+
+The one-off tasks that are *not* a workflow run, but do need the image's python or
+snakemake, go through `scripts/container_exec.sh`. It resolves the image and binds by
+sourcing the same three helpers the launcher does, so the two cannot disagree:
+
+```bash
+bash scripts/container_exec.sh python run_validation.py             # metadata check
+bash scripts/container_exec.sh snakemake --rulegraph | dot -Tpng > rulegraph.png
 ```
 
 `pixi.toml` (locked in `pixi.lock`) is still the single source of truth for *what* is
@@ -209,6 +219,8 @@ host or baked into the image. Two dependencies remain **system-level**:
   image and generates the compute-node shim. The supported way to run the workflow
 - **`scripts/container_binds.sh`** - The bind list shared by the launcher and the shim
   (data filesystems + the host SLURM client)
+- **`scripts/container_exec.sh`** - Runs a single command in the image, for the tasks that
+  are not a workflow run (metadata validation, rulegraph)
 - **`profiles/hpc3/config.yaml`** - HPC3 executor profile (slurm, resource defaults)
 - **`metadata/*.xlsx`** - Excel metadata with Summary sheet and per-project sheets
 - **`src/RunInfo_nn.xml`** - Normalized run configuration (auto-generated)

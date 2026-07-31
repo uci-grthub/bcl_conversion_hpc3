@@ -5,10 +5,14 @@ workbook. The whole workflow runs inside a Singularity container — every tool 
 Snakemake driver itself — launched by `run_hpc3_container.sh` (slurm executor,
 `profiles/hpc3`). There is no DRAGEN instrument involved on HPC3.
 
-`pixi run` is the host fallback path, used below for the setup steps that happen before
-a run starts; it auto-loads `.env` and provisions the Python/CLI environment. If you
-have no pixi env, `bash run_hpc3_container.sh` still works on its own — `module load
-singularity` is the only host requirement.
+`module load singularity` is the only host requirement. The pre-run steps need no pixi
+either: `scripts/init_run.sh` is plain bash, and anything that needs the image's python
+or snakemake outside a workflow run goes through `scripts/container_exec.sh <command>`,
+which uses the same image and binds as the launcher.
+
+`pixi run` remains the host fallback path — it auto-loads `.env` and provisions the
+Python/CLI environment — and is what the `pixi run snakemake ...` examples below assume.
+Each has a container equivalent: `bash scripts/container_exec.sh snakemake ...`.
 
 ## Quickstart (a normal run)
 
@@ -20,7 +24,8 @@ cd {RUN_NAME}
 
 # 2. Set up the run: creates snakemake_config_project.yaml and prefills
 #    metadata / library_name / data_dir from the newest run in the HPC3 staging dir
-pixi run init                 # or: pixi run init --staging-dir /dfs3b/ucightf_lab/NSRaw
+#    Plain bash (find/sed/cp only) — no pixi and no container required
+bash scripts/init_run.sh      # or: bash scripts/init_run.sh --staging-dir /dfs3b/ucightf_lab/NSRaw
 
 # 3. Drop the metadata .xlsx into metadata/ (if not already there), then confirm
 #    the prefilled config
@@ -28,7 +33,7 @@ $EDITOR snakemake_config_project.yaml         # confirm data_dir, library_name, 
 
 # 4. Validate metadata + preview the plan (no processing happens)
 module load singularity
-pixi run validate
+bash scripts/container_exec.sh python run_validation.py
 bash run_hpc3_container.sh --dryrun
 
 # 5. Run the full workflow (singularity + slurm via profiles/hpc3)
@@ -190,9 +195,12 @@ pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a ru
 ### Dependency graphs
 
 ```bash
-pixi run rulegraph            # rulegraph.png
-pixi run dag                  # dag.pdf
+bash scripts/container_exec.sh sh -c 'snakemake --rulegraph | dot -Tpng' > rulegraph.png
+bash scripts/container_exec.sh sh -c 'snakemake --dag | dot -Tpdf'      > dag.pdf
 ```
+
+Both `snakemake` and `dot` are in the image, so the pipe belongs inside it — hence the
+`sh -c`. The host-env equivalents are `pixi run rulegraph` / `pixi run dag`.
 
 ### Troubleshooting quick checks
 
