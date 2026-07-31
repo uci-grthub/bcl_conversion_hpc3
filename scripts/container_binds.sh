@@ -53,7 +53,14 @@ CONTAINER_SLURM_BINDS=(
 # bcl-convert writes to /var/log/bcl-convert and aborts if that path is
 # read-only. --writable-tmpfs alone is not enough: the overlay is small and the
 # logs are not, so point it at real disk.
-CONTAINER_LOG_BIND="/tmp/bcl-convert-logs:/var/log/bcl-convert"
+#
+# The host side is per-user. /tmp is node-local and shared by every user on the
+# node, so a fixed name is claimed by whoever ran first: `mkdir -p` then
+# succeeds for everyone else (the directory already exists) while the writes
+# inside it fail, and bcl-convert dies mid-lane with
+#     Could not open log file /var/log/bcl-convert/dragen_run_<...>.log
+CONTAINER_LOG_DIR="/tmp/bcl-convert-logs-$(id -un)"
+CONTAINER_LOG_BIND="$CONTAINER_LOG_DIR:/var/log/bcl-convert"
 
 # Paths the site already binds by default. HPC3's singularity.conf lists /dfs3b,
 # /dfs9 and /data/homezvol*, so naming them again is harmless but makes

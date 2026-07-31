@@ -31,6 +31,8 @@ source "$here/scripts/find_singularity.sh"
 source "$here/scripts/container_binds.sh"
 # shellcheck source=scripts/read_config_key.sh
 source "$here/scripts/read_config_key.sh"
+# shellcheck source=scripts/require_slurm_account.sh
+source "$here/scripts/require_slurm_account.sh"
 # Secrets. Singularity passes the host environment through (no --cleanenv
 # below), and SLURM's default --export=ALL carries it on to the compute nodes,
 # so sourcing here is enough for every rule in the DAG.
@@ -53,7 +55,7 @@ if [[ ! -r "$SIF" ]]; then
 fi
 
 # bcl-convert writes here; see the comment on CONTAINER_LOG_BIND.
-mkdir -p /tmp/bcl-convert-logs
+mkdir -p "$CONTAINER_LOG_DIR"
 
 BINDS="$(container_binds_flat "$SINGULARITY")"
 
@@ -72,8 +74,8 @@ cat > "$SHIM_DIR/python" <<EOF
 # /tmp is node-local. The launcher created this on the login node, which says
 # nothing about the compute node, and singularity refuses to start when a bind
 # source is missing:
-#   FATAL: mount source /tmp/bcl-convert-logs doesn't exist
-mkdir -p /tmp/bcl-convert-logs
+#   FATAL: mount source $CONTAINER_LOG_DIR doesn't exist
+mkdir -p $CONTAINER_LOG_DIR
 
 # Singularity exports SINGULARITY_BIND into the container describing the binds
 # it was started with. SLURM's default --export=ALL then carries that variable
@@ -118,21 +120,12 @@ SNAKEMAKE_ARGS=(
     --precommand "export PATH=$SHIM_DIR:/usr/local/bin:/usr/bin:/bin"
 )
 
-# The profile pins slurm_account to the lab's usual account. An operator on a
-# different account exports SLURM_ACCOUNT instead of editing a tracked file.
-# List yours with: sacctmgr -nP show assoc user=$USER format=Account
-#
-# --default-resources on the command line REPLACES the profile's whole
-# default-resources block rather than merging into it, so the other three
-# defaults have to be repeated here or they silently revert to snakemake's
-# built-ins (no partition, dynamic mem_mb, no runtime).
-if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
-    SNAKEMAKE_ARGS+=(--default-resources
-        "slurm_account=$SLURM_ACCOUNT"
-        "slurm_partition=standard"
-        "mem_mb=8000"
-        "runtime=60")
-fi
+# Per-operator slurm account, from $SLURM_ACCOUNT (usually ~/.env, sourced by
+# load_dotenv.sh above). Hard error when unset; see
+# scripts/require_slurm_account.sh for why it is not a profile default and why
+# unset cannot mean "let slurm decide".
+require_slurm_account
+SNAKEMAKE_ARGS+=("${SLURM_ACCOUNT_ARGS[@]}")
 
 DRY_RUN=0
 PASSTHROUGH_ARGS=()

@@ -5,7 +5,7 @@
 # key (override for one run with `export BCL_CONVERT_SIF=...`); no rule reads it.
 # The lab copy is readable by group ucightf: if it reports "No such file or
 # directory", check `id | grep ucightf`. See README > Container image to rebuild.
-container_sif: "/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif"
+container_sif: "/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif"
 
 send_emails: false
 enable_nextcloud: false
@@ -17,7 +17,7 @@ fastp_threads: 4
 
 # Empty = use the flexbar that pixi installs (bioconda 3.5). Set to an absolute path
 # (or $FLEXBAR_BIN) only to use a custom speedup build, e.g.
-# /dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar
+# /path/to/build_parasail/src/flexbar
 flexbar_bin: ""
 # Number of leading bases (e.g. a UMI) before the inline barcode in R1. The
 # barcode FASTA is built as "<this many N's><barcode>" and matched at the read

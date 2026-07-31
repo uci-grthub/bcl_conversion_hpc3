@@ -1,4 +1,5 @@
-use sbsandme_lab slurm account 
+slurm account comes from $SLURM_ACCOUNT (set it in ~/.env); never pin one in profiles/hpc3/config.yaml or any other tracked file — the launchers hard-fail when it is unset, on purpose
+
 the whole workflow runs inside one container, snakemake driver included: `bash run_hpc3_container.sh`
 that launcher runs snakemake in the image and binds the host slurm client in; spawned jobs re-enter the image via the generated .container/bin/python shim
 never add a `container:` directive or use-singularity to a rule — rules are already in the container and would nest

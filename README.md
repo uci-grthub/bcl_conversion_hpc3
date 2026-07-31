@@ -49,7 +49,7 @@ tool, and the Snakemake driver itself. The image is kept on the lab share and re
 by group `ucightf`; the path is the `container_sif` key in `snakemake_config.yaml`:
 
 ```yaml
-container_sif: "/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif"
+container_sif: "/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif"
 ```
 
 Nothing to configure — being in group `ucightf` is the only requirement. If that path
@@ -115,7 +115,7 @@ exercises the glibc and munge plumbing that in-container submission depends on:
 
 ```bash
 module load singularity
-SIF=/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif
+SIF=/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif
 
 singularity exec --writable-tmpfs "$SIF" bcl-convert --version   # Version 4.4.6
 
@@ -204,7 +204,7 @@ host or baked into the image. Two dependencies remain **system-level**:
   artifact; see [Container image](#container-image).
 - An **optional custom `flexbar` build**. `flexbar_bin` defaults to `""`, which uses the
   bioconda flexbar. Set it to an absolute path only for a speedup build (e.g.
-  `/dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar`); a non-executable path
+  `/path/to/build_parasail/src/flexbar`); a non-executable path
   there is a hard error rather than a fallback. On the container path the path must be
   inside a bind-mounted filesystem.
 
@@ -285,7 +285,7 @@ lanes: [1,2,3,4,5,6,7,8]                 # Lanes to process (auto-detected from 
 |---------|-------|-----|
 | `executor` | `slurm` | Jobs submitted to HPC3 |
 | `slurm_partition` | `standard` | `free` gets preempted mid-conversion |
-| `slurm_account` | `sbsandme_lab` | Pinned; auto-guessing was unreliable. **Not yours?** `export SLURM_ACCOUNT=<your_account>` — `run_hpc3.sh` picks it up, no file edit needed |
+| `slurm_account` | *(not in the profile)* | Per-operator, so never pinned in a tracked file. Both launchers pass `$SLURM_ACCOUNT` and **refuse to submit when it is unset** — the executor plugin's auto-guess is broken on this cluster (`sacct: invalid option -- '1'`) and would silently submit with no account, charging your personal default association. Set it once: `echo 'SLURM_ACCOUNT=<your_account>' >> ~/.env` |
 | `cores` | `32` | Snakemake downscales a rule's `threads:` to this, so it must be >= the largest one (32) |
 | `jobs` | `32` | Concurrent slurm jobs |
 | `keep-going` | `True` | One failed project doesn't stall the rest of the run |

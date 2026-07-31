@@ -26,8 +26,10 @@ Notes:
   Lmod shell function, which does not exist in a cron shell.
 - The container itself is not provisioned. See README.md > Container image.
 - The container image is not provisioned either. `container_sif` in snakemake_config.yaml
-  defaults to /dfs9/ucightf-lab/containers/bcl_convert.sif, readable by group ucightf;
-  the cron user must be in that group. See README.md > Container image.
-- If your slurm account is not the profile's default (sbsandme_lab), the crontab entry
-  must export it, since cron does not read your shell profile:
+  defaults to /dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif, readable by group
+  ucightf; the cron user must be in that group. See README.md > Container image.
+- SLURM_ACCOUNT must be set or the launcher exits without submitting. The launcher
+  sources ~/.env itself, so `echo 'SLURM_ACCOUNT=your_account' >> ~/.env` covers the
+  cron path too -- cron does not read your shell profile, but it does not need to.
+  To set it on the crontab line instead:
      0 * * * * SLURM_ACCOUNT=your_account $RUNDIR/monitor_and_run_snakemake.sh >> ...

@@ -61,7 +61,7 @@ fi
 
 # bcl-convert aborts if /var/log/bcl-convert is read-only, and singularity
 # refuses to start at all when a bind source is missing. Cheap either way.
-mkdir -p /tmp/bcl-convert-logs
+mkdir -p "$CONTAINER_LOG_DIR"
 
 BINDS="$(container_binds_flat "$SINGULARITY")"
 

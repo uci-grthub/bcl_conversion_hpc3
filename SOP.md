@@ -62,20 +62,23 @@ First time on HPC3, verify access before anything else — a missing group looks
 ```bash
 id | grep -o 'ucightf[a-z_]*'                          # need ucightf AND ucightf_lab_share
 sacctmgr -nP show assoc user=$USER format=Account      # need a slurm account
-ls /dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif        # need the container
+ls /dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif        # need the container
 ```
 
 - **Group `ucightf`** — `/dfs9/ucightf-lab` (container, lab scratch) is `drwxrws---`.
 - **Group `ucightf_lab_share`** — `/dfs3b/ucightf_lab/NSRaw` (BCL staging) likewise.
-- **A slurm account.** The profile pins `sbsandme_lab`; if that is not yours,
-  `export SLURM_ACCOUNT=<your_account>` and `run_hpc3_container.sh` uses it instead.
+- **A slurm account, in `$SLURM_ACCOUNT`.** No account is pinned in the repo — the
+  launcher refuses to submit until you set one, because slurm would otherwise
+  charge your personal default association. Set it once:
+  `echo 'SLURM_ACCOUNT=<your_account>' >> ~/.env` (works for every run directory
+  you clone, and on the cron path).
 - Run has finished copying (a `CopyComplete.txt` exists in the run directory under
   `/dfs3b/ucightf_lab/NSRaw/...`).
 - A SampleSheet `.xlsx` from the lab, placed in `metadata/`.
 - **Singularity** available via `module load singularity`. The only host requirement
   for a run.
 - **The container.** Not in the repo. Lives at
-  `/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif`, readable by group
+  `/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif`, readable by group
   `ucightf`, named by `container_sif` in `snakemake_config.yaml`. Nothing to configure.
   It holds every tool *and* the Snakemake driver.
 - **pixi** — *not* required. Only for the host fallback path (`run_hpc3.sh`) and
@@ -130,7 +133,7 @@ bash scripts/container_exec.sh python scripts/test_nextcloud_token.py
 - `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
   `send_emails: false` / `enable_nextcloud: false` live here.
 - `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor,
-  `standard` partition, account `sbsandme_lab` (override with `$SLURM_ACCOUNT`),
+  `standard` partition, account from `$SLURM_ACCOUNT` (never pinned in the file),
   `cores: 32` (must stay >= the largest rule `threads:`), up to 32 concurrent jobs,
   `keep-going`, `latency-wait: 120` (dfs9 is slow to expose outputs), `rerun-triggers: mtime`
   (an unrelated Snakefile edit won't re-run bcl-convert), and 8000 MB / 60 min defaults.
@@ -224,8 +227,9 @@ Both `snakemake` and `dot` are in the image, so the pipe belongs inside it — h
 - `bcl_convert_docker_v2.sif: No such file or directory` — you are almost certainly not in group
   `ucightf` (`id | grep ucightf`); the image is there, the directory is just unreadable
   to you. Ask RCIC or the PI to add you.
-- `sbatch: error: Invalid account` — `export SLURM_ACCOUNT=$(sacctmgr -nP show assoc
-  user=$USER format=Account | head -1)` and rerun.
+- `Error: SLURM_ACCOUNT is not set` / `sbatch: error: Invalid account` — list your
+  accounts with `sacctmgr -nP show assoc user=$USER format=Account`, then
+  `echo 'SLURM_ACCOUNT=<your_account>' >> ~/.env` and rerun.
 - Container cannot see your files (`No such file or directory` on a path that exists) —
   your working directory or `data_dir` is on a filesystem outside the container binds
   (`/dfs3b`, `/dfs9`). Add it to `CONTAINER_DATA_BINDS` in `scripts/container_binds.sh`,

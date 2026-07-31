@@ -19,7 +19,10 @@ receiver_email = sys.argv[2]
 subject = sys.argv[3]
 content_arg = sys.argv[4] if len(sys.argv) > 4 else ""
 attachment_paths = sys.argv[5] if len(sys.argv) > 5 else None
-cc_email = sys.argv[6] if len(sys.argv) > 6 else "kstachel@uci.edu"
+# No default cc: the workflow always passes one (config: email_cc, blank by
+# default), and a hardcoded address here mails whoever wrote it on every manual
+# invocation that omits the argument.
+cc_email = sys.argv[6] if len(sys.argv) > 6 else ""
 
 # Parse multiple attachments (semicolon or comma separated)
 attachment_list = []
@@ -192,7 +195,8 @@ if use_zip:
     message["Subject"] = subject
     message["From"] = sender_email
     message["To"] = receiver_email
-    message["Cc"] = cc_email
+    if cc_email:
+        message["Cc"] = cc_email
     message.attach(MIMEText(modified_html, "html"))
 
     zip_part = MIMEBase("application", "zip")
@@ -211,7 +215,8 @@ else:
     message["Subject"] = subject
     message["From"] = sender_email
     message["To"] = receiver_email
-    message["Cc"] = cc_email
+    if cc_email:
+        message["Cc"] = cc_email
 
     if text_content:
         message.attach(MIMEText(text_content, "plain"))
@@ -271,7 +276,9 @@ if DRY_RUN:
 try:
     with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
         server.login(sender_email, app_password)
-        recipients = [receiver_email, cc_email]
+        # Drop a blank cc: config's email_cc defaults to "" and the workflow
+        # passes it through, and smtplib rejects an empty recipient address.
+        recipients = [addr for addr in (receiver_email, cc_email) if addr]
         server.sendmail(sender_email, recipients, msg_str)
     print(f"Email sent successfully to {receiver_email} (cc: {cc_email})!")
 except Exception as e:

@@ -24,10 +24,16 @@ keep-going: True
 default-resources:
   # Not `free`: that partition gets preempted mid-conversion.
   slurm_partition: standard
-  # Your slurm account. Check yours with `sacctmgr -nP show assoc user=$USER format=Account`.
-  # run_hpc3.sh overrides this when $SLURM_ACCOUNT is set, so you can export that
-  # instead of editing this file.
-  slurm_account: sbsandme_lab
+  # No slurm_account here on purpose. It is per-operator, and a value committed
+  # to a tracked file is wrong for everyone but its author. Both launchers pass
+  # it from $SLURM_ACCOUNT (set it once in ~/.env) and refuse to submit when it
+  # is unset -- see the comment in run_hpc3.sh.
+  #
+  # Leaving it merely unset here is not an option: the slurm executor plugin's
+  # account auto-guess is broken on this cluster (`sacct: invalid option --
+  # '1'`), so it silently submits with no --account, and slurm then charges the
+  # user's DEFAULT association -- typically their personal account, not the
+  # lab's. Hence the hard check in the launchers.
   mem_mb: 8000
   runtime: 60
 

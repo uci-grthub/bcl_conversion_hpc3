@@ -10,7 +10,9 @@ if [[ -z "${PIXI_ENVIRONMENT_NAME:-}" ]]; then
     exec pixi run --manifest-path "$here/pixi.toml" bash "$0" "$@"
 fi
 
-mkdir -p /tmp/bcl-convert-logs
+# Per-user: /tmp is node-local and shared, so a fixed name is owned by whoever
+# ran first and everyone else gets permission-denied writes inside it.
+mkdir -p "/tmp/bcl-convert-logs-$(id -un)"
 
 DRY_RUN=0
 PASSTHROUGH_ARGS=()
@@ -30,21 +32,13 @@ done
 # reimposing serial_operation=1 and blocking hpc3 job parallelism.
 SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3 --workflow-profile none)
 
-# The profile pins slurm_account to the lab's usual account. An operator on a
-# different account exports SLURM_ACCOUNT instead of editing a tracked file.
-# List yours with: sacctmgr -nP show assoc user=$USER format=Account
-#
-# --default-resources on the command line REPLACES the profile's whole
-# default-resources block rather than merging into it, so the other three
-# defaults have to be repeated here or they silently revert to snakemake's
-# built-ins (no partition, dynamic mem_mb, no runtime).
-if [[ -n "${SLURM_ACCOUNT:-}" ]]; then
-    SNAKEMAKE_ARGS+=(--default-resources
-        "slurm_account=$SLURM_ACCOUNT"
-        "slurm_partition=standard"
-        "mem_mb=8000"
-        "runtime=60")
-fi
+# Per-operator slurm account, from $SLURM_ACCOUNT (usually ~/.env). Hard error
+# when unset; see scripts/require_slurm_account.sh for why it is not a profile
+# default and why unset cannot mean "let slurm decide".
+# shellcheck source=scripts/require_slurm_account.sh
+source "$(cd "$(dirname "$0")" && pwd)/scripts/require_slurm_account.sh"
+require_slurm_account
+SNAKEMAKE_ARGS+=("${SLURM_ACCOUNT_ARGS[@]}")
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     SNAKEMAKE_ARGS+=(--dry-run)

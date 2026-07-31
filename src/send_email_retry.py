@@ -8,6 +8,7 @@ This script will attempt to call the `send_script` repeatedly on transient failu
 and will serialize attempts for the same order_id using a file lock.
 """
 import argparse
+import getpass
 import subprocess
 import sys
 import time
@@ -59,7 +60,11 @@ def main():
     parser.add_argument('order_id')
     parser.add_argument('--max-retries', type=int, default=6)
     parser.add_argument('--base-sleep', type=float, default=5.0)
-    parser.add_argument('--lock-dir', default='/tmp/send_email_locks')
+    # Per-user: /tmp is node-local and shared by every user on the node, so a
+    # fixed name is owned by whoever ran first and everyone else gets
+    # PermissionError creating the lock inside it.
+    parser.add_argument('--lock-dir',
+                        default=f'/tmp/send_email_locks-{getpass.getuser()}')
     args = parser.parse_args()
 
     lock_path = os.path.join(args.lock_dir, f"order_{args.order_id}.lock")
