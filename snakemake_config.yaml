@@ -5,7 +5,7 @@
 # key (override for one run with `export BCL_CONVERT_SIF=...`); no rule reads it.
 # The lab copy is readable by group ucightf: if it reports "No such file or
 # directory", check `id | grep ucightf`. See README > Container image to rebuild.
-container_sif: "/dfs9/ucightf-lab/containers/bcl_convert.sif"
+container_sif: "/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif"
 
 send_emails: false
 enable_nextcloud: false

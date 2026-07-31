@@ -56,7 +56,7 @@ First time on HPC3, verify access before anything else — a missing group looks
 ```bash
 id | grep -o 'ucightf[a-z_]*'                          # need ucightf AND ucightf_lab_share
 sacctmgr -nP show assoc user=$USER format=Account      # need a slurm account
-ls /dfs9/ucightf-lab/containers/bcl_convert.sif        # need the container
+ls /dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif        # need the container
 ```
 
 - **Group `ucightf`** — `/dfs9/ucightf-lab` (container, lab scratch) is `drwxrws---`.
@@ -69,9 +69,9 @@ ls /dfs9/ucightf-lab/containers/bcl_convert.sif        # need the container
 - **Singularity** available via `module load singularity`. The only host requirement
   for a run.
 - **The container.** Not in the repo. Lives at
-  `/dfs9/ucightf-lab/containers/bcl_convert.sif`, readable by group `ucightf`, named by
-  `container_sif` in `snakemake_config.yaml`. Nothing to configure. It holds every tool
-  *and* the Snakemake driver.
+  `/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif`, readable by group
+  `ucightf`, named by `container_sif` in `snakemake_config.yaml`. Nothing to configure.
+  It holds every tool *and* the Snakemake driver.
 - **pixi**, only for the host fallback path and the setup tasks: `curl -fsSL
   https://pixi.sh/install.sh | bash`, then `pixi install`.
   See [README.md](README.md#container-image) for how the image is built.
@@ -198,7 +198,7 @@ pixi run dag                  # dag.pdf
 
 - Missing lanes: confirm `data_dir` and detected lanes in the dry run.
 - BCL conversion failures: check the Singularity module/image, and slurm job logs.
-- `bcl_convert.sif: No such file or directory` — you are almost certainly not in group
+- `bcl_convert_docker_v2.sif: No such file or directory` — you are almost certainly not in group
   `ucightf` (`id | grep ucightf`); the image is there, the directory is just unreadable
   to you. Ask RCIC or the PI to add you.
 - `sbatch: error: Invalid account` — `export SLURM_ACCOUNT=$(sacctmgr -nP show assoc

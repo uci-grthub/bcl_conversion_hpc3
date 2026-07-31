@@ -49,7 +49,7 @@ tool, and the Snakemake driver itself. The image is kept on the lab share and re
 by group `ucightf`; the path is the `container_sif` key in `snakemake_config.yaml`:
 
 ```yaml
-container_sif: "/dfs9/ucightf-lab/containers/bcl_convert.sif"
+container_sif: "/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif"
 ```
 
 Nothing to configure — being in group `ucightf` is the only requirement. If that path
@@ -115,7 +115,7 @@ exercises the glibc and munge plumbing that in-container submission depends on:
 
 ```bash
 module load singularity
-SIF=/dfs9/ucightf-lab/containers/bcl_convert.sif
+SIF=/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif
 
 singularity exec --writable-tmpfs "$SIF" bcl-convert --version   # Version 4.4.6
 
