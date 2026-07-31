@@ -10,9 +10,10 @@ either: `scripts/init_run.sh` is plain bash, and anything that needs the image's
 or snakemake outside a workflow run goes through `scripts/container_exec.sh <command>`,
 which uses the same image and binds as the launcher.
 
-`pixi run` remains the host fallback path — it auto-loads `.env` and provisions the
-Python/CLI environment — and is what the `pixi run snakemake ...` examples below assume.
-Each has a container equivalent: `bash scripts/container_exec.sh snakemake ...`.
+`pixi run` remains the host fallback path (`run_hpc3.sh`), for development or if the
+image is unavailable. Every command below is given in its container form; the pixi
+equivalent is the same command with `bash scripts/container_exec.sh` replaced by
+`pixi run`.
 
 ## Quickstart (a normal run)
 
@@ -77,8 +78,8 @@ ls /dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif        # need
   `/dfs9/ucightf-lab/kstachel/containers/bcl_convert_docker_v2.sif`, readable by group
   `ucightf`, named by `container_sif` in `snakemake_config.yaml`. Nothing to configure.
   It holds every tool *and* the Snakemake driver.
-- **pixi**, only for the host fallback path and the setup tasks: `curl -fsSL
-  https://pixi.sh/install.sh | bash`, then `pixi install`.
+- **pixi** — *not* required. Only for the host fallback path (`run_hpc3.sh`) and
+  development: `curl -fsSL https://pixi.sh/install.sh | bash`, then `pixi install`.
   See [README.md](README.md#container-image) for how the image is built.
 
 ---
@@ -105,21 +106,24 @@ cp .env.example ~/.env && chmod 600 ~/.env
 $EDITOR ~/.env
 ```
 
-`pixi run` sources it automatically (`scripts/load_dotenv.sh`), then layers a
-run-local `./.env` on top if one exists — use that only when a single run needs
-different credentials than your usual ones. Generate a Nextcloud app password under
-**Settings > Personal > Security > Devices & sessions > Create new app password**.
+`run_hpc3_container.sh`, `scripts/container_exec.sh` and `pixi run` all source it
+(`scripts/load_dotenv.sh`), then layer a run-local `./.env` on top if one exists — use
+that only when a single run needs different credentials than your usual ones. On the
+container path the environment is inherited into the image and then carried to the
+compute nodes by SLURM's `--export=ALL`, so sourcing once at launch covers every rule.
+Generate a Nextcloud app password under **Settings > Personal > Security > Devices &
+sessions > Create new app password**.
 
 Verify access before relying on it:
 
 ```bash
-pixi run python scripts/test_nextcloud_token.py
+bash scripts/container_exec.sh python scripts/test_nextcloud_token.py
 ```
 
 ### Configuration files
 
-- `snakemake_config_project.yaml` — per-run overrides (gitignored). `pixi run init`
-  prefills `library_name`, `metadata`, `data_dir`. Set `email_sender` /
+- `snakemake_config_project.yaml` — per-run overrides (gitignored).
+  `bash scripts/init_run.sh` prefills `library_name`, `metadata`, `data_dir`. Set `email_sender` /
   `email_recipient` / `email_cc` only if enabling email (base config ships these blank
   so a run never emails the previous operator), plus optional `external_drive_path`,
   `scratch_dir`, `tiles`, `flexbar_bin`.
@@ -167,17 +171,28 @@ Details in [README.md](README.md#fqtk-post-hoc-demultiplexing).
 
 ### Run specific stages
 
-Configs are per lane (`lane1`…`lane8`; MiSeq uses only `lane1`). Pass a target through
-`run_hpc3_container.sh` (or `pixi run snakemake --profile profiles/hpc3` directly on the
-host fallback path):
+Configs are per lane (`lane1`…`lane8`; MiSeq uses only `lane1`). Pass the target straight
+to `run_hpc3_container.sh` — it already carries the profile, the submission flags and the
+compute-node shim, so this is the form to reach for:
 
 ```bash
-bash run_hpc3_container.sh output/lane1                             # BCL conversion, one lane
-pixi run snakemake --profile profiles/hpc3 --cores 4 results/fastp_lane1.done
-pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
-pixi run snakemake --profile profiles/hpc3 --cores 1 results/{RUN}-count.csv
-pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a rule to re-run
+bash run_hpc3_container.sh output/lane1                    # BCL conversion, one lane
+bash run_hpc3_container.sh results/fastp_lane1.done
+bash run_hpc3_container.sh Reports/order_0626I-08/index.html
+bash run_hpc3_container.sh results/{RUN}-count.csv
+bash run_hpc3_container.sh -R compile_read_counts          # force a rule to re-run
 ```
+
+For a small target it is sometimes quicker to skip SLURM and run it in the foreground.
+That needs `--workflow-profile none` explicitly, or `profiles/default` is auto-merged and
+serializes everything (see Troubleshooting):
+
+```bash
+bash scripts/container_exec.sh snakemake --workflow-profile none --cores 4 \
+    results/fastp_lane1.done
+```
+
+The host fallback path is the same command as `pixi run snakemake ...`.
 
 ### Validate outputs
 
