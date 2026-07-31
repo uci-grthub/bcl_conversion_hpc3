@@ -71,36 +71,11 @@ def maybe_ancient(path):
 
 SCRATCH_DIR = config.get("scratch_dir", "")
 
-# Singularity image providing bcl-convert (and the python3 that draws the fastp
-# plots). Illumina does not redistribute bcl-convert through conda, so this is the
-# one dependency pixi cannot install. The image lives on the lab share and is
-# readable by group ucightf — if this path errors with "No such file or directory",
-# you are not in that group (`id | grep ucightf`); ask RCIC or the PI to add you.
-# Rebuilding it is documented in README > Container image.
-CONTAINER_SIF = "/dfs9/ucightf-lab/containers/bcl_convert.sif"
-
-# Host filesystems bind-mounted into the container: /dfs3b holds the BCL run
-# directories, /dfs9 the lab share and the run working directories. A clone
-# somewhere else (e.g. /pub/$USER) must add its filesystem here or the container
-# will not see its own inputs and outputs.
-SINGULARITY_BINDS = "/dfs3b,/dfs9"
-
-# The shell rules get singularity from `module load singularity`, but that is a
-# shell function and so unavailable inside a Snakemake `run:` block. Resolve a
-# real path for those, without pinning a module version that the next HPC3
-# upgrade will retire.
-def singularity_bin():
-    import shutil
-    exe = shutil.which("singularity")
-    if exe:
-        return exe
-    candidates = sorted(glob.glob("/opt/apps/singularity/*/bin/singularity"))
-    if candidates:
-        return candidates[-1]
-    raise SystemExit(
-        "Error: singularity not found on PATH and no /opt/apps/singularity/*/bin/singularity. "
-        "Run `module load singularity` before invoking the workflow."
-    )
+# No `singularity exec` anywhere in this file, by design: run_hpc3_container.sh
+# runs the whole workflow — Snakemake driver included — inside the image, so
+# rules are already in the container and a nested exec would fail. Rule bodies
+# call bcl-convert, fastp, flexbar, fqtk and python3 by bare name. The image
+# path is `container_sif` in snakemake_config.yaml, read by the launcher.
 
 # When true, force CreateFastqForIndexReads=1 in every generated SampleSheet so DRAGEN
 # emits index reads as FASTQs (no index-based demultiplexing). Default: false.
@@ -1537,19 +1512,14 @@ rule fastp_plots_sample:
     params:
         mean_script = "src/mean_phred_plot_fastp.py",
         base_script = "src/base_composition_plot_fastp.py",
-        sample_name = lambda wildcards: wildcards.sample_path,
-        sif = CONTAINER_SIF,
-        binds = SINGULARITY_BINDS
+        sample_name = lambda wildcards: wildcards.sample_path
     threads: 1
     shell:
         """
-        module load singularity
         mkdir -p $(dirname {output.mean})
         (
-        singularity exec --writable-tmpfs --bind {params.binds} {params.sif} \
-            python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
-        singularity exec --writable-tmpfs --bind {params.binds} {params.sif} \
-            python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
+        python3 {params.mean_script} "{input.json}" --out "{output.mean}" --title "{params.sample_name}" || true
+        python3 {params.base_script} "{input.json}" --out "{output.base}" --title "{params.sample_name}" || true
         ) > {log} 2>&1
         """
 
@@ -3044,17 +3014,12 @@ rule bcl_convert:
         tiles = TILES,
         scratch_dir = SCRATCH_DIR,
         keep_undetermined_configs = KEEP_UNDETERMINED_CONFIGS,
-        sif = CONTAINER_SIF,
-        binds = SINGULARITY_BINDS,
         conversion_threads = config.get("bcl_conversion_threads", 8),
         compression_threads = config.get("bcl_compression_threads", 8),
         decompression_threads = config.get("bcl_decompression_threads", 8)
     shell:
         """
         (
-        export PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        module load singularity
-
         cleanup() {{
             pkill -P $$ 2>/dev/null || true
         }}
@@ -3062,11 +3027,7 @@ rule bcl_convert:
 
         run_bcl_convert() {{
             local sample_sheet_path="$1"
-            timeout 7200 singularity exec \
-            --writable-tmpfs \
-            --bind {params.binds} \
-            {params.sif} \
-            bcl-convert \
+            timeout 7200 bcl-convert \
             --bcl-input-directory {input.data_dir} \
             --output-directory "$dragen_out" \
             --force \
@@ -3822,8 +3783,6 @@ rule bcl_convert_rc:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
         tiles = TILES,
-        sif = CONTAINER_SIF,
-        binds = SINGULARITY_BINDS,
         conversion_threads = config.get("bcl_conversion_threads", 8),
         compression_threads = config.get("bcl_compression_threads", 8),
         decompression_threads = config.get("bcl_decompression_threads", 8)
@@ -3839,10 +3798,6 @@ rule bcl_convert_rc:
             lf.write(f"RC suspects: {[r['project'] for r in suspects]}\n")
             tiles_args = ["--tiles", str(params.tiles)] if params.tiles else []
             cmd = [
-                singularity_bin(), "exec",
-                "--writable-tmpfs",
-                "--bind", str(params.binds),
-                str(params.sif),
                 "bcl-convert",
                 "--bcl-input-directory", str(input.data_dir),
                 "--output-directory", str(output.output_dir),

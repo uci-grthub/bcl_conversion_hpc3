@@ -5,8 +5,16 @@ channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
 # NOTE: on HPC3 this pipeline runs via Singularity + slurm (profiles/hpc3), not DRAGEN.
+#
+# This file is ALSO the image's dependency spec: the bcl_convert container copies
+# pixi.toml + pixi.lock into its build context and runs `pixi install --locked`, so the
+# image can never disagree with what a host pixi env would resolve. After changing a
+# version here, run `pixi lock` and copy both files to the container repo, or the image
+# keeps building the old set. See README > Container image.
+#
 # Two dependencies are NOT managed by pixi and must be present on the system:
-#   1. Singularity, via `module load singularity` (see run_hpc3.sh / Snakefile rules).
+#   1. Singularity, via `module load singularity` (see run_hpc3_container.sh). On the
+#      container path this is the only host requirement.
 #   2. Optional custom flexbar build referenced by `flexbar_bin` in snakemake_config.yaml.
 #      A bioconda flexbar is provided below; point `flexbar_bin` at it to drop the custom build.
 
@@ -48,10 +56,15 @@ SNAKEMAKE_PROFILE = "profiles/hpc3"
 
 [tasks]
 # Tasks rely on SNAKEMAKE_PROFILE (set above) instead of a repeated --profile flag.
+# These are the HOST path; the container path is `bash run_hpc3_container.sh` and
+# needs no pixi at all. Both run the same DAG with the same profile.
 # Full workflow
 all = "bash run_hpc3.sh"
 # Preview what would run
 dry-run = "bash run_hpc3.sh --dryrun"
+# Same, but with the Snakemake driver inside the container (no host env needed)
+container = "bash run_hpc3_container.sh"
+container-dry-run = "bash run_hpc3_container.sh --dryrun"
 # One-time per-run setup: project config + samplesheet (copy/prefill). Idempotent.
 init = "bash scripts/init_run.sh"
 # Validate the metadata workbook before a real run

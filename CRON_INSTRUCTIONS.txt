@@ -1,32 +1,30 @@
-Set up a cron job to monitor for CopyComplete.txt and trigger Snakemake (via pixi) in a
-new tmux session named after the run's library.
+Set up a cron job to monitor for CopyComplete.txt and trigger Snakemake in a new tmux
+session named after the run's library.
 
 The monitor_and_run_snakemake.sh script already handles everything: it reads data_dir and
 library_name from snakemake_config_project.yaml, waits for CopyComplete.txt in data_dir,
-and launches `run_hpc3.sh` (slurm executor + Singularity, profiles/hpc3) inside a tmux
-session. pixi activation loads .env (if present) and sets SNAKEMAKE_PROFILE=profiles/hpc3,
-and run_hpc3.sh also passes --profile profiles/hpc3 explicitly, so no manual env sourcing
-is needed.
+and launches `run_hpc3_container.sh` inside a tmux session. That launcher runs the whole
+workflow -- Snakemake driver included -- inside the container, sources .env itself, and
+passes --profile profiles/hpc3 explicitly, so no manual env sourcing is needed. There is
+no pixi step on the cron path.
 
 1. Ensure 'data_dir' and 'library_name' are set in snakemake_config_project.yaml, e.g.:
      data_dir: /dfs3b/ucightf_lab/NSRaw/20260626_SH00564_0020_ASC2231455-SC3
      library_name: iR011
 
-2. Provision the environment once (creates .pixi/ from pixi.toml / pixi.lock):
-     pixi install
-
-3. Make the script executable ($RUNDIR is your clone, e.g. /dfs9/ucightf-lab/$USER/runs/iR011):
+2. Make the script executable ($RUNDIR is your clone, e.g. /dfs9/ucightf-lab/$USER/runs/iR011):
      chmod +x $RUNDIR/monitor_and_run_snakemake.sh
 
-4. Add the following line to your crontab ('crontab -e') to check every hour, with
+3. Add the following line to your crontab ('crontab -e') to check every hour, with
    $RUNDIR expanded to the absolute path (cron does not expand shell variables):
      0 * * * * $RUNDIR/monitor_and_run_snakemake.sh >> $RUNDIR/monitor_and_run_snakemake.log 2>&1
 
 Notes:
-- cron runs with a minimal PATH. The script resolves pixi automatically, falling back to
-  $HOME/.pixi/bin/pixi when pixi is not on PATH, so no PATH edits are required in crontab.
-- Singularity must be available via `module load singularity` for the cron user
-  (bcl-convert runs inside the container; it is not provisioned by pixi).
+- cron runs with a minimal PATH, and nothing on this path needs one: config is read with
+  sed rather than a python yaml module, and singularity is located by an absolute path
+  (scripts/find_singularity.sh globs /opt/apps/singularity/*/bin) rather than via the
+  Lmod shell function, which does not exist in a cron shell.
+- The container itself is not provisioned. See README.md > Container image.
 - The container image is not provisioned either. `container_sif` in snakemake_config.yaml
   defaults to /dfs9/ucightf-lab/containers/bcl_convert.sif, readable by group ucightf;
   the cron user must be in that group. See README.md > Container image.

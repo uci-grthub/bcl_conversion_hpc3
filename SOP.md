@@ -1,10 +1,14 @@
 # SOP: Run the BCL Conversion Snakemake Workflow (HPC3)
 
 Supports **MiSeq i100** and **NovaSeqX** — the platform is auto-detected from the metadata
-workbook. `pixi run` auto-loads `.env` and provisions the Python/CLI environment, so
-day-to-day commands take no extra flags. bcl-convert itself runs inside a Singularity
-container via `run_hpc3.sh` (slurm executor, `profiles/hpc3`) — there is no DRAGEN
-instrument involved on HPC3.
+workbook. The whole workflow runs inside a Singularity container — every tool and the
+Snakemake driver itself — launched by `run_hpc3_container.sh` (slurm executor,
+`profiles/hpc3`). There is no DRAGEN instrument involved on HPC3.
+
+`pixi run` is the host fallback path, used below for the setup steps that happen before
+a run starts; it auto-loads `.env` and provisions the Python/CLI environment. If you
+have no pixi env, `bash run_hpc3_container.sh` still works on its own — `module load
+singularity` is the only host requirement.
 
 ## Quickstart (a normal run)
 
@@ -23,11 +27,12 @@ pixi run init                 # or: pixi run init --staging-dir /dfs3b/ucightf_l
 $EDITOR snakemake_config_project.yaml         # confirm data_dir, library_name, metadata
 
 # 4. Validate metadata + preview the plan (no processing happens)
+module load singularity
 pixi run validate
-bash run_hpc3.sh --dryrun
+bash run_hpc3_container.sh --dryrun
 
 # 5. Run the full workflow (singularity + slurm via profiles/hpc3)
-bash run_hpc3.sh
+bash run_hpc3_container.sh
 ```
 
 That's the whole loop. `enable_nextcloud`/`send_emails` are **off by default** on HPC3
@@ -57,17 +62,18 @@ ls /dfs9/ucightf-lab/containers/bcl_convert.sif        # need the container
 - **Group `ucightf`** — `/dfs9/ucightf-lab` (container, lab scratch) is `drwxrws---`.
 - **Group `ucightf_lab_share`** — `/dfs3b/ucightf_lab/NSRaw` (BCL staging) likewise.
 - **A slurm account.** The profile pins `sbsandme_lab`; if that is not yours,
-  `export SLURM_ACCOUNT=<your_account>` and `run_hpc3.sh` uses it instead.
+  `export SLURM_ACCOUNT=<your_account>` and `run_hpc3_container.sh` uses it instead.
 - Run has finished copying (a `CopyComplete.txt` exists in the run directory under
   `/dfs3b/ucightf_lab/NSRaw/...`).
 - A SampleSheet `.xlsx` from the lab, placed in `metadata/`.
-- **pixi** installed once: `curl -fsSL https://pixi.sh/install.sh | bash`, then
-  `pixi install` to build the environment from `pixi.lock`.
-- **Singularity** available via `module load singularity` (already wired into the rules
-  that need it).
-- **The bcl-convert container.** Not installed by pixi, not in the repo. Lives at
-  `/dfs9/ucightf-lab/containers/bcl_convert.sif`, readable by group `ucightf`, and is
-  hardcoded as `CONTAINER_SIF` near the top of the `Snakefile`. Nothing to configure.
+- **Singularity** available via `module load singularity`. The only host requirement
+  for a run.
+- **The container.** Not in the repo. Lives at
+  `/dfs9/ucightf-lab/containers/bcl_convert.sif`, readable by group `ucightf`, named by
+  `container_sif` in `snakemake_config.yaml`. Nothing to configure. It holds every tool
+  *and* the Snakemake driver.
+- **pixi**, only for the host fallback path and the setup tasks: `curl -fsSL
+  https://pixi.sh/install.sh | bash`, then `pixi install`.
   See [README.md](README.md#container-image) for how the image is built.
 
 ---
@@ -114,16 +120,16 @@ pixi run python scripts/test_nextcloud_token.py
   `scratch_dir`, `tiles`, `flexbar_bin`.
 - `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
   `send_emails: false` / `enable_nextcloud: false` live here.
-- `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor, Singularity
-  enabled, `standard` partition, account `sbsandme_lab` (override with `$SLURM_ACCOUNT`),
+- `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor,
+  `standard` partition, account `sbsandme_lab` (override with `$SLURM_ACCOUNT`),
   `cores: 32` (must stay >= the largest rule `threads:`), up to 32 concurrent jobs,
   `keep-going`, `latency-wait: 120` (dfs9 is slow to expose outputs), `rerun-triggers: mtime`
   (an unrelated Snakefile edit won't re-run bcl-convert), and 8000 MB / 60 min defaults.
-  Used automatically by `run_hpc3.sh`. Heavy rules override these in the `Snakefile`:
+  Used automatically by `run_hpc3_container.sh`. Heavy rules override these in the `Snakefile`:
   `bcl_convert`/`bcl_convert_rc` 24 threads / 48 GB, `flexbar_per_config` 32 / 64 GB / 480 min,
   `fqtk_per_config` 8 / 16 GB / 480 min.
 - `profiles/default/config.yaml` — non-HPC3 resource-limit profile (kept for parity with
-  upstream / single-host use); not used by `run_hpc3.sh`, which passes
+  upstream / single-host use); not used by `run_hpc3_container.sh`, which passes
   `--workflow-profile none` so this profile cannot silently override the hpc3 one.
 
 ### Metadata format (auto-detected)
@@ -147,7 +153,7 @@ from `output/lane{N}/fqtk/demux-metrics.txt` instead of `Demultiplex_Stats.csv`.
 Nothing to run by hand. To inspect one lane:
 
 ```bash
-bash run_hpc3.sh results/lane2/fqtk_lane2.done
+bash run_hpc3_container.sh results/lane2/fqtk_lane2.done
 cat logs/lane2/fqtk_lane2.log                        # resolved barcodes + thresholds
 cat metadata/fqtk_barcodes_lane2_resolved.tsv        # full-length barcodes and decoys
 ```
@@ -157,10 +163,11 @@ Details in [README.md](README.md#fqtk-post-hoc-demultiplexing).
 ### Run specific stages
 
 Configs are per lane (`lane1`…`lane8`; MiSeq uses only `lane1`). Pass a target through
-`run_hpc3.sh` (or `pixi run snakemake --profile profiles/hpc3` directly):
+`run_hpc3_container.sh` (or `pixi run snakemake --profile profiles/hpc3` directly on the
+host fallback path):
 
 ```bash
-bash run_hpc3.sh output/lane1                                       # BCL conversion, one lane
+bash run_hpc3_container.sh output/lane1                             # BCL conversion, one lane
 pixi run snakemake --profile profiles/hpc3 --cores 4 results/fastp_lane1.done
 pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
 pixi run snakemake --profile profiles/hpc3 --cores 1 results/{RUN}-count.csv
@@ -178,7 +185,7 @@ pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a ru
 ### Automated launch (cron)
 
 `monitor_and_run_snakemake.sh` waits for `CopyComplete.txt` in `data_dir` and launches
-`run_hpc3.sh` in a tmux session named after the library. See `CRON_INSTRUCTIONS.txt`.
+`run_hpc3_container.sh` in a tmux session named after the library. It needs no pixi. See `CRON_INSTRUCTIONS.txt`.
 
 ### Dependency graphs
 
@@ -197,16 +204,17 @@ pixi run dag                  # dag.pdf
 - `sbatch: error: Invalid account` — `export SLURM_ACCOUNT=$(sacctmgr -nP show assoc
   user=$USER format=Account | head -1)` and rerun.
 - Container cannot see your files (`No such file or directory` on a path that exists) —
-  your working directory or `data_dir` is on a filesystem outside `SINGULARITY_BINDS`
-  (`/dfs3b,/dfs9` in the `Snakefile`). Add it there, or work under one of those.
+  your working directory or `data_dir` is on a filesystem outside the container binds
+  (`/dfs3b`, `/dfs9`). Add it to `CONTAINER_DATA_BINDS` in `scripts/container_binds.sh`,
+  or work under one of those.
 - Empty reports: verify metadata sheet names and headers.
 - md5 mismatch: regenerate the specific project report outputs.
 - `Missing Masking value in Summary tab for: lane N group G` — fill that cell in the workbook.
-  Bypass only when the blank is intentional: `ALLOW_MISSING_MASKING=1 bash run_hpc3.sh`.
+  Bypass only when the blank is intentional: `ALLOW_MISSING_MASKING=1 bash run_hpc3_container.sh`.
 - `UNRESOLVABLE i7 prefix collision` from the barcode validator — mixed index lengths that no
   `BarcodeMismatchesIndex` value can separate. Pad/replace the short index in the workbook, or
   let the fqtk routing handle it (it normally does, before bcl-convert sees the sheet).
 - Job OOM-killed / hit the time limit — compare `benchmarks/{rule}_{config_id}.bench` and raise
   that rule's `resources:` block in the `Snakefile`; the profile default is 8000 MB / 60 min.
-- Only one job running at a time — confirm `run_hpc3.sh` was used (it passes
+- Only one job running at a time — confirm `run_hpc3_container.sh` was used (it passes
   `--workflow-profile none`); a bare `snakemake` picks up `profiles/default` and serializes.

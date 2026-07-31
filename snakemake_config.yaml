@@ -1,4 +1,12 @@
 # Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud by default)
+
+# The container image the whole workflow runs inside — bcl-convert plus every
+# other tool, and the Snakemake driver itself. run_hpc3_container.sh reads this
+# key (override for one run with `export BCL_CONVERT_SIF=...`); no rule reads it.
+# The lab copy is readable by group ucightf: if it reports "No such file or
+# directory", check `id | grep ucightf`. See README > Container image to rebuild.
+container_sif: "/dfs9/ucightf-lab/containers/bcl_convert.sif"
+
 send_emails: false
 enable_nextcloud: false
 num_reads: 2

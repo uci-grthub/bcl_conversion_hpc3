@@ -4,18 +4,19 @@
 
 set -e
 
-# Resolve the pixi binary. cron runs with a minimal PATH, so fall back to the
-# default install location under $HOME when pixi is not already on PATH.
-PIXI="$(command -v pixi 2>/dev/null || true)"
-[ -z "$PIXI" ] && PIXI="$HOME/.pixi/bin/pixi"
-
 cd "$(realpath "$(dirname "$0")")"
 
-CONFIG_FILE="snakemake_config_project.yaml"
-MONITOR_DIR=$(python3 -c "import yaml; print(yaml.safe_load(open('$CONFIG_FILE')).get('data_dir', ''))" 2>/dev/null)
+# Config is read with sed, not `python3 -c "import yaml"`. cron runs with a
+# minimal PATH, and the workflow no longer needs a host python at all — the
+# container supplies one — so a host yaml module here would be the last thing
+# keeping a host environment mandatory.
+# shellcheck source=scripts/read_config_key.sh
+. scripts/read_config_key.sh
+
+MONITOR_DIR="$(read_config_key data_dir || true)"
 
 if [ -z "$MONITOR_DIR" ]; then
-  echo "data_dir not set in $CONFIG_FILE. Exiting."
+  echo "data_dir not set in snakemake_config_project.yaml. Exiting."
   exit 1
 fi
 
@@ -23,15 +24,15 @@ TARGET_FILE="$MONITOR_DIR/CopyComplete.txt"
 
 if [ -f "$TARGET_FILE" ]; then
   echo "Found $TARGET_FILE. Triggering Snakemake in tmux session."
-  LIBRARY=$(python3 -c "import yaml; print(yaml.safe_load(open('snakemake_config_project.yaml')).get('library_name', 'snakemake'))")
+  LIBRARY="$(read_config_key library_name || echo snakemake)"
   # Check if tmux session already exists
   if tmux has-session -t "$LIBRARY" 2>/dev/null; then
     echo "tmux session $LIBRARY already exists. Not starting a new one."
   else
-    # Start tmux session, then drop into an activated shell. pixi's activation
-    # loads .env (secrets), and run_hpc3.sh pins --profile profiles/hpc3
-    # (singularity/slurm), so no manual env sourcing or profile flag is needed.
-    tmux new-session -d -c "$(pwd)" -s "$LIBRARY" "$PIXI run bash run_hpc3.sh; exec $PIXI run bash"
+    # run_hpc3_container.sh sources .env itself and pins --profile profiles/hpc3,
+    # so no env sourcing or profile flag is needed here. It leaves an
+    # interactive shell behind afterwards so the operator can inspect the run.
+    tmux new-session -d -c "$(pwd)" -s "$LIBRARY" "bash run_hpc3_container.sh; exec bash"
     if [ $? -ne 0 ]; then
       echo "Failed to start tmux session $LIBRARY."
     else

@@ -44,26 +44,65 @@ unreadable, not absent.
 
 ### Container image
 
-bcl-convert is **not** installed by pixi (Illumina does not redistribute it through
-conda). It runs from a Singularity image kept on the lab share and readable by group
-`ucightf`, declared near the top of the `Snakefile`:
+The **entire** workflow runs inside one Singularity image — bcl-convert, every other
+tool, and the Snakemake driver itself. The image is kept on the lab share and readable
+by group `ucightf`; the path is the `container_sif` key in `snakemake_config.yaml`:
 
-```python
-CONTAINER_SIF = "/dfs9/ucightf-lab/containers/bcl_convert.sif"
-SINGULARITY_BINDS = "/dfs3b,/dfs9"
+```yaml
+container_sif: "/dfs9/ucightf-lab/containers/bcl_convert.sif"
 ```
 
 Nothing to configure — being in group `ucightf` is the only requirement. If that path
 reports "No such file or directory", you are not in the group; check with
-`id | grep ucightf`.
+`id | grep ucightf`. Override for a single run with `export BCL_CONVERT_SIF=...`.
 
-The image is built from the private `whtns/containers` repo (`bcl_convert/Dockerfile`:
-Rocky 8 + the `bcl-convert-4.4.6` RPM + a pixi environment on
-`/app/.pixi/envs/default/bin`) and pushed to a **private** GHCR package. Neither the
-repo nor the package is publicly pullable, so the group-readable `.sif` above is the
-supported way to get it. To rebuild it yourself you need access to that repo plus a
-manual download of the bcl-convert RPM from
-[Illumina](https://support.illumina.com/sequencing/sequencing_software/bcl-convert/downloads.html):
+**How SLURM works from inside a container.** `run_hpc3_container.sh` starts Snakemake
+in the image with the host's SLURM client bind-mounted in (`sbatch`, `srun`, `squeue`,
+`scancel`, `sacct`, plus `/usr/lib64/slurm`, `/usr/lib64/libmunge.so.2`, `/etc/slurm`
+and the `/var/run/munge` socket — see `scripts/container_binds.sh`). The image ships no
+slurm packages of its own, so it follows HPC3 through upgrades instead of drifting out
+of lockstep with `slurmctld`. Every job Snakemake spawns re-enters the same image
+through `.container/bin/python`, a shim the launcher generates per run. Two flags make
+that work and are passed by the launcher, not the profile:
+
+- `--shared-fs-usage` **without** `software-deployment` — otherwise Snakemake puts its
+  own in-container interpreter path into the spawned command, and the compute node
+  cannot find it.
+- `--precommand` — puts the shim directory first on the compute node's `PATH`.
+
+The shim then does three things that are each load-bearing, and each of which failed a
+real test run before being added:
+
+1. `mkdir -p /tmp/bcl-convert-logs` — `/tmp` is node-local, so the launcher creating it
+   on the login node says nothing about the compute node, and singularity refuses to
+   start when a bind source is missing.
+2. `unset SINGULARITY_BIND` — singularity exports that variable into the container to
+   describe its own binds, and SLURM's `--export=ALL` carries it to the compute node,
+   where it would duplicate every mount and drag along login-node-only paths.
+3. Appends `--executor local` — the slurm executor hardcodes `--executor slurm-jobstep`
+   into every spawned command, and that executor wraps the work in `srun`. `srun`
+   launches its task on the *host*, outside the container, while asking for the
+   interpreter by its absolute in-container path — because the jobstep executor extends
+   `RealExecutor` rather than `RemoteExecutor` and so never sees the `--shared-fs-usage`
+   conditional; its `get_python_executable()` returns `sys.executable` unconditionally.
+   No flag disables that `srun`, so the shim overrides the executor instead (argparse
+   takes the last occurrence). Jobs still run inside the allocation's cgroup, so SLURM
+   resource limits still apply; only `srun`'s cpu-binding is lost.
+
+This is also why the image must be **Rocky 9**: HPC3's `sbatch` is linked against
+glibc 2.34, which the previous Rocky 8 base (2.28) cannot load.
+
+The image is built from the private `whtns/containers` repo
+(`bcl_convert/Dockerfile`: Rocky 9 + the `bcl-convert-4.4.6` RPM + this repo's own
+`pixi.toml`/`pixi.lock` installed to `/app/.pixi/envs/default`) and pushed to a
+**private** GHCR package. Neither the repo nor the package is publicly pullable, so the
+group-readable `.sif` above is the supported way to get it. Rebuilding needs access to
+that repo plus a manual download of the bcl-convert RPM from
+[Illumina](https://support.illumina.com/sequencing/sequencing_software/bcl-convert/downloads.html).
+
+> The image installs **this repo's** `pixi.lock`, copied into the build context. Change
+> a tool version in `pixi.toml`, run `pixi lock`, copy both files to the container repo,
+> rebuild. The image can then never disagree with what a host pixi env would resolve.
 
 ```bash
 # with access to ghcr.io/whtns/bcl_convert
@@ -71,40 +110,63 @@ module load singularity
 singularity pull bcl_convert.sif docker://ghcr.io/whtns/bcl_convert:latest
 ```
 
-Verify access to whichever copy you use:
+Verify whichever copy you use — the second command is the one that matters, since it
+exercises the glibc and munge plumbing that in-container submission depends on:
 
 ```bash
 module load singularity
-singularity exec --writable-tmpfs /dfs9/ucightf-lab/containers/bcl_convert.sif \
-    bcl-convert --version                                  # bcl-convert Version 4.4.6
+SIF=/dfs9/ucightf-lab/containers/bcl_convert.sif
+
+singularity exec --writable-tmpfs "$SIF" bcl-convert --version   # Version 4.4.6
+
+source scripts/container_binds.sh
+singularity exec $(container_binds_flat) "$SIF" squeue -u "$USER"
 ```
 
-`--writable-tmpfs` is required: bcl-convert writes to `/var/log/bcl-convert` inside
-the container and aborts if that path is read-only.
+A `GLIBC_2.34 not found` from the second command means the image is still on a Rocky 8
+base. A munge error means the `/var/run/munge` bind or `libmunge.so.2` is missing.
 
-`SINGULARITY_BINDS` covers `/dfs3b` (the BCL run directories) and `/dfs9` (the lab
-share and run working directories). Cloning a run somewhere else — `/pub/$USER`, say —
-means adding that filesystem to the list, or the container cannot see its own inputs
-and outputs.
+`--writable-tmpfs` is required for bcl-convert: it writes to `/var/log/bcl-convert`
+inside the container and aborts if that path is read-only. The launcher additionally
+binds `/tmp/bcl-convert-logs` over it, because the tmpfs overlay is small and the logs
+are not.
+
+The data binds are `/dfs3b` (the BCL run directories) and `/dfs9` (the lab share and
+run working directories). Cloning a run somewhere else — `/pub/$USER`, say — means
+adding that filesystem to `CONTAINER_DATA_BINDS` in `scripts/container_binds.sh`, or
+the container cannot see its own inputs and outputs.
 
 ## Environment
 
-Python and the bioinformatics CLIs are provisioned with [pixi](https://pixi.sh) from
-`pixi.toml` (locked in `pixi.lock`). Install pixi once, then let it build the environment:
+**The container is the runtime.** Running the workflow needs the `.sif`, this repo, and
+`module load singularity` — no pixi, no python, no conda on the host:
+
+```bash
+module load singularity
+bash run_hpc3_container.sh --dryrun   # preview what would run
+bash run_hpc3_container.sh            # full workflow
+```
+
+`pixi.toml` (locked in `pixi.lock`) is still the single source of truth for *what* is
+installed — the image builds its environment from those two files — and a host pixi env
+remains useful for development and as a fallback path. Install pixi once, then:
 
 ```bash
 curl -fsSL https://pixi.sh/install.sh | bash   # one-time install
 pixi install                                    # solve/create env from pixi.lock
 ```
 
-Run any command inside the environment with `pixi run`, or use the predefined tasks:
-
 ```bash
 pixi run init                 # one-time per-run setup (project config + samplesheet)
+pixi run validate             # check the metadata workbook
 pixi run dry-run              # preview what would run (run_hpc3.sh --dryrun)
-pixi run all                  # full workflow (run_hpc3.sh; slurm + Singularity)
+pixi run all                  # full workflow on the host env (run_hpc3.sh)
 pixi run convert output/lane1 # BCL conversion for a single lane
 ```
+
+> `run_hpc3.sh` is the host/pixi path and `run_hpc3_container.sh` the container path.
+> They run the same DAG with the same profile; the container one additionally needs no
+> host environment, and is what cron uses.
 
 > `pixi run` auto-loads secrets from **`~/.env`**, then from a run-local `./.env` if
 > one exists (only needed when `enable_nextcloud`/`send_emails` are turned on), and
@@ -121,18 +183,20 @@ cp .env.example ~/.env && chmod 600 ~/.env
 
 A `./.env` inside a run directory overrides it for that run only, and is gitignored.
 
-pixi manages Python (pandas, openpyxl, numpy, matplotlib, pillow, pyyaml, reportlab),
-Snakemake (+ the slurm executor plugin), and the bioconda CLIs (`fastqc`, `flexbar`,
-`seqtk`, `fqtk`, `seqkit`, `pigz`). Two dependencies remain **system-level** and are not
-installed by pixi:
+`pixi.toml` describes Python (pandas, openpyxl, numpy, matplotlib, pillow, pyyaml,
+reportlab), Snakemake (+ the slurm executor plugin), and the bioconda CLIs (`fastqc`,
+`flexbar`, `seqtk`, `fqtk`, `seqkit`, `pigz`) — the same set whether it is solved on the
+host or baked into the image. Two dependencies remain **system-level**:
 
-- **Singularity**, via `module load singularity` — runs the bcl-convert container
-  (see `run_hpc3.sh` and the rules that shell out to it in the Snakefile). The image
-  itself is a separate artifact; see [Container image](#container-image).
+- **Singularity**, via `module load singularity`. The only host requirement left on the
+  container path. Resolved by `scripts/find_singularity.sh`, which finds a real binary
+  path rather than relying on the Lmod shell function. The image itself is a separate
+  artifact; see [Container image](#container-image).
 - An **optional custom `flexbar` build**. `flexbar_bin` defaults to `""`, which uses the
-  bioconda flexbar pixi installs. Set it to an absolute path only for a speedup build
-  (e.g. `/dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar`); a non-executable
-  path there is a hard error rather than a fallback.
+  bioconda flexbar. Set it to an absolute path only for a speedup build (e.g.
+  `/dfs9/ucightf-lab/kstachel/TOOLS/build_parasail/src/flexbar`); a non-executable path
+  there is a hard error rather than a fallback. On the container path the path must be
+  inside a bind-mounted filesystem.
 
 > The legacy `bcl_convert` mamba/conda environment is being retired in favor of pixi.
 
@@ -141,7 +205,11 @@ installed by pixi:
 - **`Snakefile`** - Main workflow definition; imports rules from `src/workflow_defs.smk`
 - **`snakemake_config.yaml`** - Base configuration (paths, threads, email settings)
 - **`snakemake_config_project.yaml`** - Project-specific configuration (overrides base settings)
-- **`profiles/hpc3/config.yaml`** - HPC3 executor profile (slurm, Singularity, resource defaults)
+- **`run_hpc3_container.sh`** - Container entry point: runs Snakemake itself inside the
+  image and generates the compute-node shim. The supported way to run the workflow
+- **`scripts/container_binds.sh`** - The bind list shared by the launcher and the shim
+  (data filesystems + the host SLURM client)
+- **`profiles/hpc3/config.yaml`** - HPC3 executor profile (slurm, resource defaults)
 - **`metadata/*.xlsx`** - Excel metadata with Summary sheet and per-project sheets
 - **`src/RunInfo_nn.xml`** - Normalized run configuration (auto-generated)
 - **`src/barcode_collisions.py`** - Detects unresolvable index collisions and routes those

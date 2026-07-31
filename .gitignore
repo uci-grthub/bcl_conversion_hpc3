@@ -48,3 +48,6 @@ recover_lane6_r2.sh
 .pixi/
 gz_md5_54400008.out
 gz_md5_54400008.err
+
+# container: shim generated per-run by run_hpc3_container.sh
+.container/

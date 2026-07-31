@@ -1,5 +1,8 @@
 use sbsandme_lab slurm account 
-use pixi for python/tool provisioning (pixi.toml + pixi.lock); run commands with `pixi run ...`
-the legacy mamba env `bcl_convert` is being retired in favor of pixi
+the whole workflow runs inside one container, snakemake driver included: `bash run_hpc3_container.sh`
+that launcher runs snakemake in the image and binds the host slurm client in; spawned jobs re-enter the image via the generated .container/bin/python shim
+never add a `container:` directive or use-singularity to a rule — rules are already in the container and would nest
+pixi.toml + pixi.lock stay the single dependency spec; the image installs them with --locked. change a version there, `pixi lock`, copy both to the container repo, rebuild
+`pixi run ...` / run_hpc3.sh remain the host fallback path for development
 don't use python venv
-HPC3 uses singularity (module load singularity), not DRAGEN; bcl-convert runs via profiles/hpc3 (slurm executor)
+HPC3 uses singularity (module load singularity), not DRAGEN; slurm executor via profiles/hpc3

@@ -1,11 +1,20 @@
 snakefile: Snakefile
 configfile: snakemake_config.yaml
 executor: slurm
-use-singularity: true
-singularity-args: >-
-  --bind /dfs9
-  --bind /tmp/bcl-convert-logs:/var/log/bcl-convert
-  --env PATH=/app/.pixi/envs/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# No use-singularity / singularity-args here. Those only ever applied to rules
+# declaring a `container:` directive, and none do — the setting was inert. The
+# container is entered one level up instead: run_hpc3_container.sh runs this
+# whole Snakemake process inside the image, and every job it spawns re-enters
+# the same image through the generated .container/bin/python shim. Re-adding
+# them would wrap already-containerized rules in a second, nested container.
+#
+# The two settings that make that spawn work are NOT here either; the launcher
+# passes them, because both need absolute paths that depend on where the repo
+# is checked out:
+#   --shared-fs-usage (omitting software-deployment)
+#   --precommand "export PATH=<repo>/.container/bin:..."
+
 retries: 3
 # Must be >= the largest `threads:` in the Snakefile (32, flexbar_per_config).
 # Snakemake silently downscales a rule's threads to this value.
