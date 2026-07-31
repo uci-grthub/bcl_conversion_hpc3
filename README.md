@@ -2,6 +2,10 @@
 
 Automated workflow for Illumina (MiSeq i100 / NovaSeqX) sequencing data processing, quality control, and report generation. Runs on HPC3 via Singularity + slurm — no DRAGEN instrument required.
 
+The same DAG also runs on a single machine with no scheduler at all; see
+[Single-Node / No-SLURM Execution](#single-node--no-slurm-execution). Everything else in this
+document describes the HPC3 path.
+
 ## Workflow Diagram
 
 ![Workflow Rule Graph](rulegraph.png)
@@ -162,6 +166,11 @@ pixi run validate             # check the metadata workbook
 pixi run dry-run              # preview what would run (run_hpc3.sh --dryrun)
 pixi run all                  # full workflow on the host env (run_hpc3.sh)
 pixi run convert output/lane1 # BCL conversion for a single lane
+
+# Single node, no scheduler (profiles/local) — see Single-Node / No-SLURM Execution
+pixi run local-container-dry-run
+pixi run local-container      # driver in the image, executor local
+pixi run local                # host env, no container
 ```
 
 > `run_hpc3.sh` is the host/pixi path and `run_hpc3_container.sh` the container path.
@@ -170,9 +179,12 @@ pixi run convert output/lane1 # BCL conversion for a single lane
 
 > `pixi run` auto-loads secrets from **`~/.env`**, then from a run-local `./.env` if
 > one exists (only needed when `enable_nextcloud`/`send_emails` are turned on), and
-> forces `SNAKEMAKE_PROFILE=profiles/hpc3` (see `[activation]` in `pixi.toml` and
-> `scripts/load_dotenv.sh`). `run_hpc3.sh` also passes `--profile profiles/hpc3`
-> explicitly, so no manual `--profile` flag or `source .env` is needed.
+> pins `SNAKEMAKE_PROFILE` — to `profiles/hpc3` unless a launcher exported
+> `BCL_SNAKEMAKE_PROFILE` first, which is how the `local*` tasks reach `profiles/local`
+> (see `[activation]` in `pixi.toml` and `scripts/load_dotenv.sh`). Either way it
+> overrides whatever a personal `.env` set. `run_hpc3.sh` also passes
+> `--profile profiles/hpc3` explicitly, so no manual `--profile` flag or `source .env`
+> is needed.
 
 Credentials belong in `~/.env` — one personal copy, reused by every run directory you
 clone, outside every repo so it cannot be committed by accident:
@@ -208,8 +220,13 @@ host or baked into the image. Two dependencies remain **system-level**:
 - **`run_hpc3_container.sh`** - Container entry point: runs Snakemake itself inside the
   image and generates the compute-node shim. The supported way to run the workflow
 - **`scripts/container_binds.sh`** - The bind list shared by the launcher and the shim
-  (data filesystems + the host SLURM client)
+  (data filesystems, plus the host SLURM client unless `CONTAINER_SKIP_SLURM_BINDS` is set)
 - **`profiles/hpc3/config.yaml`** - HPC3 executor profile (slurm, resource defaults)
+- **`run_local_container.sh`** / **`run_local.sh`** - Single-node entry points, container and
+  host respectively; no scheduler involved
+- **`profiles/local/config.yaml`** - Single-node executor profile (`executor: local`)
+- **`scripts/local_resources.sh`** - Sizes Snakemake to the host and clamps rules whose
+  declared `mem_mb` exceeds it; shared by both local launchers
 - **`metadata/*.xlsx`** - Excel metadata with Summary sheet and per-project sheets
 - **`src/RunInfo_nn.xml`** - Normalized run configuration (auto-generated)
 - **`src/barcode_collisions.py`** - Detects unresolvable index collisions and routes those
@@ -355,7 +372,8 @@ explains the purpose: *"HPC3-specific: scale fastp memory by input FASTQ size �
 request mem dynamically."* That sizes a **request** for a scheduler choosing a node; fastp
 itself streams its input. On one machine it only does harm — a FASTQ over twice the budget
 fails the whole DAG, and a merely large one reserves most of the budget for one sample and
-serializes all ~179 of them. So the local path pins it to the heuristic's own floor (8000 MB,
+serializes every other `fastp_sample` job behind it (there is one per sample, often hundreds).
+So the local path pins it to the heuristic's own floor (8000 MB,
 or the whole budget if that is smaller) via `--set-resources`. Change it with
 `LOCAL_FASTP_MEM_MB` in `scripts/local_resources.sh`.
 
@@ -371,7 +389,8 @@ or the whole budget if that is smaller) via `--set-resources`. Change it with
 | slurm client binds | bound in | skipped via `CONTAINER_SKIP_SLURM_BINDS` |
 
 Expect a much longer wall time. The DAG is the same, but one node replaces up to 32 concurrent
-SLURM jobs, and `serial_operation=1` additionally serializes the four heaviest rules.
+SLURM jobs, and `serial_operation=1` additionally serializes the four rules that declare it —
+`bcl_convert`, `bcl_convert_rc`, `project_link`, `flexbar_project_link`.
 
 **`run_local.sh` caveat:** the pixi env cannot supply `bcl-convert`, which is an RPM baked into
 the container image rather than a conda package. On that path the `bcl_convert` rules need it
@@ -486,39 +505,51 @@ pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/iR011_read_counts_e
 
 ## Common Commands
 
+Calling `snakemake` directly needs **`--workflow-profile none`**. Without it Snakemake also
+auto-discovers `profiles/default` as the workflow profile and merges it on top of your
+`--profile`, announcing it in the first line of output:
+
+```
+Using profiles profiles/hpc3 and workflow specific profile profiles/default for setting ...
+```
+
+`profiles/default` is the legacy DRAGEN-server profile, and its `serial_operation=1` wins —
+silently serializing everything. The launchers all pass the flag for you; these examples pass
+it because they bypass the launchers.
+
 **Dry run (see what would execute):**
 ```bash
-pixi run snakemake --profile profiles/hpc3 -n
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none -n
 ```
 
 **Run entire workflow:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 8
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --cores 8
 ```
 
 **Run specific project report:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 4 Reports/MyProject/index.html
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --cores 4 Reports/MyProject/index.html
 ```
 
 **Analyze undetermined indices:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 1 results/undetermined_indices/lane1.csv
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --cores 1 results/undetermined_indices/lane1.csv
 ```
 
 **Force re-run a specific rule:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 4 -R compile_read_counts
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --cores 4 -R compile_read_counts
 ```
 
 **View rule graph:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --rulegraph | dot -Tpdf > rulegraph.pdf
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --rulegraph | dot -Tpdf > rulegraph.pdf
 ```
 
 **View complete dependency graph:**
 ```bash
-pixi run snakemake --profile profiles/hpc3 --dag | dot -Tpdf > dag.pdf
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --dag | dot -Tpdf > dag.pdf
 ```
 
 ## Output Structure

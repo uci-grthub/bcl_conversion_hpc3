@@ -10,6 +10,11 @@ a run starts; it auto-loads `.env` and provisions the Python/CLI environment. If
 have no pixi env, `bash run_hpc3_container.sh` still works on its own — `module load
 singularity` is the only host requirement.
 
+**This SOP is the HPC3 procedure.** To run the same workflow on one machine with no
+scheduler, substitute `run_local_container.sh` for `run_hpc3_container.sh` throughout and
+skip everything about slurm accounts; see
+[README.md](README.md#single-node--no-slurm-execution) for how it sizes itself to the host.
+
 ## Quickstart (a normal run)
 
 ```bash
@@ -128,9 +133,14 @@ pixi run python scripts/test_nextcloud_token.py
   Used automatically by `run_hpc3_container.sh`. Heavy rules override these in the `Snakefile`:
   `bcl_convert`/`bcl_convert_rc` 24 threads / 48 GB, `flexbar_per_config` 32 / 64 GB / 480 min,
   `fqtk_per_config` 8 / 16 GB / 480 min.
-- `profiles/default/config.yaml` — non-HPC3 resource-limit profile (kept for parity with
-  upstream / single-host use); not used by `run_hpc3_container.sh`, which passes
-  `--workflow-profile none` so this profile cannot silently override the hpc3 one.
+- `profiles/local/config.yaml` — the single-node profile: `executor: local`, so rules run
+  as child processes of the driver and nothing is submitted. Used by `run_local_container.sh`
+  and `run_local.sh`, which size `cores`/`mem_mb` to the host rather than hardcoding them.
+- `profiles/default/config.yaml` — the legacy DRAGEN-server profile, kept for parity with
+  upstream. Not used by any launcher here; every launcher passes `--workflow-profile none`
+  so it cannot silently override the profile that was asked for. For single-host runs use
+  `profiles/local` instead — this one has no `executor` and carries DRAGEN-era FPGA
+  assumptions.
 
 ### Metadata format (auto-detected)
 
@@ -163,15 +173,22 @@ Details in [README.md](README.md#fqtk-post-hoc-demultiplexing).
 ### Run specific stages
 
 Configs are per lane (`lane1`…`lane8`; MiSeq uses only `lane1`). Pass a target through
-`run_hpc3_container.sh` (or `pixi run snakemake --profile profiles/hpc3` directly on the
-host fallback path):
+`run_hpc3_container.sh`:
 
 ```bash
 bash run_hpc3_container.sh output/lane1                             # BCL conversion, one lane
-pixi run snakemake --profile profiles/hpc3 --cores 4 results/fastp_lane1.done
-pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
-pixi run snakemake --profile profiles/hpc3 --cores 1 results/{RUN}-count.csv
-pixi run snakemake --profile profiles/hpc3 -R compile_read_counts   # force a rule to re-run
+bash run_hpc3_container.sh results/fastp_lane1.done
+bash run_hpc3_container.sh Reports/order_0626I-08/index.html
+bash run_hpc3_container.sh results/{RUN}-count.csv
+bash run_hpc3_container.sh -R compile_read_counts                   # force a rule to re-run
+```
+
+On the host fallback path, calling `snakemake` directly needs **`--workflow-profile none`**
+as well — without it Snakemake merges `profiles/default` over your `--profile` and its
+`serial_operation=1` silently serializes the run (see the last troubleshooting entry):
+
+```bash
+pixi run snakemake --profile profiles/hpc3 --workflow-profile none --cores 4 results/fastp_lane1.done
 ```
 
 ### Validate outputs
@@ -205,8 +222,10 @@ pixi run dag                  # dag.pdf
   user=$USER format=Account | head -1)` and rerun.
 - Container cannot see your files (`No such file or directory` on a path that exists) —
   your working directory or `data_dir` is on a filesystem outside the container binds
-  (`/dfs3b`, `/dfs9`). Add it to `CONTAINER_DATA_BINDS` in `scripts/container_binds.sh`,
-  or work under one of those.
+  (`/dfs3b`, `/dfs9`). Easiest fix is the escape hatch, no file edit needed:
+  `export CONTAINER_EXTRA_BINDS="/pub/$USER"`. For a path every operator needs, add it to
+  `CONTAINER_DATA_BINDS` in `scripts/container_binds.sh` instead. (The repo checkout itself
+  is bound automatically when it falls outside the defaults.)
 - Empty reports: verify metadata sheet names and headers.
 - md5 mismatch: regenerate the specific project report outputs.
 - `Missing Masking value in Summary tab for: lane N group G` — fill that cell in the workbook.
@@ -216,5 +235,9 @@ pixi run dag                  # dag.pdf
   let the fqtk routing handle it (it normally does, before bcl-convert sees the sheet).
 - Job OOM-killed / hit the time limit — compare `benchmarks/{rule}_{config_id}.bench` and raise
   that rule's `resources:` block in the `Snakefile`; the profile default is 8000 MB / 60 min.
-- Only one job running at a time — confirm `run_hpc3_container.sh` was used (it passes
+  On the single-node path, raising it past the host budget has no effect: the launcher clamps
+  it back down and says so. Give the machine more RAM, or accept the clamp.
+- Only one job running at a time — confirm a launcher was used (they all pass
   `--workflow-profile none`); a bare `snakemake` picks up `profiles/default` and serializes.
+  Expected on the single-node path for `bcl_convert` / `bcl_convert_rc` / `project_link` /
+  `flexbar_project_link`, which `profiles/local` caps at `serial_operation=1` on purpose.
