@@ -21,7 +21,11 @@ set -a
 set +a
 
 # Re-pin the workflow profile regardless of anything a sourced .env set. A
-# personal ~/.env may export SNAKEMAKE_PROFILE pointing at a global profile;
-# the repo's profiles/hpc3 (slurm executor + Singularity) is the one that must
-# win for every operator on this cluster.
-export SNAKEMAKE_PROFILE="profiles/hpc3"
+# personal ~/.env may export SNAKEMAKE_PROFILE pointing at a global profile; a
+# repo profile is the one that must win for every operator.
+#
+# Default stays profiles/hpc3 (slurm executor + Singularity). A launcher aimed
+# at a different repo profile exports BCL_SNAKEMAKE_PROFILE before sourcing
+# this; run_local*.sh set profiles/local. Deliberately NOT
+# ${SNAKEMAKE_PROFILE:-...}: the point is to override the .env, not defer to it.
+export SNAKEMAKE_PROFILE="${BCL_SNAKEMAKE_PROFILE:-profiles/hpc3}"

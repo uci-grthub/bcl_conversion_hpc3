@@ -301,6 +301,87 @@ silently reimpose `serial_operation=1`, blocking all job parallelism.
 Peak bcl-convert RSS across all 8 lanes measured ~23 GB, so 48 GB keeps 2× headroom without
 queueing for a 144 GB block.
 
+## Single-Node / No-SLURM Execution
+
+For a machine with no scheduler at all — a workstation, the dragen server, a cloud VM.
+`profiles/local/config.yaml` sets `executor: local`, so every rule runs as a child process of
+the Snakemake driver. Nothing is submitted anywhere.
+
+```bash
+bash run_local_container.sh --dryrun    # preview
+bash run_local_container.sh             # run
+bash run_local.sh                       # no Singularity on this host (see caveat below)
+```
+
+or `pixi run local-container` / `pixi run local` / the `-dry-run` variants.
+
+**Neither launcher allocates anything.** Be on the machine you intend to use before you start.
+
+### Host sizing
+
+`scripts/local_resources.sh` measures the box and passes the result to Snakemake:
+
+| | Source | Override |
+|---|---|---|
+| `--cores` / `--local-cores` | `nproc` (honours cgroup and affinity limits) | `BCL_LOCAL_CORES` |
+| `--resources mem_mb` | 90% of `MemTotal` | `BCL_LOCAL_MEM_MB` |
+
+The 10% memory margin is not padding for its own sake: rules declare only what Snakemake
+accounts for, while bcl-convert's own buffers, the page cache for a multi-TB BCL tree, and the
+driver process itself all sit outside that accounting.
+
+### Memory clamping
+
+On HPC3 a rule's `mem_mb` is a request and SLURM finds a node that fits. On one machine it is a
+budget, and a rule asking for more than the global limit is a hard DAG error, not a queue wait:
+
+```
+Job needs mem_mb=64000 which exceeds the available mem_mb=32000
+```
+
+So the launcher emits `--set-resources <rule>:mem_mb=<budget>` for any rule that overshoots,
+and prints which ones it clamped. On a 32 GB box `flexbar_per_config` (64 GB) and
+`bcl_convert` (48 GB) still run — in less memory than they were written for. Watch them the
+first time.
+
+Threads need no equivalent: Snakemake silently downscales any `threads:` above `--cores`. It
+does so *silently*, so the launcher says once when the host has fewer than 32 cores and the
+flexbar rules will therefore run narrower than declared.
+
+`fastp_sample` is handled separately and unconditionally. Its `mem_mb` is a callable,
+`get_fastp_mem_mb` in `src/workflow_defs.smk`, returning `max(8000, input_size/2 + 4000)` — a
+value only known at DAG time, so the static clamp above cannot reach it. Its own comment
+explains the purpose: *"HPC3-specific: scale fastp memory by input FASTQ size … HPC3 jobs
+request mem dynamically."* That sizes a **request** for a scheduler choosing a node; fastp
+itself streams its input. On one machine it only does harm — a FASTQ over twice the budget
+fails the whole DAG, and a merely large one reserves most of the budget for one sample and
+serializes all ~179 of them. So the local path pins it to the heuristic's own floor (8000 MB,
+or the whole budget if that is smaller) via `--set-resources`. Change it with
+`LOCAL_FASTP_MEM_MB` in `scripts/local_resources.sh`.
+
+### Differences from the HPC3 path
+
+| | `profiles/hpc3` | `profiles/local` |
+|---|---|---|
+| `executor` | `slurm` | `local` |
+| `serial_operation` | uncapped — each rule gets its own allocation | `1` — `bcl_convert` (48 GB) alongside `flexbar_per_config` (64 GB) would OOM one box |
+| `retries` | `3` | `0` — local failures are deterministic, and there is no per-attempt resource escalation to make a second try differ |
+| `latency-wait` | `120` (dfs9/NFS) | `20` — raise it if the output tree is on a network filesystem |
+| `.container/bin/python` shim | required | unused; nothing re-enters the image |
+| slurm client binds | bound in | skipped via `CONTAINER_SKIP_SLURM_BINDS` |
+
+Expect a much longer wall time. The DAG is the same, but one node replaces up to 32 concurrent
+SLURM jobs, and `serial_operation=1` additionally serializes the four heaviest rules.
+
+**`run_local.sh` caveat:** the pixi env cannot supply `bcl-convert`, which is an RPM baked into
+the container image rather than a conda package. On that path the `bcl_convert` rules need it
+already installed and on `PATH`; everything downstream (flexbar, fqtk, fastp, seqkit) comes
+from pixi. Prefer `run_local_container.sh` wherever Singularity exists.
+
+To lower bcl-convert's own thread use on a small machine, drop `bcl_conversion_threads` /
+`bcl_compression_threads` / `bcl_decompression_threads` in `snakemake_config_project.yaml` —
+their sum must stay at or below the rule's `threads:` (24).
+
 ## Metadata Format
 
 ### NovaSeqX (Summary-sheet format)

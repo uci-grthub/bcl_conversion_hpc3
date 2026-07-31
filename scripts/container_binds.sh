@@ -86,8 +86,17 @@ container_binds() {
     local defaults=()
     mapfile -t defaults < <(_container_default_binds "${1:-}")
 
+    # Single-node launchers (run_local*.sh) set CONTAINER_SKIP_SLURM_BINDS: the
+    # driver never submits, so a host slurm client is dead weight at best. At
+    # worst the host has a partial install -- an /etc/slurm and a libmunge left
+    # behind with no sbatch -- which the [[ -e ]] test below happily binds in.
+    local bind_list=("${CONTAINER_DATA_BINDS[@]}")
+    if [[ -z "${CONTAINER_SKIP_SLURM_BINDS:-}" ]]; then
+        bind_list+=("${CONTAINER_SLURM_BINDS[@]}")
+    fi
+
     local p
-    for p in "${CONTAINER_DATA_BINDS[@]}" "${CONTAINER_SLURM_BINDS[@]}"; do
+    for p in "${bind_list[@]}"; do
         # Skip anything absent rather than failing the whole run: a site without
         # /dfs3b, or a slurm build that puts sinfo elsewhere, should still work.
         [[ -e "$p" ]] || continue

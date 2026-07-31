@@ -1,0 +1,52 @@
+snakefile: Snakefile
+configfile: snakemake_config.yaml
+
+# Single node, no scheduler: every rule runs as a child of the driver process.
+# This is the profile for a workstation, the dragen server, or a cloud VM — any
+# host with no sbatch at all. For HPC3 use profiles/hpc3 instead.
+executor: local
+
+# No use-singularity / singularity-args. Those only ever applied to rules
+# declaring a `container:` directive, and none do. The container is entered one
+# level up instead: run_local_container.sh runs this whole Snakemake process
+# inside the image, and with the local executor there is nothing to spawn
+# outside it. Re-adding them would wrap already-containerized rules in a second,
+# nested container.
+#
+# cores / local-cores / `resources: mem_mb` are deliberately NOT set here: they
+# describe the host, not the workflow, and run_local*.sh measures the actual
+# machine and passes them. Pin them here only if this profile serves exactly one
+# known box.
+
+# Serialize the rules that must not overlap: bcl_convert, bcl_convert_rc,
+# project_link, flexbar_project_link. On hpc3 this cap is deliberately absent
+# because each rule gets its own allocation; here they share one machine, and
+# bcl_convert (48 GB) landing alongside flexbar_per_config (64 GB) would OOM it.
+resources:
+  - serial_operation=1
+  - nextcloud_api=3
+  - precision_ssh=3
+
+keep-going: True
+printshellcmds: True
+rerun-incomplete: True
+
+# Only mtime triggers a re-run. Snakemake's default also reruns on changed
+# code/params/software-env, which would re-run bcl-convert on an unrelated
+# Snakefile edit — hours of conversion time.
+rerun-triggers: mtime
+
+# Local disk makes outputs visible immediately; hpc3 needs 120 only because
+# dfs9 is NFS. Raise this if the output tree lives on a network filesystem.
+latency-wait: 20
+
+# Single-node failures are deterministic — bad input, OOM, a missing binary.
+# Retrying reruns the same hours-long job to reach the same traceback, and
+# unlike the slurm path there is no per-attempt resource escalation to make the
+# second try any different.
+retries: 0
+
+shared-fs-usage:
+  - input-output
+  - persistence
+  - software-deployment

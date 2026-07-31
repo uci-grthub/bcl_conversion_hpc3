@@ -52,6 +52,10 @@ scripts = ["scripts/load_dotenv.sh"]
 # Snakemake reads SNAKEMAKE_PROFILE, so profiles/hpc3 (slurm executor + Singularity)
 # applies to EVERY invocation (even a bare `pixi run snakemake -n`) without passing
 # --profile. See profiles/hpc3/config.yaml.
+#
+# scripts/load_dotenv.sh above re-exports this after sourcing .env, and honours
+# BCL_SNAKEMAKE_PROFILE — that is how the `local*` tasks below reach
+# profiles/local without this value having to change.
 SNAKEMAKE_PROFILE = "profiles/hpc3"
 
 [tasks]
@@ -71,6 +75,16 @@ init = "bash scripts/init_run.sh"
 validate = "python run_validation.py"
 # BCL conversion for a single lane, e.g. `pixi run convert output/lane1`
 convert = "bash run_hpc3.sh"
+
+# Single-node, no-SLURM path (profiles/local). Assumes you are already on the
+# machine you want to use — neither task allocates anything. Both size Snakemake
+# to the host; override with BCL_LOCAL_CORES / BCL_LOCAL_MEM_MB.
+local = "bash run_local.sh"
+local-dry-run = "bash run_local.sh --dryrun"
+# Same DAG with the driver inside the container. Preferred where Singularity
+# exists: run_local.sh cannot supply bcl-convert, which only lives in the image.
+local-container = "bash run_local_container.sh"
+local-container-dry-run = "bash run_local_container.sh --dryrun"
 # Rule/dependency graphs
 rulegraph = "snakemake --rulegraph | dot -Tpng > rulegraph.png"
 dag = "snakemake --dag | dot -Tpdf > dag.pdf"
