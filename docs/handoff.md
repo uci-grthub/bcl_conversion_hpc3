@@ -67,8 +67,29 @@ bash run_hpc3_container.sh handoff         # same thing, named explicitly
 otherwise everything looks newer than its inputs on arrival):
 
 ```bash
-rsync -aP --exclude '.snakemake/' hpc3:/path/to/xR106/ /path/to/xR106/
+rsync -aP \
+    --exclude '.snakemake/' \
+    --exclude '.container/' \
+    --exclude 'snakemake_config_delivery.yaml' \
+    hpc3:/path/to/xR106/ /path/to/xR106/
 ```
+
+Each exclusion is load-bearing:
+
+- `.snakemake/` — the conversion run's DAG metadata. Carrying it over gives the
+  delivery host provenance for jobs that ran somewhere else, against a Snakefile
+  it does not use.
+- `.container/` — the compute-node python shim, generated per run by
+  `run_hpc3_container.sh` and specific to HPC3's singularity setup.
+- `snakemake_config_delivery.yaml` — the delivery host's own settings. It is
+  gitignored but *not* automatically transfer-ignored, so without this exclusion a
+  copy created on HPC3 silently overwrites the delivery host's, and
+  `run_delivery.sh` skips the first-run review prompt because the file already
+  exists. The tracked `.example` still comes across, which is all the bootstrap
+  needs.
+
+Add `-W` (whole-file) for a LAN transfer: delta encoding is wasted work on
+already-compressed FASTQs. Do not add `-z` for the same reason.
 
 **On the dragen server:**
 
