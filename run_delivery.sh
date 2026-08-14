@@ -17,8 +17,19 @@ here="$(cd "$(dirname "$0")" && pwd)"
 
 # Re-exec inside the pixi env if not already there, for the same reason as
 # run_hpc3.sh: a stray conda env earlier on PATH shadows pixi's snakemake.
+#
+# pixi is resolved to an absolute path rather than invoked by bare name: its
+# installer only puts ~/.pixi/bin on PATH via a shell rc, so `ssh host
+# 'bash run_delivery.sh'`, cron and batch jobs all get command-not-found from an
+# installed pixi. That first `pixi run` also builds the environment from
+# pixi.lock if the run directory has no .pixi yet, which is the normal state for
+# a run rsynced from HPC3 (the conversion side runs in the container and never
+# builds a host env).
 if [[ -z "${PIXI_ENVIRONMENT_NAME:-}" ]]; then
-    exec pixi run --manifest-path "$here/pixi.toml" bash "$0" "$@"
+    # shellcheck source=scripts/find_pixi.sh
+    source "$here/scripts/find_pixi.sh"
+    PIXI="$(find_pixi)" || exit 1
+    exec "$PIXI" run --manifest-path "$here/pixi.toml" bash "$0" "$@"
 fi
 
 SKIP_VERIFY=0

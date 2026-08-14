@@ -77,6 +77,18 @@ bash run_delivery.sh --dry-run
 bash run_delivery.sh
 ```
 
+The first run in a freshly rsynced directory builds the pixi environment from
+`pixi.lock`, because the conversion side runs in the container and never creates a
+host `.pixi/`. That is automatic — `run_delivery.sh` re-execs through `pixi run`,
+which installs on demand — and fast, since the package cache is shared across run
+directories. Run `pixi install` first if you would rather see it as its own step.
+
+Do **not** run `pixi run init` there. That is `scripts/init_run.sh`, the HPC3
+run-setup task: it rewrites `metadata` / `library_name` / `data_dir` in
+`snakemake_config_project.yaml` from the HPC3 staging directory, and those seds are
+not guarded by its "config already exists" check. The transferred run is already
+configured.
+
 The delivery workflow can only *execute* on a host with Nextcloud credentials and
 a mail relay. Its DAG, however, is testable anywhere — including HPC3 — with
 throwaway credentials and `--dry-run`, which is enough to check that a run's
