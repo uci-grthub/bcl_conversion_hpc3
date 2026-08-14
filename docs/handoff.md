@@ -71,6 +71,11 @@ rsync -aP \
     --exclude '.snakemake/' \
     --exclude '.container/' \
     --exclude 'snakemake_config_delivery.yaml' \
+    --exclude 'project_link*' \
+    --exclude 'flexbar_project_link*' \
+    --exclude 'verify_project_link*' \
+    --exclude 'nextcloud_scan*' \
+    --exclude 'Reports/' \
     hpc3:/path/to/xR106/ /path/to/xR106/
 ```
 
@@ -87,6 +92,22 @@ Each exclusion is load-bearing:
   `run_delivery.sh` skips the first-run review prompt because the file already
   exists. The tracked `.example` still comes across, which is all the bootstrap
   needs.
+- the `*link*` / `nextcloud_scan*` log patterns and `Reports/` — delivery outputs. A run directory that predates
+  this split still holds the old skip-stubs (`Status: SKIPPED`, `link: ''`) and the
+  stale HTML reports built from them. Ship those to the delivery host and Snakemake
+  treats them as satisfying `project_link` and `report_order_id`, so it publishes
+  the empty links instead of rebuilding — the exact failure the split exists to
+  remove, reintroduced by the transfer. A conversion run started after the split
+  never creates these, but the exclusion costs nothing and makes the transfer safe
+  from any run directory. If a delivery host already received them, move the link
+  logs and `Reports/` aside there once and re-run.
+
+  These are written as bare basename globs on purpose. The obvious
+  `--exclude 'logs/**/*link*'` does **not** match them: the logs live one level
+  down at `logs/{config_id}/project_link_*.log`, and that pattern silently lets
+  every one of them through. A pattern with no `/` matches the basename at any
+  depth, which is what is wanted here. Verify any change with
+  `rsync -an --out-format='%n'` rather than assuming the pattern bit.
 
 Add `-W` (whole-file) for a LAN transfer: delta encoding is wasted work on
 already-compressed FASTQs. Do not add `-z` for the same reason.
