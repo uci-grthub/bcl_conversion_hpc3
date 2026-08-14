@@ -67,7 +67,7 @@ bash run_hpc3_container.sh handoff         # same thing, named explicitly
 otherwise everything looks newer than its inputs on arrival):
 
 ```bash
-rsync -aP \
+rsync -aP --no-g \
     --exclude '.snakemake/' \
     --exclude '.container/' \
     --exclude 'snakemake_config_delivery.yaml' \
@@ -111,6 +111,32 @@ Each exclusion is load-bearing:
 
 Add `-W` (whole-file) for a LAN transfer: delta encoding is wasted work on
 already-compressed FASTQs. Do not add `-z` for the same reason.
+
+`--no-g` matters more than it looks. Nextcloud reaches the delivered files over an
+SMB mount, as a service account that is a member of the delivery host's own group
+(`grthcloud` here) and not of the conversion host's (`ucightf`). Plain `rsync -a`
+preserves the source group, and it *succeeds* in doing so whenever an
+identically-named group exists on the destination and the transferring user
+belongs to it — which is exactly the case here, so nothing errors. The files land
+readable only by a group Nextcloud cannot use, `occ files:scan` fails with
+`Couldn't open SMB directory … Permission denied`, and the share link resolves to
+an empty folder while every rule reports success. `--no-g` lets the destination
+assign its own group instead.
+
+That failure is silent from the workflow's side, so check the scan summary in
+`logs/{config_id}/rescan_nextcloud_*.log` after a delivery run — the `Errors`
+column must be 0 and `Files` non-zero:
+
+```
+| Folders | Files | New | Updated | Removed | Errors | Elapsed time |
+| 2       | 41    | 0   | 0       | 0       | 0      | 00:00:01     |
+```
+
+If a run has already landed with the wrong group, `chgrp -R <delivery-group>` on
+the run directory and re-run with `--forcerun rescan_nextcloud`. Deleting the
+`nextcloud_scan_*.done` markers alone will not re-trigger the scan: their consumer
+`verify_project_links` is already satisfied, so Snakemake has no reason to rebuild
+them.
 
 **On the dragen server:**
 
