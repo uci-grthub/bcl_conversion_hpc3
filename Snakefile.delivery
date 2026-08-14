@@ -15,6 +15,7 @@
 # those arrive by rsync.  A missing one is therefore a hard "MissingInputException"
 # naming the exact file, which is the rsync-completeness check.
 
+import getpass
 import os
 import re
 import glob
@@ -30,12 +31,23 @@ NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
 NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
-# SSH target for `occ files:scan` on the Nextcloud host. Defaults to the same
-# user/host as NEXTCLOUD_URL; override via env for a different admin account.
+# SSH target for `occ files:scan` on the Nextcloud host.
+#
+# The SSH login is independent of NEXTCLOUD_USER: that is the Nextcloud API
+# account (e.g. a shared "ucightf" service user), which is not a Unix account on
+# the Nextcloud host and has no authorized key there. Deriving the SSH target
+# from it produces `ssh <api-user>@<host>`, which falls through to a password
+# prompt and hangs the run. Default to the OS user instead, since that is whose
+# SSH keys and agent are actually available.
+#
+# Override NEXTCLOUD_SSH_USER for a different admin account, or set
+# NEXTCLOUD_SSH_HOST to a full "user@host" (or an ssh_config alias) to control both.
+NEXTCLOUD_SSH_USER = os.environ.get("NEXTCLOUD_SSH_USER") or getpass.getuser()
+
 NEXTCLOUD_SSH_HOST = os.environ.get("NEXTCLOUD_SSH_HOST")
 if NEXTCLOUD_SSH_HOST is None:
     from urllib.parse import urlparse as _urlparse
-    NEXTCLOUD_SSH_HOST = f"{NEXTCLOUD_USER}@{_urlparse(NEXTCLOUD_URL).hostname}"
+    NEXTCLOUD_SSH_HOST = f"{NEXTCLOUD_SSH_USER}@{_urlparse(NEXTCLOUD_URL).hostname}"
 
 configfile: "snakemake_config.yaml"
 

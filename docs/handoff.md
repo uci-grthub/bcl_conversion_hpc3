@@ -67,8 +67,76 @@ bash run_hpc3_container.sh handoff         # same thing, named explicitly
 otherwise everything looks newer than its inputs on arrival):
 
 ```bash
-rsync -aP --exclude '.snakemake/' hpc3:/path/to/xR106/ /path/to/xR106/
+rsync -aP --no-g \
+    --exclude '.snakemake/' \
+    --exclude '.container/' \
+    --exclude 'snakemake_config_delivery.yaml' \
+    --exclude 'project_link*' \
+    --exclude 'flexbar_project_link*' \
+    --exclude 'verify_project_link*' \
+    --exclude 'nextcloud_scan*' \
+    --exclude 'Reports/' \
+    hpc3:/path/to/xR106/ /path/to/xR106/
 ```
+
+Each exclusion is load-bearing:
+
+- `.snakemake/` — the conversion run's DAG metadata. Carrying it over gives the
+  delivery host provenance for jobs that ran somewhere else, against a Snakefile
+  it does not use.
+- `.container/` — the compute-node python shim, generated per run by
+  `run_hpc3_container.sh` and specific to HPC3's singularity setup.
+- `snakemake_config_delivery.yaml` — the delivery host's own settings. It is
+  gitignored but *not* automatically transfer-ignored, so without this exclusion a
+  copy created on HPC3 silently overwrites the delivery host's, and
+  `run_delivery.sh` skips the first-run review prompt because the file already
+  exists. The tracked `.example` still comes across, which is all the bootstrap
+  needs.
+- the `*link*` / `nextcloud_scan*` log patterns and `Reports/` — delivery outputs. A run directory that predates
+  this split still holds the old skip-stubs (`Status: SKIPPED`, `link: ''`) and the
+  stale HTML reports built from them. Ship those to the delivery host and Snakemake
+  treats them as satisfying `project_link` and `report_order_id`, so it publishes
+  the empty links instead of rebuilding — the exact failure the split exists to
+  remove, reintroduced by the transfer. A conversion run started after the split
+  never creates these, but the exclusion costs nothing and makes the transfer safe
+  from any run directory. If a delivery host already received them, move the link
+  logs and `Reports/` aside there once and re-run.
+
+  These are written as bare basename globs on purpose. The obvious
+  `--exclude 'logs/**/*link*'` does **not** match them: the logs live one level
+  down at `logs/{config_id}/project_link_*.log`, and that pattern silently lets
+  every one of them through. A pattern with no `/` matches the basename at any
+  depth, which is what is wanted here. Verify any change with
+  `rsync -an --out-format='%n'` rather than assuming the pattern bit.
+
+Add `-W` (whole-file) for a LAN transfer: delta encoding is wasted work on
+already-compressed FASTQs. Do not add `-z` for the same reason.
+
+`--no-g` matters more than it looks. Nextcloud reaches the delivered files over an
+SMB mount, as a service account that is a member of the delivery host's own group
+(`grthcloud` here) and not of the conversion host's (`ucightf`). Plain `rsync -a`
+preserves the source group, and it *succeeds* in doing so whenever an
+identically-named group exists on the destination and the transferring user
+belongs to it — which is exactly the case here, so nothing errors. The files land
+readable only by a group Nextcloud cannot use, `occ files:scan` fails with
+`Couldn't open SMB directory … Permission denied`, and the share link resolves to
+an empty folder while every rule reports success. `--no-g` lets the destination
+assign its own group instead.
+
+That failure is silent from the workflow's side, so check the scan summary in
+`logs/{config_id}/rescan_nextcloud_*.log` after a delivery run — the `Errors`
+column must be 0 and `Files` non-zero:
+
+```
+| Folders | Files | New | Updated | Removed | Errors | Elapsed time |
+| 2       | 41    | 0   | 0       | 0       | 0      | 00:00:01     |
+```
+
+If a run has already landed with the wrong group, `chgrp -R <delivery-group>` on
+the run directory and re-run with `--forcerun rescan_nextcloud`. Deleting the
+`nextcloud_scan_*.done` markers alone will not re-trigger the scan: their consumer
+`verify_project_links` is already satisfied, so Snakemake has no reason to rebuild
+them.
 
 **On the dragen server:**
 
@@ -76,6 +144,18 @@ rsync -aP --exclude '.snakemake/' hpc3:/path/to/xR106/ /path/to/xR106/
 bash run_delivery.sh --dry-run
 bash run_delivery.sh
 ```
+
+The first run in a freshly rsynced directory builds the pixi environment from
+`pixi.lock`, because the conversion side runs in the container and never creates a
+host `.pixi/`. That is automatic — `run_delivery.sh` re-execs through `pixi run`,
+which installs on demand — and fast, since the package cache is shared across run
+directories. Run `pixi install` first if you would rather see it as its own step.
+
+Do **not** run `pixi run init` there. That is `scripts/init_run.sh`, the HPC3
+run-setup task: it rewrites `metadata` / `library_name` / `data_dir` in
+`snakemake_config_project.yaml` from the HPC3 staging directory, and those seds are
+not guarded by its "config already exists" check. The transferred run is already
+configured.
 
 The delivery workflow can only *execute* on a host with Nextcloud credentials and
 a mail relay. Its DAG, however, is testable anywhere — including HPC3 — with
