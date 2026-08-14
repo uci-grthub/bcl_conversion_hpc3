@@ -7,3 +7,12 @@ pixi.toml + pixi.lock stay the single dependency spec; the image installs them w
 `pixi run ...` / run_hpc3.sh remain the host fallback path for development
 don't use python venv
 HPC3 uses singularity (module load singularity), not DRAGEN; slurm executor via profiles/hpc3
+
+two workflows, one run directory — see docs/handoff.md
+conversion (`Snakefile` + src/handoff.smk, HPC3): bcl-convert through md5sums/QC, ends by writing handoff/manifest.yaml
+delivery (`Snakefile.delivery` + src/delivery.smk, dragen server via `bash run_delivery.sh`): nextcloud links, order reports, emails
+never add a nextcloud/email/share rule to the conversion Snakefile — a rule that "skips" still writes its outputs, and after the rsync those stubs look up to date, which is the hand-touching this split removed
+the delivery side must not parse metadata workbooks or SampleSheets; if it needs a value, add it to a handoff fragment in src/handoff.smk
+partial runs: share links are per project and publish as soon as a fragment lands; order reports and emails wait until every project handoff/manifest.yaml names for that order has arrived — never widen that to "whatever fragments are on disk", it mails customers a partial delivery
+B only executes where nextcloud creds + a mail relay exist, but its DAG dry-runs anywhere with throwaway NEXTCLOUD_* vars
+no `benchmark:` on target-only rules (all, links_only, bcl_convert_only, …) — snakemake counts the benchmark file as an output, so a leftover one makes the target a silent no-op

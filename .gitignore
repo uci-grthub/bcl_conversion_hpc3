@@ -51,3 +51,7 @@ gz_md5_54400008.err
 
 # container: shim generated per-run by run_hpc3_container.sh
 .container/
+
+# handoff manifests: per-run output, produced by the conversion workflow and
+# rsynced to the delivery host (see docs/handoff.md)
+handoff/

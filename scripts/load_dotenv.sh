@@ -11,8 +11,9 @@
 #                 your usual ones.
 #
 # Runs at the pixi manifest root (the run directory). Both files are optional on
-# HPC3: enable_nextcloud/send_emails default to false, so a fresh clone needs no
-# .env at all unless a project turns those on. See .env.example for the keys.
+# HPC3: the conversion workflow has no Nextcloud or email rules, so a fresh clone
+# needs no .env beyond SLURM_ACCOUNT. The Nextcloud/mail keys are read by the
+# delivery workflow on the dragen server. See .env.example and docs/handoff.md.
 set -a
 # shellcheck source=/dev/null  # both files are optional and created by the operator
 [ -f "$HOME/.env" ] && . "$HOME/.env"

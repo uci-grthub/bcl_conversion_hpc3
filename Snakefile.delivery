@@ -1,0 +1,306 @@
+# Delivery workflow (workflow B) -- runs on the dragen server.
+#
+# Consumes a run directory rsynced from HPC3 and does the parts that need a
+# Nextcloud instance and a mail relay: share links, Nextcloud rescan/verify,
+# per-order HTML reports, and the customer emails.
+#
+#     snakemake -s Snakefile.delivery --profile profiles/default
+#
+# It reads handoff/ and nothing else for run structure: no metadata workbook, no
+# SampleSheets, no rename maps.  The conversion workflow resolved every project's
+# order_id, group and original name once and wrote them down; re-deriving them
+# here is what used to make the two halves disagree.
+#
+# Nothing in this file has a producing rule for output/, results/ or metadata/ --
+# those arrive by rsync.  A missing one is therefore a hard "MissingInputException"
+# naming the exact file, which is the rsync-completeness check.
+
+import os
+import re
+import glob
+import yaml
+
+# NOTE: do NOT declare these as `envvars:`. Snakemake's envvars directive re-exports
+# the values inline into every spawned --mode subprocess command line and echoes that
+# command into .snakemake/log, leaking secrets. The values are read via os.environ
+# below and inherited by child processes from the launching shell, so the directive
+# is unnecessary.
+NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "")
+NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
+NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+# SSH target for `occ files:scan` on the Nextcloud host. Defaults to the same
+# user/host as NEXTCLOUD_URL; override via env for a different admin account.
+NEXTCLOUD_SSH_HOST = os.environ.get("NEXTCLOUD_SSH_HOST")
+if NEXTCLOUD_SSH_HOST is None:
+    from urllib.parse import urlparse as _urlparse
+    NEXTCLOUD_SSH_HOST = f"{NEXTCLOUD_USER}@{_urlparse(NEXTCLOUD_URL).hostname}"
+
+configfile: "snakemake_config.yaml"
+
+# `--config key=value` is merged by Snakemake before this point, so the manual
+# layering below would silently overwrite a CLI override. Re-apply it last.
+_cli_overrides = dict(getattr(workflow.config_settings, "config", {}) or {})
+
+for _extra_config in ("snakemake_config_project.yaml", "snakemake_config_delivery.yaml"):
+    if os.path.exists(_extra_config):
+        with open(_extra_config) as _f:
+            config.update(yaml.safe_load(_f) or {})
+
+config.update(_cli_overrides)
+
+
+def _cfg_truthy(value):
+    """`--config send_emails=false` arrives as the string "false", which is truthy."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+NEXTCLOUD_DIR_NAME = config.get("nextcloud_dir_name", "DragenExt3")
+NEXTCLOUD_DIR_PATH = config.get("nextcloud_dir_path", "nextcloud3")
+
+EMAIL_SENDER = config.get("email_sender", "")
+EMAIL_RECIPIENT = config.get("email_recipient", "")
+EMAIL_CC = config.get("email_cc", "")
+SEND_EMAILS = _cfg_truthy(config.get("send_emails", True))
+
+EXTERNAL_DRIVE_PATH = config.get("external_drive_path", None)
+WORKING_DIR = os.getcwd()
+# Skip rsync if working directory is on /mnt/ path (already on external drive)
+SKIP_RSYNC = WORKING_DIR.startswith("/mnt/")
+
+# Unlike the conversion workflow, missing Nextcloud credentials are fatal here.
+# Publishing is the entire purpose of this workflow, so a run without them can
+# only produce empty-link YAMLs and stub reports -- which then look up-to-date to
+# a later, properly configured run and have to be deleted by hand.
+_missing_nc = [name for name, value in (
+    ("NEXTCLOUD_URL", NEXTCLOUD_URL),
+    ("NEXTCLOUD_USER", NEXTCLOUD_USER),
+    ("NEXTCLOUD_PASSWORD", NEXTCLOUD_PASSWORD),
+) if not str(value).strip()]
+if _missing_nc:
+    raise SystemExit(
+        "Error: the delivery workflow requires Nextcloud credentials in the "
+        f"environment; missing: {', '.join(_missing_nc)}. Source your ~/.env "
+        "(see scripts/load_dotenv.sh) or run the conversion workflow instead."
+    )
+
+if SEND_EMAILS and not str(EMAIL_RECIPIENT).strip():
+    raise SystemExit(
+        "Error: send_emails is true but email_recipient is empty. Set it in "
+        "snakemake_config_delivery.yaml, or set send_emails: false to generate "
+        "links and reports without mailing anyone."
+    )
+
+# ---------------------------------------------------------------------------
+# Handoff manifest
+# ---------------------------------------------------------------------------
+
+HANDOFF_DIR = "handoff"
+
+_run_manifest_path = f"{HANDOFF_DIR}/manifest.yaml"
+RUN_MANIFEST = {}
+if os.path.exists(_run_manifest_path):
+    with open(_run_manifest_path) as _f:
+        RUN_MANIFEST = yaml.safe_load(_f) or {}
+
+# Fragments are read by glob rather than from the run manifest's project lists so
+# delivery can run against a partially rsynced run: whatever projects have landed
+# get their links now, the rest on a later invocation.
+HANDOFF_ENTRIES = []
+for _frag in sorted(glob.glob(f"{HANDOFF_DIR}/projects/*.yaml")):
+    with open(_frag) as _f:
+        _entry = yaml.safe_load(_f) or {}
+    if _entry.get("config_id") and _entry.get("project"):
+        HANDOFF_ENTRIES.append(_entry)
+
+FLEXBAR_HANDOFF_ENTRIES = []
+for _frag in sorted(glob.glob(f"{HANDOFF_DIR}/flexbar/*.yaml")):
+    with open(_frag) as _f:
+        _entry = yaml.safe_load(_f) or {}
+    if _entry.get("config_id"):
+        FLEXBAR_HANDOFF_ENTRIES.append(_entry)
+
+if not HANDOFF_ENTRIES:
+    raise SystemExit(
+        f"Error: no handoff fragments found under {HANDOFF_DIR}/projects/. "
+        "Run the conversion workflow first (its `handoff` target), then rsync "
+        "the run directory here. See docs/handoff.md."
+    )
+
+_HANDOFF_BY_PAIR = {(e["config_id"], e["project"]): e for e in HANDOFF_ENTRIES}
+_FLEXBAR_BY_CONFIG = {e["config_id"]: e for e in FLEXBAR_HANDOFF_ENTRIES}
+
+
+def handoff_entry(config_id, project):
+    try:
+        return _HANDOFF_BY_PAIR[(config_id, project)]
+    except KeyError:
+        raise WorkflowError(
+            f"No handoff fragment for {config_id}/{project}. Expected "
+            f"{HANDOFF_DIR}/projects/{config_id}---{project}.yaml; the rsync from "
+            "the conversion host may be incomplete."
+        )
+
+
+def flexbar_handoff_entry(config_id):
+    try:
+        return _FLEXBAR_BY_CONFIG[config_id]
+    except KeyError:
+        raise WorkflowError(
+            f"No flexbar handoff fragment for {config_id}. Expected "
+            f"{HANDOFF_DIR}/flexbar/{config_id}.yaml."
+        )
+
+
+def handoff_entries_for_order(order_id):
+    return [e for e in HANDOFF_ENTRIES if e["order_id"] == str(order_id)]
+
+
+LIBRARY = RUN_MANIFEST.get("library") or config.get("library_name", "")
+
+# Names the moved delivery rules already use, rebuilt from the manifest rather
+# than from the metadata workbook.
+CONFIG_PROJECT_PAIRS = [(e["config_id"], e["project"]) for e in HANDOFF_ENTRIES]
+ACTIVE_ORDER_IDS = sorted({e["order_id"] for e in HANDOFF_ENTRIES})
+FLEXBAR_ACTIVE_ORDER_IDS = sorted(
+    {e["order_id"] for e in FLEXBAR_HANDOFF_ENTRIES} - set(ACTIVE_ORDER_IDS)
+)
+# Every order the run is supposed to deliver, not just the ones whose fragments
+# have arrived. Taking this from the fragments alone would make a missing order
+# invisible rather than pending, and RUN_COMPLETE below would read as true for a
+# run that is mostly still in transit.
+ALL_ORDER_IDS = sorted(
+    set(ACTIVE_ORDER_IDS)
+    | set(FLEXBAR_ACTIVE_ORDER_IDS)
+    | {str(oid) for oid in (RUN_MANIFEST.get("orders", {}) or {})}
+)
+
+ORDER_ID_TO_LANE = {}
+for _e in HANDOFF_ENTRIES:
+    if _e.get("lane") is not None:
+        _lanes = ORDER_ID_TO_LANE.setdefault(_e["order_id"], [])
+        if _e["lane"] not in _lanes:
+            _lanes.append(_e["lane"])
+for _lanes in ORDER_ID_TO_LANE.values():
+    _lanes.sort()
+
+FLEXBAR_CONFIG_BY_ORDER_ID = {}
+for _e in FLEXBAR_HANDOFF_ENTRIES:
+    FLEXBAR_CONFIG_BY_ORDER_ID.setdefault(_e["order_id"], []).append(_e["config_id"])
+
+
+# ---------------------------------------------------------------------------
+# Order completeness
+#
+# A share link is per project: publishing one for a finished project while the
+# rest of the run is still converting is the point of the per-project fragments.
+# An order report is per ORDER, and an order can span several projects and lanes.
+# Built from whatever fragments happen to be on disk, it silently describes a
+# subset -- and send_order_email would then mail that subset to the customer as
+# the finished delivery.
+#
+# handoff/manifest.yaml records the authoritative project list per order, so an
+# order is only eligible for a report once every project it names has arrived.
+# Without the manifest (conversion still running, or a partial rsync) that is
+# unknowable, and no order qualifies.
+# ---------------------------------------------------------------------------
+
+_MANIFEST_ORDERS = RUN_MANIFEST.get("orders", {}) or {}
+
+
+def order_missing_pieces(order_id):
+    """Projects and flexbar configs this order needs that have not arrived yet."""
+    spec = _MANIFEST_ORDERS.get(str(order_id), {})
+    missing = sorted(set(spec.get("projects", []))
+                     - {e["project"] for e in handoff_entries_for_order(order_id)})
+    missing += sorted(set(spec.get("flexbar_configs", [])) - set(_FLEXBAR_BY_CONFIG))
+    return missing
+
+
+if RUN_MANIFEST:
+    COMPLETE_ORDER_IDS = [oid for oid in ALL_ORDER_IDS if not order_missing_pieces(oid)]
+    _incomplete = {oid: order_missing_pieces(oid)
+                   for oid in ALL_ORDER_IDS if order_missing_pieces(oid)}
+    for _oid, _missing in sorted(_incomplete.items()):
+        logger.warning(
+            f"Order {_oid}: no report or email -- still waiting on {len(_missing)} "
+            f"piece(s) from the conversion run: {', '.join(_missing)}"
+        )
+else:
+    COMPLETE_ORDER_IDS = []
+    logger.warning(
+        f"{_run_manifest_path} is absent, so which orders are complete cannot be "
+        "determined; building share links only. Rerun once the conversion run has "
+        "written its manifest and it has been rsynced here."
+    )
+
+ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in COMPLETE_ORDER_IDS]
+ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in COMPLETE_ORDER_IDS]
+
+# get_project_links_from_yaml and friends; pure helper definitions, no side effects.
+include: "src/workflow_defs.smk"
+include: "src/delivery.smk"
+
+
+# The read-counts CSV and the low-reads alerts are run-level aggregates, not
+# per-order, so they only mean anything once every order has arrived.
+RUN_COMPLETE = bool(RUN_MANIFEST) and set(COMPLETE_ORDER_IDS) == set(ALL_ORDER_IDS)
+
+
+def _email_targets():
+    """Email sentinels are dropped from the target set rather than skipped in-rule.
+
+    Gating inside the rule instead would touch the .done sentinel without sending
+    anything, so a later run with send_emails: true would consider the mail
+    already delivered. The same reasoning covers incomplete orders: an order whose
+    projects have not all arrived gets no sentinel, so it still sends later.
+    """
+    if not SEND_EMAILS:
+        return []
+    targets = expand("Reports/order_{order_id}/email_sent.done",
+                     order_id=COMPLETE_ORDER_IDS)
+    if RUN_COMPLETE:
+        targets += [f"Reports/{LIBRARY}_read_counts_email.done",
+                    f"Reports/{LIBRARY}_low_reads_alerts.done"]
+    else:
+        logger.warning(
+            "Run-level emails (read counts, low-reads alerts) are held back until "
+            "every order has arrived; they aggregate the whole run."
+        )
+    return targets
+
+
+rule all:
+    input:
+        expand("logs/{config_id}/project_links_{config_id}---{project}.yaml", zip,
+               config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
+               project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        expand("logs/{config_id}/verify_project_link_{config_id}---{project}.txt", zip,
+               config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
+               project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+        expand("logs/{config_id}/flexbar_project_links_{config_id}.yaml",
+               config_id=sorted(_FLEXBAR_BY_CONFIG)),
+        ORDER_ID_REPORTS,
+        ORDER_ID_MD5S,
+        _email_targets(),
+    # No `benchmark:` on target-only rules -- Snakemake counts the benchmark file
+    # as an output, so a leftover one makes the target look already satisfied.
+
+
+rule links_only:
+    """Share links and their verification, without reports or emails."""
+    input:
+        expand("logs/{config_id}/verify_project_link_{config_id}---{project}.txt", zip,
+               config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
+               project=[p for c, p in CONFIG_PROJECT_PAIRS]),
+
+
+rule reports_only:
+    """Links plus per-order HTML/PDF/md5 reports, without sending any email."""
+    input:
+        ORDER_ID_REPORTS,
+        ORDER_ID_MD5S,

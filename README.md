@@ -8,7 +8,19 @@ Automated workflow for Illumina (MiSeq i100 / NovaSeqX) sequencing data processi
 
 ## Overview
 
-This Snakemake pipeline handles the complete sequencing data processing workflow:
+This pipeline is **two Snakemake workflows** sharing one run directory — see
+[docs/handoff.md](docs/handoff.md).
+
+**Conversion** (`Snakefile`, HPC3, `bash run_hpc3_container.sh`) — steps 1-5 and 7
+below. It ends by writing `handoff/manifest.yaml`, the contract the delivery side
+reads. It contains no Nextcloud or email rules and needs no credentials.
+
+**Delivery** (`Snakefile.delivery`, dragen server, `bash run_delivery.sh`) — steps
+6 and 8, plus Nextcloud share links and their verification. It needs a Nextcloud
+instance and a mail relay, and it parses no metadata: everything it knows about
+the run comes from `handoff/`.
+
+The steps:
 1. **BCL Conversion** - bcl-convert (via Singularity) to FASTQ with per-lane sample sheets
 2. **Post-hoc Demultiplexing** - fqtk recovers samples that bcl-convert cannot demultiplex
    (index collisions, `*fqtk*` projects) from the lane's Undetermined reads; flexbar handles
@@ -18,7 +30,7 @@ This Snakemake pipeline handles the complete sequencing data processing workflow
 5. **Visualization** - Quality plots (mean Phred scores, base composition)
 6. **Report Generation** - Comprehensive HTML reports grouped by Order ID with embedded plots and download instructions
 7. **Read Count Compilation** - Lane-level read counts formatted as CSV, aggregated per library
-8. **Email Notifications** - Automated email delivery of reports and read counts (optional, off by default)
+8. **Email Notifications** - Automated email delivery of reports and read counts (delivery side; `send_emails: false` builds links and reports without mailing)
 
 ## Installation
 
@@ -179,7 +191,7 @@ pixi run convert output/lane1 # BCL conversion for a single lane
 > host environment, and is what cron uses.
 
 > `pixi run` auto-loads secrets from **`~/.env`**, then from a run-local `./.env` if
-> one exists (only needed when `enable_nextcloud`/`send_emails` are turned on), and
+> one exists (the Nextcloud/mail keys matter only to the delivery workflow), and
 > forces `SNAKEMAKE_PROFILE=profiles/hpc3` (see `[activation]` in `pixi.toml` and
 > `scripts/load_dotenv.sh`). `run_hpc3.sh` also passes `--profile profiles/hpc3`
 > explicitly, so no manual `--profile` flag or `source .env` is needed.
@@ -212,9 +224,15 @@ host or baked into the image. Two dependencies remain **system-level**:
 
 ## Key Files
 
-- **`Snakefile`** - Main workflow definition; imports rules from `src/workflow_defs.smk`
-- **`snakemake_config.yaml`** - Base configuration (paths, threads, email settings)
+- **`Snakefile`** - Conversion workflow (HPC3); imports helpers from `src/workflow_defs.smk`
+  and the manifest rules from `src/handoff.smk`
+- **`src/handoff.smk`** - Writes `handoff/`, the contract the delivery workflow reads
+- **`Snakefile.delivery`** - Delivery workflow (dragen server); rules in `src/delivery.smk`
+- **`run_delivery.sh`** - Delivery entry point; runs `scripts/verify_handoff.py` first
+- **`scripts/verify_handoff.py`** - Reports every gap in the rsynced run in one pass
+- **`snakemake_config.yaml`** - Base configuration (paths, threads), shared by both halves
 - **`snakemake_config_project.yaml`** - Project-specific configuration (overrides base settings)
+- **`snakemake_config_delivery.yaml`** - Delivery-side settings (Nextcloud paths, email)
 - **`run_hpc3_container.sh`** - Container entry point: runs Snakemake itself inside the
   image and generates the compute-node shim. The supported way to run the workflow
 - **`scripts/container_binds.sh`** - The bind list shared by the launcher and the shim
@@ -380,8 +398,12 @@ pixi run snakemake --profile profiles/hpc3 --cores 4 results/lane1/fastp_plots_l
 - Outputs PNG files to `results/fastp_plots/lane{N}/{project}/{sample}-*.png`
 
 ### 6. Project/Order Reports
+
+Delivery side — the HTML embeds Nextcloud share links, so it runs on the dragen
+server, not HPC3.
+
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/order_0626I-08/index.html
+bash run_delivery.sh Reports/order_0626I-08/index.html
 ```
 - Creates comprehensive HTML reports grouped by `Order ID`
 - Includes summary of all projects associated with the order
@@ -408,8 +430,11 @@ pixi run snakemake --profile profiles/hpc3 --cores 1 results/iR011-count.csv
   from `output/{config_id}/fqtk/demux-metrics.txt` and placed in their real lane/group column
 
 ### 8. Email Delivery
+
+Delivery side.
+
 ```bash
-pixi run snakemake --profile profiles/hpc3 --cores 1 Reports/iR011_read_counts_email.done
+bash run_delivery.sh Reports/iR011_read_counts_email.done
 ```
 - Sends read count CSV as attachment
 - Uses SMTP over SSL (`smtp.gmail.com:465`, see `src/send_email.py`); authenticates as
@@ -455,6 +480,11 @@ pixi run snakemake --profile profiles/hpc3 --dag | dot -Tpdf > dag.pdf
 ## Output Structure
 
 ```
+handoff/                        # the HPC3 -> dragen contract; see docs/handoff.md
+  manifest.yaml
+  projects/{config_id}---{project}.yaml
+  flexbar/{config_id}.yaml
+  alerts/{config_id}---{project}.json
 output/
   lane{N}/
     {project}/
@@ -551,9 +581,14 @@ R1/I1/R2 files are missing.
 
 ## Email Configuration
 
-Off by default on HPC3 (`send_emails: false`). When enabled, the workflow uses
-`src/send_email.py` via Gmail SMTP (`smtp.gmail.com`), authenticated with
-`GMAIL_APP_PASSWORD` from `.env` — see `.env.example`.
+Delivery side only; the HPC3 conversion workflow sends nothing. `src/send_email.py`
+uses Gmail SMTP (`smtp.gmail.com`), authenticated with `GMAIL_APP_PASSWORD` from
+`.env` — see `.env.example`.
+
+With `send_emails: false` in `snakemake_config_delivery.yaml` the delivery workflow
+still builds every share link and order report; it just drops the email targets, so
+no sentinel is created and flipping the flag to `true` later sends without anything
+to delete first.
 
 ## Troubleshooting
 

@@ -41,9 +41,14 @@ bash run_hpc3_container.sh --dryrun
 bash run_hpc3_container.sh
 ```
 
-That's the whole loop. `enable_nextcloud`/`send_emails` are **off by default** on HPC3
-(`snakemake_config.yaml`), so no `.env` is required unless a project explicitly turns
-Nextcloud sharing or email alerts back on.
+That's the whole loop on HPC3. No `.env` is required: this workflow has no Nextcloud
+or email rules at all.
+
+Delivery — share links, order reports and customer emails — is a separate workflow
+that runs on the dragen server, because it needs a Nextcloud instance and a mail
+relay. The run above ends by writing `handoff/manifest.yaml`; rsync the run
+directory to the dragen server and run `bash run_delivery.sh` there. See
+[docs/handoff.md](docs/handoff.md).
 
 Two things the workflow now decides on its own, with no operator action:
 
@@ -89,10 +94,12 @@ ls /dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif        # need the cont
 
 ## Reference
 
-### Credentials (`.env`) — optional on HPC3
+### Credentials (`.env`) — not used on HPC3
 
-Only needed if a project sets `enable_nextcloud: true` or `send_emails: true` in
-`snakemake_config_project.yaml` (both default `false`). If enabled, the workflow needs:
+The conversion workflow needs no credentials: it has no Nextcloud or email rules.
+These are read only by the delivery workflow on the dragen server
+(`bash run_delivery.sh`, see [docs/handoff.md](docs/handoff.md)), which hard-fails
+at parse time if the Nextcloud ones are missing:
 
 | Variable | What it is |
 | --- | --- |
@@ -126,12 +133,13 @@ bash scripts/container_exec.sh python scripts/test_nextcloud_token.py
 ### Configuration files
 
 - `snakemake_config_project.yaml` — per-run overrides (gitignored).
-  `bash scripts/init_run.sh` prefills `library_name`, `metadata`, `data_dir`. Set `email_sender` /
-  `email_recipient` / `email_cc` only if enabling email (base config ships these blank
-  so a run never emails the previous operator), plus optional `external_drive_path`,
-  `scratch_dir`, `tiles`, `flexbar_bin`.
-- `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited;
-  `send_emails: false` / `enable_nextcloud: false` live here.
+  `bash scripts/init_run.sh` prefills `library_name`, `metadata`, `data_dir`; plus optional
+  `external_drive_path`, `scratch_dir`, `tiles`, `flexbar_bin`.
+- `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited.
+- `snakemake_config_delivery.yaml` — delivery-side only, read on the dragen server
+  (gitignored): `send_emails`, `email_sender` / `email_recipient` / `email_cc`,
+  `nextcloud_dir_name` / `nextcloud_dir_path`, `external_drive_path`. Nothing on
+  HPC3 reads it. See [docs/handoff.md](docs/handoff.md).
 - `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor,
   `standard` partition, account from `$SLURM_ACCOUNT` (never pinned in the file),
   `cores: 32` (must stay >= the largest rule `threads:`), up to 32 concurrent jobs,
