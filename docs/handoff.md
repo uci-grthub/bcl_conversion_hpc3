@@ -75,6 +75,7 @@ rsync -aP --no-g \
     --exclude 'flexbar_project_link*' \
     --exclude 'verify_project_link*' \
     --exclude 'nextcloud_scan*' \
+    --exclude 'rescan_nextcloud*' \
     --exclude 'Reports/' \
     hpc3:/path/to/xR106/ /path/to/xR106/
 ```

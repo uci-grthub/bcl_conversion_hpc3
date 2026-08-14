@@ -41,14 +41,65 @@ bash run_hpc3_container.sh --dryrun
 bash run_hpc3_container.sh
 ```
 
-That's the whole loop on HPC3. No `.env` is required: this workflow has no Nextcloud
-or email rules at all.
+That is the HPC3 half. It ends by writing `handoff/manifest.yaml`, and needs no
+`.env`: this workflow has no Nextcloud or email rules at all.
 
 Delivery — share links, order reports and customer emails — is a separate workflow
-that runs on the dragen server, because it needs a Nextcloud instance and a mail
-relay. The run above ends by writing `handoff/manifest.yaml`; rsync the run
-directory to the dragen server and run `bash run_delivery.sh` there. See
-[docs/handoff.md](docs/handoff.md).
+on the dragen server, because it needs a Nextcloud instance and a mail relay.
+
+```bash
+# 6. Transfer the run to the delivery host. Copy these flags verbatim; see the
+#    notes below for what each one prevents.
+rsync -aWP --no-g \
+    --exclude '.snakemake/' \
+    --exclude '.container/' \
+    --exclude 'snakemake_config_delivery.yaml' \
+    --exclude 'project_link*' \
+    --exclude 'flexbar_project_link*' \
+    --exclude 'verify_project_link*' \
+    --exclude 'nextcloud_scan*' \
+    --exclude 'rescan_nextcloud*' \
+    --exclude 'Reports/' \
+    ./ {DELIVERY_HOST}:/staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}/
+
+# 7. On the delivery host, set up the delivery config. The first run creates it
+#    from the tracked template and stops so you can review it.
+ssh {DELIVERY_HOST}
+cd /staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}
+bash run_delivery.sh --dry-run                 # creates snakemake_config_delivery.yaml, exits
+$EDITOR snakemake_config_delivery.yaml         # send_emails, email_sender/recipient/cc
+
+# 8. Preview, then publish. With send_emails: false this builds every share link
+#    and order report and mails nobody — the intended review state.
+bash run_delivery.sh --dry-run
+bash run_delivery.sh
+
+# 9. Confirm Nextcloud actually indexed the files. Errors must be 0 and Files
+#    non-zero; this is the one failure the workflow cannot detect for you.
+grep -h '^| [0-9]' logs/*/rescan_nextcloud_*.log
+
+# 10. Only once the reports look right: set send_emails: true and re-run to mail
+#     the customers. Nothing needs deleting first — no sentinel was written.
+```
+
+Three things about step 6 that are easy to get wrong, each of which fails *silently*
+— every rule still reports success:
+
+- **`--no-g`.** Nextcloud serves the files over SMB as an account in the delivery
+  host's group. Without this, rsync preserves HPC3's group instead and every share
+  link resolves to an empty folder.
+- **The `*link*` / `Reports/` exclusions.** A run directory predating the
+  conversion/delivery split still holds the old skip-stubs; transferred over, they
+  satisfy `project_link` and `report_order_id` and the empty links get published.
+- **`snakemake_config_delivery.yaml`.** Untracked but not transfer-ignored, so a
+  copy made on HPC3 overwrites the delivery host's own and suppresses the step 7
+  review prompt.
+
+For a large run, submit step 6 as a batch job rather than running it on a login
+node — a few hundred GB will be throttled or killed there. Compute nodes have
+`/dfs9` and outbound ssh. See [docs/handoff.md](docs/handoff.md) for the full
+reference, including partial-run behaviour and how to recover a transfer that
+landed with the wrong group.
 
 Two things the workflow now decides on its own, with no operator action:
 
@@ -104,9 +155,24 @@ at parse time if the Nextcloud ones are missing:
 | Variable | What it is |
 | --- | --- |
 | `NEXTCLOUD_URL` | Nextcloud instance, e.g. `https://precision.biochem.uci.edu` |
-| `NEXTCLOUD_USER` | Nextcloud account owning the share directory |
+| `NEXTCLOUD_USER` | Nextcloud **API** account owning the share directory |
 | `NEXTCLOUD_PASSWORD` | **App password** for that account (not the login password) |
+| `NEXTCLOUD_SSH_USER` | *Optional.* Login for `occ files:scan` over ssh. Defaults to the OS user running the workflow |
+| `NEXTCLOUD_SSH_HOST` | *Optional.* Full `user@host` (or ssh_config alias), overriding both of the above for ssh |
 | `GMAIL_APP_PASSWORD` | App password for the `email_sender` account |
+
+`NEXTCLOUD_USER` and the ssh login are **not** the same thing. The first is a
+Nextcloud API account — often a shared service user with no Unix account on the
+Nextcloud host and no authorized key there. `rescan_nextcloud` ssh's to that host
+to run `occ files:scan`, and it does so as the OS user by default. Set
+`NEXTCLOUD_SSH_USER` only when that is wrong; if the run stops at a password
+prompt for `<api-user>@<host>`, this is why.
+
+Email addresses are **not** environment variables. `email_sender` /
+`email_recipient` / `email_cc` are config keys in
+`snakemake_config_delivery.yaml`; an `EMAIL_SENDER` exported in `~/.env` is
+ignored. Only `GMAIL_APP_PASSWORD` is read from the environment, and it must be
+the app password for whatever `email_sender` names.
 
 Credentials live in **`~/.env`** — written once, reused by every run directory you
 clone, and outside every repo so they cannot be committed by accident:
