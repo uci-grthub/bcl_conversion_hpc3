@@ -47,8 +47,17 @@ or email rules at all.
 Delivery — share links, order reports and customer emails — is a separate workflow
 that runs on the dragen server, because it needs a Nextcloud instance and a mail
 relay. The run above ends by writing `handoff/manifest.yaml`; rsync the run
-directory to the dragen server and run `bash run_delivery.sh` there. See
-[docs/handoff.md](docs/handoff.md).
+directory to the dragen server and run `bash run_delivery.sh` there.
+
+Use the exact rsync invocation under
+[docs/handoff.md § Running it](docs/handoff.md#running-it) rather than a bare
+`rsync -a`. Its flags are not cosmetic: `--no-g` keeps the delivery host's group
+(without it Nextcloud cannot read the files and every share link resolves to an
+empty folder, while every rule still reports success), and the exclusions keep
+pre-split link stubs and the delivery host's own config from overwriting live
+state. After a delivery run, check that the scan summary in
+`logs/{config_id}/rescan_nextcloud_*.log` shows `Errors 0` and a non-zero `Files`
+count — that is the one failure the workflow cannot detect for you.
 
 Two things the workflow now decides on its own, with no operator action:
 
@@ -104,9 +113,24 @@ at parse time if the Nextcloud ones are missing:
 | Variable | What it is |
 | --- | --- |
 | `NEXTCLOUD_URL` | Nextcloud instance, e.g. `https://precision.biochem.uci.edu` |
-| `NEXTCLOUD_USER` | Nextcloud account owning the share directory |
+| `NEXTCLOUD_USER` | Nextcloud **API** account owning the share directory |
 | `NEXTCLOUD_PASSWORD` | **App password** for that account (not the login password) |
+| `NEXTCLOUD_SSH_USER` | *Optional.* Login for `occ files:scan` over ssh. Defaults to the OS user running the workflow |
+| `NEXTCLOUD_SSH_HOST` | *Optional.* Full `user@host` (or ssh_config alias), overriding both of the above for ssh |
 | `GMAIL_APP_PASSWORD` | App password for the `email_sender` account |
+
+`NEXTCLOUD_USER` and the ssh login are **not** the same thing. The first is a
+Nextcloud API account — often a shared service user with no Unix account on the
+Nextcloud host and no authorized key there. `rescan_nextcloud` ssh's to that host
+to run `occ files:scan`, and it does so as the OS user by default. Set
+`NEXTCLOUD_SSH_USER` only when that is wrong; if the run stops at a password
+prompt for `<api-user>@<host>`, this is why.
+
+Email addresses are **not** environment variables. `email_sender` /
+`email_recipient` / `email_cc` are config keys in
+`snakemake_config_delivery.yaml`; an `EMAIL_SENDER` exported in `~/.env` is
+ignored. Only `GMAIL_APP_PASSWORD` is read from the environment, and it must be
+the app password for whatever `email_sender` names.
 
 Credentials live in **`~/.env`** — written once, reused by every run directory you
 clone, and outside every repo so they cannot be committed by accident:

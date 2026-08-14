@@ -230,6 +230,8 @@ host or baked into the image. Two dependencies remain **system-level**:
 - **`Snakefile.delivery`** - Delivery workflow (dragen server); rules in `src/delivery.smk`
 - **`run_delivery.sh`** - Delivery entry point; runs `scripts/verify_handoff.py` first
 - **`scripts/verify_handoff.py`** - Reports every gap in the rsynced run in one pass
+- **`scripts/find_pixi.sh`** - Resolves an absolute path to pixi, for the non-interactive
+  shells (ssh, cron, batch) where `~/.pixi/bin` is not on PATH
 - **`snakemake_config.yaml`** - Base configuration (paths, threads), shared by both halves
 - **`snakemake_config_project.yaml`** - Project-specific configuration (overrides base settings)
 - **`snakemake_config_delivery.yaml.example`** - Tracked template for the delivery-side
@@ -631,6 +633,34 @@ to delete first.
 **md5 mismatches:**
 - Re-run specific project: `pixi run snakemake --profile profiles/hpc3 -R report_project --cores 1 Reports/{project}/md5sums.txt`
 - Verify FASTQ files weren't modified after generation
+
+**Share links open an empty folder (every rule reported success):**
+- Nextcloud serves the files over SMB as a service account in the *delivery host's*
+  group. `rsync -a` preserves the conversion host's group instead, and succeeds at
+  it whenever a same-named group exists on the destination — so nothing errors, the
+  link is real, and the folder is empty.
+- Check `logs/{config_id}/rescan_nextcloud_*.log`. `Couldn't open SMB directory ...
+  Permission denied` with `Files 0 | Errors 1` is this.
+- Fix: `chgrp -R <delivery-group>` on the run directory, then re-run with
+  `--forcerun rescan_nextcloud`. Deleting the `nextcloud_scan_*.done` markers alone
+  will not re-trigger the scan — `verify_project_links` is already satisfied, so
+  Snakemake has no reason to rebuild them.
+- Prevent it: transfer with `--no-g`, per [docs/handoff.md](docs/handoff.md).
+
+**Delivery stops at a password prompt for `<user>@<nextcloud-host>`:**
+- `rescan_nextcloud` ssh's to the Nextcloud host to run `occ files:scan`. If the
+  prompt names the Nextcloud *API* account, the ssh login is being taken from
+  `NEXTCLOUD_USER`, which is not a Unix account there.
+- Fix: set `NEXTCLOUD_SSH_USER` (or `NEXTCLOUD_SSH_HOST` for a full `user@host`).
+  Current versions default to the OS user, so this should not occur.
+
+**Delivery rebuilds nothing, or publishes empty links, after an rsync:**
+- A run directory predating the conversion/delivery split still holds the old
+  skip-stubs (`Status: SKIPPED`, `link: ''`) and the `Reports/` built from them.
+  Transferred to the delivery host, Snakemake accepts them as satisfying
+  `project_link` and `report_order_id`.
+- Fix: move the link logs and `Reports/` aside there and re-run. Prevent it with
+  the exclusions in [docs/handoff.md](docs/handoff.md).
 
 ## Advanced Features
 
