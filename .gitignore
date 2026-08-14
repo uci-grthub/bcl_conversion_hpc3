@@ -23,6 +23,9 @@ Reports/
 RunInfo.xml
 src/RunInfo_nn.xml
 snakemake_config_*
+# ...but the delivery-config template is tracked, the way .env.example is. The
+# file it is copied to (snakemake_config_delivery.yaml) stays ignored above.
+!snakemake_config_delivery.yaml.example
 scripts/parse-upload-1.2.1.sh
 scripts/parse-upload-1.2.1.py
 .claude/
@@ -51,3 +54,7 @@ gz_md5_54400008.err
 
 # container: shim generated per-run by run_hpc3_container.sh
 .container/
+
+# handoff manifests: per-run output, produced by the conversion workflow and
+# rsynced to the delivery host (see docs/handoff.md)
+handoff/

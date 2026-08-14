@@ -8,27 +8,6 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 from io import StringIO
 
-# NOTE: do NOT declare these as `envvars:`. Snakemake's envvars directive re-exports
-# the values inline into every spawned --mode subprocess command line and echoes that
-# command into .snakemake/log, leaking secrets. The values are read via os.environ
-# below and inherited by child processes from the launching shell, so the directive
-# is unnecessary.
-#
-# Unlike upstream, these are NOT hard-required here: ENABLE_NEXTCLOUD/SEND_EMAILS
-# (below) auto-disable when the corresponding credentials are absent, which is the
-# default/expected state on HPC3 (no Nextcloud instance, no mail relay).
-NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "")
-NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
-NEXTCLOUD_PASSWORD = os.environ.get("NEXTCLOUD_PASSWORD", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-
-# SSH target for `occ files:scan` on the Nextcloud host. Defaults to the same
-# user/host as NEXTCLOUD_URL; override via env for a different admin account.
-NEXTCLOUD_SSH_HOST = os.environ.get("NEXTCLOUD_SSH_HOST")
-if NEXTCLOUD_SSH_HOST is None:
-    from urllib.parse import urlparse as _urlparse
-    NEXTCLOUD_SSH_HOST = f"{NEXTCLOUD_USER}@{_urlparse(NEXTCLOUD_URL).hostname}"
-
 configfile: "snakemake_config.yaml"
 
 # Load project-specific config if it exists (higher priority than default)
@@ -81,38 +60,11 @@ SCRATCH_DIR = config.get("scratch_dir", "")
 # emits index reads as FASTQs (no index-based demultiplexing). Default: false.
 NO_DEMUX = bool(config.get("no_demux", False))
 
-NEXTCLOUD_DIR_NAME = config.get("nextcloud_dir_name", "DragenExt3")
-NEXTCLOUD_DIR_PATH = config.get("nextcloud_dir_path", "nextcloud3")
-
-EMAIL_SENDER = config.get("email_sender", "kstachel@uci.edu")
-EMAIL_RECIPIENT = config.get("email_recipient", "kstachel@uci.edu")
-EMAIL_CC = config.get("email_cc", "kstachel@uci.edu")
-SEND_EMAILS = config.get("send_emails", True)
 LOW_READS_THRESHOLD = config.get("low_reads_threshold", 1_000)
 
-def _cfg_truthy(value):
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-# Nextcloud operations can be disabled explicitly via config and are also
-# auto-disabled when required Nextcloud environment variables are missing
-# (common on HPC3 where no Nextcloud instance is available).
-ENABLE_NEXTCLOUD = (
-    _cfg_truthy(config.get("enable_nextcloud", True))
-    and bool(str(NEXTCLOUD_URL).strip())
-    and bool(str(NEXTCLOUD_USER).strip())
-    and bool(str(NEXTCLOUD_PASSWORD).strip())
-)
-
-# Rule: rsync project to external drive specified in config.yaml
-EXTERNAL_DRIVE_PATH = config.get("external_drive_path", None)
-
-# Skip rsync if working directory is on /mnt/ path (already on external drive)
-WORKING_DIR = os.getcwd()
-SKIP_RSYNC = WORKING_DIR.startswith("/mnt/")
+# Where this workflow writes everything the delivery workflow needs to know about
+# the run. See src/handoff.smk and docs/handoff.md.
+HANDOFF_DIR = "handoff"
 
 include: "src/workflow_defs.smk"
 
@@ -512,12 +464,8 @@ if PROJECT_ORDER_ID:
             # Add empty list for order_ids not yet in configs
             ORDER_ID_CONFIGS[oid] = []
 
-ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ORDER_ID_CONFIGS.keys()]
-ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ORDER_ID_CONFIGS.keys()]
 
 PROJECT_LANES = get_project_lane_pairs(SAMPLE_SHEETS_DICT)
-PROJECT_LANE_REPORTS = [f"Reports/{p}/lane{l}/index.html" for p, l in PROJECT_LANES]
-PROJECT_LANE_MD5S = [f"Reports/{p}/lane{l}/md5sums.txt" for p, l in PROJECT_LANES]
 
 # NOTE: do not name the loop variable `config` here. Python leaks loop variables into
 # the enclosing scope, so that would rebind Snakemake's global `config` dict to the last
@@ -592,8 +540,6 @@ ACTIVE_ORDER_IDS = [
     oid for oid, projects in ORDER_ID_CONFIGS.items()
     if set(projects or []).intersection(_projects_in_pairs)
 ]
-ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
-ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
 
 # Exclude order IDs (and their projects) from all targets in rule all.
 EXCLUDE_ORDER_IDS = set(config.get("exclude_order_ids", []))
@@ -602,8 +548,6 @@ if EXCLUDE_ORDER_IDS:
     for _oid in EXCLUDE_ORDER_IDS:
         _exclude_projects.update(ORDER_ID_CONFIGS.pop(_oid, []))
     ACTIVE_ORDER_IDS = [oid for oid in ACTIVE_ORDER_IDS if oid not in EXCLUDE_ORDER_IDS]
-    ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
-    ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
     CONFIG_PROJECT_PAIRS = [(c, p) for c, p in CONFIG_PROJECT_PAIRS if p not in _exclude_projects]
     PROJECTS = [p for p in PROJECTS if p not in _exclude_projects]
 
@@ -629,7 +573,6 @@ FLEXBAR_CONFIG_BY_ORDER_ID = {}  # order_id -> [config_id, ...]
 for _k, _v in FLEXBAR_ORDER_ID_MAP.items():
     FLEXBAR_CONFIG_BY_ORDER_ID.setdefault(_v, []).append(_k)
 FLEXBAR_ACTIVE_ORDER_IDS = list(FLEXBAR_ORDER_ID_MAP.values())
-FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_ACTIVE_ORDER_IDS]
 
 # Build flexbar renaming map: config_id -> list of row dicts (one per barcode/sample).
 # This allows flexbar-demuxed samples to flow through fastp and report_order_id.
@@ -699,11 +642,8 @@ for _fconfig, _frows in FLEXBAR_CONFIG_RENAMING_MAP.items():
 
 # Integrated flexbar orders are now handled by report_order_id; remove from FLEXBAR_ACTIVE_ORDER_IDS
 FLEXBAR_ACTIVE_ORDER_IDS = [oid for oid in FLEXBAR_ACTIVE_ORDER_IDS if oid not in ACTIVE_ORDER_IDS]
-FLEXBAR_ORDER_REPORTS = [f"Reports/order_{oid}/index.html" for oid in FLEXBAR_ACTIVE_ORDER_IDS]
 
 # Rebuild order-level targets to include newly added flexbar orders
-ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
-ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
 
 # Build fqtk order ID map: config_id -> order_id
 # fqtk projects appear in PROJECT_LOOKUP for their lane but not in any BCL Convert samplesheet.
@@ -776,538 +716,41 @@ for _qconfig, _qrows in FQTK_CONFIG_RENAMING_MAP.items():
     if _qorder_id not in ACTIVE_ORDER_IDS:
         ACTIVE_ORDER_IDS.append(_qorder_id)
 
-# Rebuild order-level targets to include newly added fqtk orders
-ORDER_ID_REPORTS = [f"Reports/order_{oid}/index.html" for oid in ACTIVE_ORDER_IDS]
-ORDER_ID_MD5S = [f"Reports/order_{oid}/md5sums.txt" for oid in ACTIVE_ORDER_IDS]
-
 # print("CONFIG_PROJECT_PAIRS:", CONFIG_PROJECT_PAIRS)
 
+# This is the conversion half of the pipeline. Nextcloud share links, order
+# reports and customer emails live in Snakefile.delivery and run on the dragen
+# server; see docs/handoff.md.
 rule all:
     input:
         expand("results/{config_id}/fastp_plots_{config_id}.done", config_id=CONFIG_IDS),
         expand(".output/{config_id}/.done", config_id=CONFIG_IDS),
         expand("output/{config_id}/{project}/md5sums.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
-        ORDER_ID_REPORTS,
-        ORDER_ID_MD5S,
         expand("results/lane{lane}/fastp_plots_summary_lane{lane}.done", lane=detected_lanes),
         expand("results/undetermined_indices/{config_id}.csv", config_id=CONFIG_IDS),
         expand("results/undetermined_indices/{config_id}_rc.csv", config_id=CONFIG_IDS),
         expand("results/{config_id}/{project}/read_counts_{project}.csv", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
-        # expand("logs/{config_id}/project_link_{config_id}_{project}.log", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
-        expand("logs/{config_id}/project_links_{config_id}---{project}.yaml", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         f"results/{LIBRARY}-count.csv",
-        f"Reports/{LIBRARY}_read_counts_email.done",
-        expand("Reports/order_{order_id}/email_sent.done", order_id=ACTIVE_ORDER_IDS + FLEXBAR_ACTIVE_ORDER_IDS),
         expand("output/{config_id}/{project}/.low_reads_checked", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         expand("output/{config_id}/{project}/.plots_copied", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
-        expand("logs/{config_id}/verify_project_link_{config_id}---{project}.txt", zip, config_id=[c for c, p in CONFIG_PROJECT_PAIRS], project=[p for c, p in CONFIG_PROJECT_PAIRS]),
         ([VALIDATION_XLSX] if VALIDATION_XLSX else []),
         expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
         expand("results/{config_id}/fqtk_{config_id}.done", config_id=FQTK_CONFIGS),
-        # "logs/rsync_to_external_drive.done",
+        # Written last: its presence is what tells the delivery host the run is complete.
+        f"{HANDOFF_DIR}/manifest.yaml",
         # "results/check_index_rc_swap.txt"
-    benchmark:
-        "benchmarks/all.bench"
+    # No `benchmark:` here, and none on any other target-only rule. Snakemake
+    # treats the benchmark file as an output, so a leftover benchmarks/all.bench
+    # from an earlier run makes the whole target look up to date and the run a
+    # silent no-op.
+
+# Included after `rule all` so that stays the default target: Snakemake takes the
+# first rule it parses, and an included file's rules count.
+include: "src/handoff.smk"
 
 rule bcl_convert_only:
     input:
         expand(".output/{config_id}/.done", config_id=CONFIG_IDS)
-    benchmark:
-        "benchmarks/bcl_convert_only.bench"
-
-rule report_order_id:
-    input:
-        fastp_plots = lambda wildcards: get_order_id_plot_targets(wildcards.order_id),
-        md5_files = lambda wildcards: [
-            f"output/{c}/{p}/md5sums.txt" for c, p in CONFIG_PROJECT_PAIRS
-            if p in ORDER_ID_CONFIGS.get(wildcards.order_id, [])
-            and (
-                not ORDER_ID_TO_LANE.get(wildcards.order_id)
-                or (re.match(r'lane(\d+)', c) and int(re.match(r'lane(\d+)', c).group(1)) in ORDER_ID_TO_LANE.get(wildcards.order_id, []))
-            )
-        ],
-        links_yamls = lambda wildcards: [
-            f"logs/{c}/project_links_{c}---{p}.yaml"
-            for c, p in CONFIG_PROJECT_PAIRS
-            if p in ORDER_ID_CONFIGS.get(wildcards.order_id, [])
-            and (
-                not ORDER_ID_TO_LANE.get(wildcards.order_id)
-                or (re.match(r'lane(\d+)', c) and int(re.match(r'lane(\d+)', c).group(1)) in ORDER_ID_TO_LANE.get(wildcards.order_id, []))
-            )
-        ]
-    output:
-        html = "Reports/order_{order_id}/index.html",
-        md5 = "Reports/order_{order_id}/md5sums.txt",
-        pdf = "Reports/order_{order_id}/Download_Instructions.pdf"
-    log:
-        "logs/report_order_{order_id}.log"
-    benchmark:
-        "benchmarks/report_order_id_{order_id}.bench"
-    params:
-        order_id = "{order_id}",
-        output_base = "output",
-        fastp_plots_base = "results",
-        fastp_base = "results",
-        report_dir = "Reports/order_{order_id}"
-    run:
-        import subprocess
-        import sys
-        import os
-        sys.path.insert(0, workflow.basedir)
-        
-        import yaml as _yaml
-
-        def _as_file_list(value):
-            """Normalize Snakemake named inputs to a list of file paths.
-
-            With a single upstream file, named inputs can be exposed as a scalar path.
-            """
-            if value is None:
-                return []
-            if isinstance(value, (str, os.PathLike)):
-                return [str(value)]
-            try:
-                return [str(v) for v in value]
-            except TypeError:
-                return [str(value)]
-
-        order_id = params.order_id
-        report_dir = params.report_dir
-        log_file = log[0]
-
-        # Determine lane filter: if this order_id maps to a single lane, filter by it
-        _lanes_for_order = ORDER_ID_TO_LANE.get(order_id, [])
-        lane_arg = ",".join(str(l) for l in _lanes_for_order) if _lanes_for_order else "None"
-
-        os.makedirs(report_dir, exist_ok=True)
-
-        # Merge individual per-project yaml files into a single dict
-        merged_links = {}
-        links_yaml_files = _as_file_list(input.links_yamls)
-        if not links_yaml_files:
-            # Fallback: glob for yaml files whose name encodes this order_id.
-            # This handles Snakemake subprocess mode where named input lambdas
-            # may resolve to [] even though the files exist on disk.
-            import glob as _glob
-            links_yaml_files = sorted(_glob.glob(f"logs/**/project_links_*---*_{order_id}_*.yaml", recursive=True))
-        for yaml_path in links_yaml_files:
-            if os.path.exists(yaml_path):
-                with open(yaml_path) as _yf:
-                    _data = _yaml.safe_load(_yf) or {}
-                for _proj, _proj_data in _data.items():
-                    for _cfg, _cfg_data in _proj_data.items():
-                        # Only include configs that have an entry for this order_id
-                        if isinstance(_cfg_data, dict) and order_id not in _cfg_data:
-                            continue
-                        if _proj not in merged_links:
-                            merged_links[_proj] = {}
-                        merged_links[_proj][_cfg] = _cfg_data
-        merged_yaml_path = os.path.join(report_dir, "_merged_links.yaml")
-        with open(merged_yaml_path, 'w') as _yf:
-            _yaml.dump(merged_links, _yf, default_flow_style=False)
-
-        # Derive projects from merged input yamls (robust to subprocess re-evaluation
-        # of ORDER_ID_CONFIGS without the original --configfile)
-        projects = sorted(merged_links.keys())
-
-        # Build renamed→original project name mapping for all projects in this order_id.
-        # generate_report.py uses this to display original metadata names in the HTML.
-        import json as _json
-        project_name_map = {}
-        for _proj in projects:
-            _orig = next(
-                (p for cid, p in _CONFIG_PROJECT_PAIRS_RAW
-                 if PROJECT_RENAME_MAP.get((cid, p), p) == _proj),
-                None
-            )
-            # For multi-group projects, PROJECT_RENAME_MAP only stores the
-            # last-written entry so the forward scan above may miss earlier
-            # groups.  Fall back to the inverse map which has an entry for
-            # every per-group renamed folder name.
-            if _orig is None:
-                _orig = next(
-                    (orig for (_, _rn), orig in PROJECT_RENAME_MAP_INV.items()
-                     if _rn == _proj),
-                    _proj
-                )
-            project_name_map[_proj] = _orig
-
-        # Flexbar/fqtk projects are injected into CONFIG_PROJECT_PAIRS after the main
-        # rename map is built, so they are not present in _CONFIG_PROJECT_PAIRS_RAW.
-        # Add explicit renamed->original mappings here so generate_report.py can
-        # find the fastp JSONs under the original project directory.
-        for _fconfig in FLEXBAR_CONFIGS:
-            _forig = FLEXBAR_ORDER_ID_PROJECT.get(_fconfig)
-            if not _forig:
-                continue
-            _frenamed = PROJECT_RENAME_MAP.get((_fconfig, _forig), _forig)
-            if _frenamed in projects:
-                project_name_map[_frenamed] = _forig
-        for _qconfig in FQTK_CONFIGS:
-            _qorig = FQTK_ORDER_ID_PROJECT.get(_qconfig)
-            if not _qorig:
-                continue
-            _qrenamed = PROJECT_RENAME_MAP.get((_qconfig, _qorig), _qorig)
-            if _qrenamed in projects:
-                project_name_map[_qrenamed] = _qorig
-        project_name_map_json = _json.dumps(project_name_map)
-
-        # Open log file
-        with open(log_file, 'w') as lf:
-            lf.write(f"Generating report for order_id: {order_id}\n")
-            lf.write(f"Link YAML inputs: {links_yaml_files}\n")
-            lf.write(f"Projects: {projects}\n")
-            lf.write(f"Project name map: {project_name_map}\n\n")
-
-        # Generate report for each project in this order_id
-        for project in projects:
-            orig_project = project_name_map.get(project, project)
-
-            # Get fastq links for this project in this order_id
-            fastq_links = get_project_links_from_yaml(merged_yaml_path, project, lane=None, order_id=order_id)
-
-            # Call generate_report.py for this project
-            cmd = [
-                "python3", "src/generate_report.py",
-                project,
-                params.output_base,
-                params.fastp_plots_base,
-                params.fastp_base,
-                report_dir,
-                fastq_links,
-                lane_arg,  # lane_filter
-                merged_yaml_path,
-                order_id,
-                LIBRARY,  # library_name
-                str(config.get('plots_total_width', 900)),
-                str(config.get('plots_quality', 35)),
-                orig_project,          # orig_project_name for fastp lookups
-                project_name_map_json, # full renamed→original map for report display
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            with open(log_file, 'a') as f:
-                f.write(f"\n=== Report generation for project {project} ===\n")
-                f.write(result.stdout)
-                if result.stderr:
-                    f.write(f"STDERR: {result.stderr}\n")
-        
-        # Consolidate md5 sums from all projects in this order_id
-        all_md5s = []
-        md5_input_files = _as_file_list(input.md5_files)
-        for md5_file in md5_input_files:
-            try:
-                with open(md5_file, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            all_md5s.append(line)
-            except Exception as e:
-                with open(log_file, 'a') as f:
-                    f.write(f"Warning: Could not read {md5_file}: {e}\n")
-        
-        # Sort consolidated md5s by filename
-        all_md5s.sort(key=lambda x: x.split()[1] if len(x.split()) > 1 else x)
-        
-        # Write consolidated md5sums.txt
-        md5_file = os.path.join(report_dir, "md5sums.txt")
-        with open(md5_file, 'w') as f:
-            for line in all_md5s:
-                f.write(line + '\n')
-        
-        with open(log_file, 'a') as f:
-            f.write(f"\nConsolidated {len(all_md5s)} md5 entries into {md5_file}\n")
-
-        # Always generate Download Instructions PDF so rule outputs are complete,
-        # even when project discovery returns an empty set.
-        pdf_file = os.path.join(report_dir, "Download_Instructions.pdf")
-        pdf_cmd = ["python3", "src/generate_download_instructions_pdf.py", pdf_file]
-        pdf_result = subprocess.run(pdf_cmd, capture_output=True, text=True)
-        with open(log_file, 'a') as f:
-            f.write("\n=== Download Instructions PDF generation ===\n")
-            f.write(pdf_result.stdout)
-            if pdf_result.stderr:
-                f.write(f"PDF STDERR: {pdf_result.stderr}\n")
-        if pdf_result.returncode != 0:
-            raise RuntimeError(f"PDF generation failed for order {order_id}")
-
-        # Ensure HTML output exists if no per-project report was generated.
-        if not os.path.exists(output.html):
-            with open(output.html, 'w') as f:
-                f.write(f"<html><body><h1>Order {order_id}</h1><p>No project report entries were generated.</p></body></html>\n")
-
-rule flexbar_project_link:
-    """Create a Nextcloud share for the flexbar output directory and record the link."""
-    input:
-        done = "results/{config_id}/flexbar_{config_id}.done"
-    output:
-        link_log  = "logs/{config_id}/flexbar_project_link_{config_id}.log",
-        yaml_file = "logs/{config_id}/flexbar_project_links_{config_id}.yaml"
-    benchmark:
-        "benchmarks/flexbar_project_link_{config_id}.bench"
-    wildcard_constraints:
-        config_id = "[^/]+"
-    resources:
-        serial_operation = 1
-    params:
-        work_dir  = os.getcwd(),
-        order_id  = lambda wildcards: FLEXBAR_ORDER_ID_MAP.get(wildcards.config_id, ""),
-        project   = lambda wildcards: FLEXBAR_ORDER_ID_PROJECT.get(wildcards.config_id, "flexbar"),
-    run:
-        import traceback, subprocess, time, urllib.parse, re, os, shlex
-        from pathlib import Path
-        import yaml as _yaml
-
-        config_id = wildcards.config_id
-        order_id  = params.order_id
-        project   = params.project
-        fastq_dir = f"output/{config_id}/flexbar"
-        log_file  = output.link_log
-        yaml_file = output.yaml_file
-
-        if not str(order_id).strip():
-            msg = (
-                f"Missing order_id for flexbar project link generation "
-                f"(config_id={config_id}, project={project}). "
-                "Check metadata order-id mapping for this config."
-            )
-            Path(log_file).write_text(msg + "\n")
-            raise RuntimeError(msg)
-
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        yaml_data = {project: {config_id: {}}}
-
-        if not ENABLE_NEXTCLOUD:
-            with open(log_file, 'w') as f:
-                f.write("Status: SKIPPED\n")
-                f.write("Reason: Nextcloud sharing disabled for this workflow run.\n")
-                f.write(f"Project: {project}\nConfig ID: {config_id}\nOrder ID: {order_id}\n")
-            yaml_data[project][config_id][order_id] = {"link": "", "group": "flexbar"}
-            with open(yaml_file, 'w') as yf:
-                _yaml.dump(yaml_data, yf, default_flow_style=False)
-            return
-
-        def extract_share_url(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<url>(.*?)</url>', xml_text)
-            return m.group(1) if m else None
-
-        def extract_share_token(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<token>(.*?)</token>', xml_text)
-            return m.group(1) if m else None
-
-        def extract_share_owner(xml_text):
-            if not xml_text: return None
-            for pattern in [r'<uid_owner>(.*?)</uid_owner>', r'<owner>(.*?)</owner>']:
-                m = re.search(pattern, xml_text)
-                if m: return m.group(1)
-            return None
-
-        def extract_internal_path(xml_text):
-            if not xml_text: return None
-            for pattern in [r'<path>(.*?)</path>', r'<folder>(.*?)</folder>']:
-                m = re.search(pattern, xml_text)
-                if m: return m.group(1)
-            return None
-
-        def fetch_existing_share(path):
-            encoded = urllib.parse.quote(path, safe="/")
-            cmd = ['curl', '-s', '-X', 'GET',
-                   '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
-                   '-H', 'OCS-APIRequest: true',
-                   f'{NEXTCLOUD_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares?path={encoded}&reshares=true']
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
-
-        executed_cmds = []
-        try:
-            if os.path.isdir(fastq_dir):
-                abs_path = os.path.abspath(fastq_dir)
-                nc_path = f"/{NEXTCLOUD_DIR_NAME}/" + abs_path.split(f"/{NEXTCLOUD_DIR_PATH}/", 1)[1] \
-                          if f"/{NEXTCLOUD_DIR_PATH}/" in abs_path else abs_path
-
-                max_retries, retry_count = 30, 0
-                share_url = share_token = share_owner = share_internal_path = None
-                rate_limited, last_error = False, None
-
-                while retry_count < max_retries and not share_url:
-                    retry_count += 1
-                    wait_time = min(3 * (2 ** (retry_count - 1)), 60)
-                    if rate_limited: time.sleep(10)
-                    try:
-                        cmd = ['curl', '-s', '-w', '\nHTTP_CODE:%{http_code}',
-                               '-X', 'POST',
-                               '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
-                               '-H', 'OCS-APIRequest: true',
-                               '-d', f'path={nc_path}', '-d', 'shareType=3',
-                               f'{NEXTCLOUD_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares']
-                        executed_cmds.append(cmd)
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                        lines = result.stdout.split('\n')
-                        http_code = next((l.split(':')[1] for l in lines if l.startswith('HTTP_CODE:')), None)
-                        share_xml = '\n'.join(l for l in lines if not l.startswith('HTTP_CODE:'))
-                        if http_code == '429':
-                            rate_limited = True; last_error = f"Rate limited (HTTP 429)"
-                        elif http_code in ('200', '201'):
-                            share_url   = extract_share_url(share_xml)
-                            share_token = extract_share_token(share_xml)
-                            if share_url and share_token:
-                                share_owner         = extract_share_owner(share_xml)
-                                share_internal_path = extract_internal_path(share_xml)
-                                break
-                            else:
-                                last_error = f"Valid response but could not extract URL/token (HTTP {http_code})"
-                        elif http_code in ('400', '403'):
-                            share_xml   = fetch_existing_share(nc_path)
-                            share_url   = extract_share_url(share_xml)
-                            share_token = extract_share_token(share_xml)
-                            if share_url and share_token:
-                                share_owner         = extract_share_owner(share_xml)
-                                share_internal_path = extract_internal_path(share_xml)
-                                break
-                            else:
-                                last_error = f"Share may exist but could not fetch via GET (HTTP {http_code})"
-                        else:
-                            last_error = f"HTTP {http_code}: {share_xml[:100] if share_xml else 'No response'}"
-                        if retry_count < max_retries and not share_url:
-                            time.sleep(wait_time)
-                    except subprocess.TimeoutExpired:
-                        last_error = "Request timed out (30 seconds)"
-                        if retry_count < max_retries: time.sleep(wait_time)
-                    except Exception as e:
-                        last_error = f"Exception: {str(e)}"
-                        if retry_count < max_retries: time.sleep(wait_time)
-
-                with open(log_file, 'w') as f:
-                    f.write(f"Project: {project}\nConfig ID: {config_id}\nOrder ID: {order_id}\n")
-                    try: f.write(f"NC_PATH: {nc_path}\n")
-                    except Exception: pass
-                    if share_url and share_token:
-                        f.write(f"Status: SUCCESS\nBrowser URL: {share_url}\n")
-                        f.write(f"WebDAV URL: {NEXTCLOUD_URL}/public.php/dav/\nWebDAV Token: {share_token}\n")
-                        if share_owner:         f.write(f"NC_OWNER: {share_owner}\n")
-                        if share_internal_path: f.write(f"NC_INTERNAL_PATH: {share_internal_path}\n")
-                        yaml_data[project][config_id][order_id] = {"link": share_url, "group": "flexbar"}
-                    else:
-                        f.write(f"Status: FAILED\nReason: {last_error}\nRetries: {retry_count}/{max_retries}\n")
-                    if executed_cmds:
-                        f.write("\nCommands executed:\n")
-                        for c in executed_cmds:
-                            try:    f.write(shlex.join(c) + "\n")
-                            except: f.write(' '.join(shlex.quote(p) for p in c) + "\n")
-            else:
-                Path(log_file).write_text(f"Directory {fastq_dir} not found.")
-        except Exception as e:
-            Path(log_file).write_text(f"Error: {str(e)}\n{traceback.format_exc()}")
-
-        Path(log_file).touch(exist_ok=True)
-        with open(yaml_file, 'w') as yf:
-            _yaml.dump(yaml_data, yf, default_flow_style=False)
-
-
-        # Generate Download Instructions PDF
-        pdf_cmd = ["python3", "src/generate_download_instructions_pdf.py",
-                   os.path.join(report_dir, "Download_Instructions.pdf")]
-        pdf_result = subprocess.run(pdf_cmd, capture_output=True, text=True)
-        with open(log_file, 'a') as f:
-            f.write(pdf_result.stdout)
-            if pdf_result.stderr:
-                f.write(f"PDF STDERR: {pdf_result.stderr}\n")
-
-
-rule collect_flexbar_report_extras:
-    input:
-        done = "results/{config_id}/flexbar_{config_id}.done"
-    output:
-        flexbar_log = "Reports/order_{order_id}/flexbarOut_{config_id}.log",
-        barcodes    = "Reports/order_{order_id}/flexbar_barcodes_{config_id}.txt",
-        filesizes   = "Reports/order_{order_id}/flexbar_filesizes_{config_id}.txt"
-    wildcard_constraints:
-        config_id = "[^/]+"
-    run:
-        import shutil, os, re
-        config_id = wildcards.config_id
-        os.makedirs(f"Reports/order_{wildcards.order_id}", exist_ok=True)
-        shutil.copy(f"output/{config_id}/flexbar/flexbarOut.log", output.flexbar_log)
-
-        # Build sample_name -> renamed stem mapping from FLEXBAR_CONFIG_RENAMING_MAP
-        name_map = {}
-        for _row in FLEXBAR_CONFIG_RENAMING_MAP.get(config_id, []):
-            _sname = _row['Sample_Name']
-            _idx1 = str(_row.get('index', '') or '')
-            _idx2 = str(_row.get('index2', '') or '')
-            _bc = f"{_idx1}-{_idx2}" if _idx2 and _idx2.lower() != 'nan' else _idx1
-            name_map[_sname] = f"{_row['Run']}-L{_row['Lane']}-G{_row['Group']}-{_row['Position']}-{_bc}"
-
-        # Write barcodes file with renamed sample names in column 1
-        with open(f"metadata/flexbar_barcodes_{config_id}.txt") as _fin, \
-             open(output.barcodes, 'w') as _fout:
-            for _line in _fin:
-                _parts = _line.rstrip('\n').split('\t')
-                if _parts and _parts[0].strip() in name_map:
-                    _parts[0] = name_map[_parts[0].strip()]
-                _fout.write('\t'.join(_parts) + '\n')
-
-        # Write filesizes file with renamed FASTQ names
-        with open(f"output/{config_id}/flexbar/size.txt") as _fin, \
-             open(output.filesizes, 'w') as _fout:
-            for _line in _fin:
-                _parts = _line.rstrip('\n').split('\t')
-                if len(_parts) >= 2:
-                    _m = re.match(r'flexbarOut_barcode_(.+?)(_R2)?\.fastq\.gz$', _parts[1].strip())
-                    if _m:
-                        _sname, _r2 = _m.group(1), _m.group(2)
-                        _rtype = 'R2' if _r2 else 'R1'
-                        if _sname in name_map:
-                            _parts[1] = f"{name_map[_sname]}-{_rtype}.fastq.gz"
-                _fout.write('\t'.join(_parts) + '\n')
-
-
-rule send_order_email:
-    input:
-        html = "Reports/order_{order_id}/index.html",
-        md5  = "Reports/order_{order_id}/md5sums.txt",
-        pdf  = "Reports/order_{order_id}/Download_Instructions.pdf",
-        flexbar_extras = lambda wildcards: [
-            f"Reports/order_{wildcards.order_id}/{prefix}_{cid}.{ext}"
-            for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(wildcards.order_id, [])
-            for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]
-        ]
-    output:
-        touch("Reports/order_{order_id}/email_sent.done")
-    log:
-        "logs/send_order_email_{order_id}.log"
-    benchmark:
-        "benchmarks/send_order_email_{order_id}.bench"
-    params:
-        script   = "src/send_email.py",
-        sender   = EMAIL_SENDER,
-        receiver = EMAIL_RECIPIENT,
-        cc_email = EMAIL_CC,
-        subject  = lambda wildcards: f"Sequencing Report for Order {wildcards.order_id}"
-    run:
-        import subprocess, os
-        if not SEND_EMAILS:
-            with open(log[0], "w") as logf:
-                logf.write("send_emails=false; skipping email send.\n")
-        else:
-            order_id = wildcards.order_id
-            attachments = f"{input.md5};{input.pdf}"
-            for cid in FLEXBAR_CONFIG_BY_ORDER_ID.get(order_id, []):
-                for prefix, ext in [("flexbarOut", "log"), ("flexbar_barcodes", "txt"), ("flexbar_filesizes", "txt")]:
-                    extra = f"Reports/order_{order_id}/{prefix}_{cid}.{ext}"
-                    if os.path.exists(extra):
-                        attachments += f";{extra}"
-            cmd = [
-                "python3", "src/send_email_retry.py",
-                params.script, params.sender, params.receiver,
-                params.subject, input.html, attachments,
-                params.cc_email, order_id
-            ]
-            with open(log[0], "w") as logf:
-                result = subprocess.run(cmd, stdout=logf, stderr=logf)
-            if result.returncode != 0:
-                raise RuntimeError(f"Email send failed (see {log[0]})")
 
 rule fastp_sample:
     input:
@@ -1967,39 +1410,6 @@ rule compile_read_counts:
             writer = csv.writer(out_handle)
             writer.writerow(header)
             writer.writerows(rows)
-
-rule send_read_counts_email:
-    input:
-        csv = f"results/{LIBRARY}-count.csv",
-        order_reports = ORDER_ID_REPORTS
-    output:
-        touch(f"Reports/{LIBRARY}_read_counts_email.done")
-    log:
-        f"logs/send_read_counts_email.log"
-    benchmark:
-        "benchmarks/send_read_counts_email.bench"
-    priority: 80
-    params:
-        script = "src/send_email.py",
-        sender = EMAIL_SENDER,
-        receiver = EMAIL_RECIPIENT,
-        subject = f"Read counts for {LIBRARY}",
-        body = lambda wildcards: f"Attached: per-lane read counts for {LIBRARY}.",
-        cc_email = EMAIL_CC
-    run:
-        import subprocess
-        if not SEND_EMAILS:
-            with open(log[0], "w") as logf:
-                logf.write("send_emails=false; skipping email send.\n")
-        else:
-            with open(log[0], "w") as logf:
-                result = subprocess.run(
-                    ["python3", params.script, params.sender, params.receiver,
-                     params.subject, params.body, input.csv, params.cc_email],
-                    stdout=logf, stderr=logf
-                )
-            if result.returncode != 0:
-                raise RuntimeError(f"Email send failed (see {log[0]})")
 
 rule fastp_plots_lane:
     input:
@@ -3317,121 +2727,112 @@ rule bcl_project_done:
                 print(f"Removed {removed} index FASTQ file(s) from {proj_dir}")
 
 rule check_low_reads:
-    """Send an alert email if any sample in a project has zero or low reads after bcl_project_done.
+    """Flag samples with zero or low reads and record an alert payload for delivery.
 
     Reads Demultiplex_Stats.csv for the config_id and flags any sample belonging
-    to this project whose read count is below LOW_READS_THRESHOLD.  The sentinel
-    is always created so the pipeline is never blocked; the email is optional and
-    is gated on SEND_EMAILS (disabled on HPC3 where no mail relay is configured).
+    to this project whose read count is below LOW_READS_THRESHOLD.  Detection
+    happens here because it needs the demultiplex stats; sending needs a mail
+    relay, which HPC3 does not have, so the alert is written as JSON and
+    send_low_reads_alerts (delivery side) delivers it.  The JSON is always
+    written -- an empty `samples` list means "checked, nothing to report" -- so a
+    missing payload on the delivery host is a real gap, not a quiet pass.
     """
     input:
         project_done = "output/{config_id}/{project}/.project_done"
     output:
-        sentinel = touch("output/{config_id}/{project}/.low_reads_checked")
+        sentinel = touch("output/{config_id}/{project}/.low_reads_checked"),
+        alert = "handoff/alerts/{config_id}---{project}.json"
     wildcard_constraints:
         config_id = "[^/]+",
         project   = "[^/]+"
     priority: 99
     params:
-        sender    = EMAIL_SENDER,
-        receiver  = EMAIL_RECIPIENT,
-        cc        = EMAIL_CC,
         threshold = LOW_READS_THRESHOLD,
         library   = LIBRARY,
     log:
         "logs/{config_id}/check_low_reads_{config_id}_{project}.log"
     run:
-        import os, subprocess, sys
+        import os, json
         import pandas as pd
 
         config_id = wildcards.config_id
         project   = wildcards.project
         threshold = int(params.threshold)
 
-        log_fh = open(log[0], "w")
-        def _log(msg):
-            print(msg, file=log_fh, flush=True)
+        payload = {
+            "config_id": config_id,
+            "project": project,
+            "threshold": threshold,
+            "samples": [],
+            "subject": "",
+            "body": "",
+        }
 
-        demux_path = os.path.join("output", config_id, "Reports", "Demultiplex_Stats.csv")
-        if not os.path.exists(demux_path):
-            _log(f"Demultiplex_Stats.csv not found at {demux_path}; skipping low-reads check.")
-            log_fh.close()
-        else:
-            try:
-                df = pd.read_csv(demux_path)
-            except Exception as e:
-                _log(f"Could not read {demux_path}: {e}")
-                log_fh.close()
+        with open(log[0], "w") as log_fh:
+            def _log(msg):
+                print(msg, file=log_fh, flush=True)
+
+            demux_path = os.path.join("output", config_id, "Reports", "Demultiplex_Stats.csv")
+            proj_rows = None
+            if not os.path.exists(demux_path):
+                _log(f"Demultiplex_Stats.csv not found at {demux_path}; skipping low-reads check.")
             else:
-                # Accept both old Sample_Project and new-name project
-                target_projects = {project}
-                for (cid, old_p), new_p in PROJECT_RENAME_MAP.items():
-                    if cid == config_id:
+                try:
+                    df = pd.read_csv(demux_path)
+                except (OSError, pd.errors.ParserError) as e:
+                    _log(f"Could not read {demux_path}: {e}")
+                else:
+                    # Accept both the original Sample_Project and the renamed folder name.
+                    target_projects = {project}
+                    for (cid, old_p), new_p in PROJECT_RENAME_MAP.items():
+                        if cid != config_id:
+                            continue
                         if old_p == project:
                             target_projects.add(new_p)
                         elif new_p == project:
                             target_projects.add(old_p)
 
-                if "Sample_Project" not in df.columns or "# Reads" not in df.columns:
-                    _log(f"Expected columns missing in {demux_path}; skipping.")
-                    log_fh.close()
-                else:
-                    proj_rows = df[df["Sample_Project"].astype(str).isin(target_projects)].copy()
-                    proj_rows["_reads"] = pd.to_numeric(proj_rows["# Reads"], errors="coerce").fillna(0).astype(int)
-                    low = proj_rows[proj_rows["_reads"] < threshold]
-
-                    if low.empty:
-                        _log(f"All samples in {project} ({config_id}) have >= {threshold} reads. No alert needed.")
-                        log_fh.close()
+                    if "Sample_Project" not in df.columns or "# Reads" not in df.columns:
+                        _log(f"Expected columns missing in {demux_path}; skipping.")
                     else:
-                        lines = []
-                        for _, row in low.iterrows():
-                            sid   = str(row.get("SampleID", row.get("Sample_ID", "unknown"))).strip()
-                            reads = int(row["_reads"])
-                            lines.append(f"  {sid}: {reads:,} reads")
-                        sample_list = "\n".join(lines)
-                        all_zero = (low["_reads"] == 0).all()
-                        severity  = "ZERO" if all_zero else "LOW"
-                        n_affected = len(low)
-                        n_total    = len(proj_rows)
+                        proj_rows = df[df["Sample_Project"].astype(str).isin(target_projects)].copy()
+                        proj_rows["_reads"] = pd.to_numeric(
+                            proj_rows["# Reads"], errors="coerce").fillna(0).astype(int)
 
-                        subject = (
-                            f"[{severity} READS] {params.library} — {project} ({config_id}): "
-                            f"{n_affected}/{n_total} sample(s) below {threshold:,} reads"
-                        )
-                        body = (
-                            f"Low-reads alert for library {params.library}\n\n"
-                            f"Config:  {config_id}\n"
-                            f"Project: {project}\n"
-                            f"Threshold: {threshold:,} reads\n\n"
-                            f"{n_affected} of {n_total} sample(s) are below threshold:\n"
-                            f"{sample_list}\n\n"
-                            f"Please review the demultiplex report at:\n"
-                            f"  output/{config_id}/Reports/Demultiplex_Stats.csv\n"
-                        )
-                        if not SEND_EMAILS:
-                            _log(f"SEND_EMAILS disabled; would have sent {severity} READS alert for "
-                                 f"{n_affected} sample(s):\n{sample_list}")
-                            log_fh.close()
-                        else:
-                            _log(f"Sending {severity} READS alert for {n_affected} sample(s):\n{sample_list}")
-                            try:
-                                result = subprocess.run(
-                                    [
-                                        "python3", "src/send_email.py",
-                                        params.sender, params.receiver, subject, body,
-                                        "none", params.cc,
-                                    ],
-                                    capture_output=True, text=True
-                                )
-                                _log(result.stdout)
-                                if result.returncode != 0:
-                                    _log(f"Warning: email send returned exit code {result.returncode}:\n{result.stderr}")
-                                else:
-                                    _log("Alert email sent successfully.")
-                            except Exception as e:
-                                _log(f"Warning: failed to send alert email: {e}")
-                            log_fh.close()
+            if proj_rows is not None:
+                low = proj_rows[proj_rows["_reads"] < threshold]
+                if low.empty:
+                    _log(f"All samples in {project} ({config_id}) have >= {threshold} reads. No alert needed.")
+                else:
+                    for _, row in low.iterrows():
+                        payload["samples"].append({
+                            "sample_id": str(row.get("SampleID", row.get("Sample_ID", "unknown"))).strip(),
+                            "reads": int(row["_reads"]),
+                        })
+                    sample_list = "\n".join(
+                        f"  {s['sample_id']}: {s['reads']:,} reads" for s in payload["samples"])
+                    severity = "ZERO" if (low["_reads"] == 0).all() else "LOW"
+                    n_affected, n_total = len(low), len(proj_rows)
+                    payload["subject"] = (
+                        f"[{severity} READS] {params.library} — {project} ({config_id}): "
+                        f"{n_affected}/{n_total} sample(s) below {threshold:,} reads"
+                    )
+                    payload["body"] = (
+                        f"Low-reads alert for library {params.library}\n\n"
+                        f"Config:  {config_id}\n"
+                        f"Project: {project}\n"
+                        f"Threshold: {threshold:,} reads\n\n"
+                        f"{n_affected} of {n_total} sample(s) are below threshold:\n"
+                        f"{sample_list}\n\n"
+                        f"Please review the demultiplex report at:\n"
+                        f"  output/{config_id}/Reports/Demultiplex_Stats.csv\n"
+                    )
+                    _log(f"Recorded {severity} READS alert for {n_affected} sample(s):\n{sample_list}")
+
+            os.makedirs(os.path.dirname(output.alert), exist_ok=True)
+            with atomic_output(output.alert) as fh:
+                json.dump(payload, fh, indent=2)
+
 
 def _project_fastqs_for_md5(wildcards):
     """List the fastq.gz files feeding md5sums.txt so Snakemake ties the checksum
@@ -3987,600 +3388,3 @@ rule check_index_rc_swap:
         """
         python3 {params.script} --samples {input.samples} --undetermined {input.undetermined} > {output} 2> {log}
         """
-
-rule project_link:
-    input:
-        done = "output/{config_id}/{project}/.project_done"
-    output:
-        log = "logs/{config_id}/project_link_{config_id}---{project}.log",
-        yaml_file = "logs/{config_id}/project_links_{config_id}---{project}.yaml"
-    benchmark:
-        "benchmarks/project_link_{config_id}---{project}.bench"
-    wildcard_constraints:
-        # Relaxed to accept any lane-prefixed config with additional underscore-separated tokens
-        config_id = "[^/]+",
-        project = ".+"
-    resources:
-        serial_operation=1
-    params:
-        work_dir = os.getcwd(),
-        order_id = lambda wildcards: (
-            # Prefer (lane, group)-keyed lookup so duplicate project names on the same lane
-            # each resolve to their own order_id rather than the last-written shared entry.
-            ORDER_ID_LOOKUP.get(
-                (int(lane_m.group(1)), int(grp_m.group(1))),
-                PROJECT_ORDER_ID.get(
-                    (PROJECT_RENAME_MAP_INV.get((wildcards.config_id, wildcards.project), wildcards.project),
-                     int(lane_m.group(1))), "")
-            )
-            if (lane_m := re.match(r'lane(\d+)', wildcards.config_id))
-            and (grp_m := re.search(r'_G(\d+)$', wildcards.project))
-            else PROJECT_ORDER_ID.get(
-                (PROJECT_RENAME_MAP_INV.get((wildcards.config_id, wildcards.project), wildcards.project),
-                 int(re.match(r'lane(\d+)', wildcards.config_id).group(1))
-                 if re.match(r'lane(\d+)', wildcards.config_id) else 0), "")
-        ),
-        group = lambda wildcards: (
-            # Extract group directly from the renamed project folder name (_G{n} suffix)
-            # to avoid the reverse-lookup bug where duplicate project names on the same
-            # lane always resolve to the first group in PROJECT_LOOKUP.
-            m.group(1) if (m := re.search(r'_G(\d+)$', wildcards.project))
-            else get_project_group(
-                PROJECT_RENAME_MAP_INV.get((wildcards.config_id, wildcards.project), wildcards.project),
-                wildcards.config_id)
-        )
-    run:
-        import traceback
-        import subprocess
-        import sys
-        from pathlib import Path
-        import time
-        import urllib.parse
-        import re
-        import os
-        import shlex
-        import glob as _glob
-
-        config_id = wildcards.config_id
-        project = wildcards.project
-        order_id = params.order_id
-        group = params.group
-        fastq_dir = f"output/{config_id}/{project}"
-        log_file = output.log
-        yaml_file = output.yaml_file
-
-        if not str(order_id).strip():
-            msg = (
-                f"Missing order_id for project link generation "
-                f"(config_id={config_id}, project={project}, group={group}). "
-                "Check metadata order-id mapping for this project/lane."
-            )
-            Path(log_file).write_text(msg + "\n")
-            raise RuntimeError(msg)
-
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-        yaml_data = {project: {config_id: {}}}
-
-        if not ENABLE_NEXTCLOUD:
-            with open(log_file, 'w') as f:
-                f.write("Status: SKIPPED\n")
-                f.write("Reason: Nextcloud sharing disabled for this workflow run.\n")
-                f.write(f"Project: {project}\n")
-                f.write(f"Config ID: {config_id}\n")
-                f.write(f"Order ID: {order_id}\n")
-                f.write(f"Group: {group}\n")
-            yaml_data[project][config_id][order_id] = {"link": "", "group": group}
-            import yaml as _yaml
-            with open(yaml_file, 'w') as yf:
-                _yaml.dump(yaml_data, yf, default_flow_style=False)
-            return
-        
-        # Helper: Extract Browser URL
-        def extract_share_url(xml_text):
-            if not xml_text: return None
-            match = re.search(r'<url>(.*?)</url>', xml_text)
-            return match.group(1) if match else None
-
-        # Helper: Extract Token (This is your WebDAV Username)
-        def extract_share_token(xml_text):
-            if not xml_text: return None
-            match = re.search(r'<token>(.*?)</token>', xml_text)
-            return match.group(1) if match else None
-
-        def extract_share_owner(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<uid_owner>(.*?)</uid_owner>', xml_text)
-            if m:
-                return m.group(1)
-            # fallback: sometimes owner is in <id> or <owner>
-            m2 = re.search(r'<owner>(.*?)</owner>', xml_text)
-            if m2:
-                return m2.group(1)
-            return None
-
-        def extract_share_id(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<id>(\d+)</id>', xml_text)
-            return m.group(1) if m else None
-
-        def extract_internal_path(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<path>(.*?)</path>', xml_text)
-            if m:
-                return m.group(1)
-            # fallback: sometimes in <folder>
-            m2 = re.search(r'<folder>(.*?)</folder>', xml_text)
-            if m2:
-                return m2.group(1)
-            return None
-
-        def extract_share_id(xml_text):
-            if not xml_text: return None
-            m = re.search(r'<id>(\d+)</id>', xml_text)
-            return m.group(1) if m else None
-
-        # Capture executed commands for logging
-        executed_cmds = []
-
-        def fetch_existing_share(path, log_handle):
-            encoded_path = urllib.parse.quote(path, safe="/")
-            cmd = [
-                'curl', '-s', '-X', 'GET',
-                '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
-                '-H', 'OCS-APIRequest: true',
-                f'{NEXTCLOUD_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares?path={encoded_path}&reshares=true'
-            ]
-            executed_cmds.append(cmd)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            return result.stdout
-
-        try:
-            if os.path.isdir(fastq_dir):
-                abs_path = os.path.abspath(fastq_dir)
-                nc_path = f"/{NEXTCLOUD_DIR_NAME}/" + abs_path.split(f"/{NEXTCLOUD_DIR_PATH}/", 1)[1] if f"/{NEXTCLOUD_DIR_PATH}/" in abs_path else abs_path
-                
-                max_retries = 30  # Retry up to 30 times with exponential backoff
-                retry_count = 0
-                share_url = None
-                share_token = None
-                share_id_num = None
-                share_xml = None
-                rate_limited = False
-                last_error = None
-                
-                while retry_count < max_retries and not share_url:
-                    retry_count += 1
-                    wait_time = min(3 * (2 ** (retry_count - 1)), 60)
-                    if rate_limited: time.sleep(10)
-                    
-                    try:
-                        cmd = [
-                            'curl', '-s', '-w', '\nHTTP_CODE:%{http_code}',
-                            '-X', 'POST',
-                            '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
-                            '-H', 'OCS-APIRequest: true',
-                            '-d', f'path={nc_path}',
-                            '-d', 'shareType=3', # 3 = Public Link
-                            f'{NEXTCLOUD_URL}/ocs/v2.php/apps/files_sharing/api/v1/shares'
-                        ]
-                        executed_cmds.append(cmd)
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                        
-                        stdout_split = result.stdout.split('\n')
-                        http_code = next((l.split(':')[1] for l in stdout_split if l.startswith('HTTP_CODE:')), None)
-                        share_xml = '\n'.join([l for l in stdout_split if not l.startswith('HTTP_CODE:')])
-
-                        if http_code == '429':
-                            rate_limited = True
-                            last_error = f"Rate limited (HTTP {http_code})"
-                        elif http_code == '200' or http_code == '201':
-                            # Success - extract data from response
-                            share_url = extract_share_url(share_xml)
-                            share_token = extract_share_token(share_xml)
-                            share_id_num = extract_share_id(share_xml)
-                            if share_url and share_token:
-                                try:
-                                    owner = extract_share_owner(share_xml)
-                                    internal_path = extract_internal_path(share_xml)
-                                except Exception:
-                                    owner = None
-                                    internal_path = None
-                                share_owner = owner
-                                share_internal_path = internal_path
-                                break
-                            else:
-                                last_error = f"Valid response but could not extract URL/token (HTTP {http_code})"
-                        elif http_code == '400' or http_code == '403':
-                            # 403 usually means "already exists" - try GET to fetch existing share
-                            share_xml = fetch_existing_share(nc_path, None)
-                            share_url = extract_share_url(share_xml)
-                            share_token = extract_share_token(share_xml)
-                            share_id_num = extract_share_id(share_xml)
-                            if share_url and share_token:
-                                try:
-                                    owner = extract_share_owner(share_xml)
-                                    internal_path = extract_internal_path(share_xml)
-                                except Exception:
-                                    owner = None
-                                    internal_path = None
-                                share_owner = owner
-                                share_internal_path = internal_path
-                                break
-                            else:
-                                last_error = f"Share may exist but could not fetch via GET (HTTP {http_code})"
-                        else:
-                            last_error = f"HTTP {http_code}: {share_xml[:100] if share_xml else 'No response'}"
-
-                        if retry_count < max_retries and not share_url:
-                            time.sleep(wait_time)
-
-                    except subprocess.TimeoutExpired:
-                        last_error = "Request timed out (30 seconds)"
-                        if retry_count < max_retries:
-                            time.sleep(wait_time)
-                    except Exception as e:
-                        last_error = f"Exception: {str(e)}"
-                        if retry_count < max_retries:
-                            time.sleep(wait_time)
-
-                # --- RESTORE PRIOR TOKEN FROM EXISTING LOGS ---
-                # Nextcloud re-shares get a fresh token each run, which breaks links already
-                # sent to users. If a prior successful share for this nc_path recorded a token,
-                # push it back so the public URL stays stable across pipeline re-runs.
-                if share_url and share_token and share_id_num:
-                    old_token = None
-                    for lp in sorted(_glob.glob("logs/**/project_link_*.log", recursive=True)):
-                        if os.path.abspath(lp) == os.path.abspath(log_file):
-                            continue
-                        try:
-                            content = Path(lp).read_text()
-                            if f"NC_PATH: {nc_path}" in content and "Status: SUCCESS" in content:
-                                m = re.search(r'^WebDAV Token: (\S+)', content, re.MULTILINE)
-                                if m:
-                                    old_token = m.group(1)
-                                    break
-                        except Exception:
-                            pass
-                    if old_token and old_token != share_token:
-                        put_cmd = [
-                            sys.executable, "scripts/test_nextcloud_token.py",
-                            "--share-id", share_id_num,
-                            "--token", old_token
-                        ]
-                        executed_cmds.append(put_cmd)
-                        put_result = subprocess.run(put_cmd, capture_output=True, text=True, timeout=30)
-                        m_token = re.search(r'New Token\s*:\s*(\S+)', put_result.stdout)
-                        m_url = re.search(r'New URL\s*:\s*(\S+)', put_result.stdout)
-                        if m_token:
-                            share_token = m_token.group(1)
-                        if m_url:
-                            share_url = m_url.group(1)
-
-                # --- LOGGING WEB DAV CREDENTIALS AND EXECUTED COMMANDS ---
-                with open(log_file, 'w') as f:
-                    f.write(f"Project: {project}\n")
-                    f.write(f"Config ID: {config_id}\n")
-                    # Always write Order ID and Group (needed for report generation)
-                    f.write(f"Order ID: {order_id}\n")
-                    f.write(f"Group: {group}\n")
-                    # Write the Nextcloud path we attempted to share (for rescan parsing)
-                    try:
-                        f.write(f"NC_PATH: {nc_path}\n")
-                    except Exception:
-                        pass
-                    if share_url and share_token:
-                        f.write(f"Status: SUCCESS\n")
-                        f.write(f"Browser URL: {share_url}\n")
-                        f.write(f"WebDAV URL: {NEXTCLOUD_URL}/public.php/dav/\n")
-                        f.write(f"WebDAV Token: {share_token}\n")
-                        # If available, record Nextcloud owner and internal storage path
-                        try:
-                            if share_owner:
-                                f.write(f"NC_OWNER: {share_owner}\n")
-                            if share_internal_path:
-                                f.write(f"NC_INTERNAL_PATH: {share_internal_path}\n")
-                        except Exception:
-                            pass
-                        # Populate individual project yaml
-                        yaml_data[project][config_id][order_id] = {"link": share_url, "group": group}
-                    else:
-                        f.write(f"Status: FAILED\n")
-                        f.write(f"Reason: {last_error}\n")
-                        f.write(f"Retries: {retry_count}/{max_retries}\n")
-
-                    # Record the actual commands executed (quoted for copy/paste)
-                    if executed_cmds:
-                        f.write("\nCommands executed:\n")
-                        for c in executed_cmds:
-                            try:
-                                quoted = shlex.join(c)
-                            except Exception:
-                                quoted = ' '.join(shlex.quote(p) for p in c)
-                            f.write(quoted + "\n")
-            else:
-                Path(log_file).write_text(f"Directory {fastq_dir} not found.")
-
-        except Exception as e:
-            Path(log_file).write_text(f"Error: {str(e)}\n{traceback.format_exc()}")
-
-        Path(log_file).touch(exist_ok=True)
-
-        # Write individual project yaml (empty dict if sharing failed)
-        import yaml as _yaml
-        with open(yaml_file, 'w') as yf:
-            _yaml.dump(yaml_data, yf, default_flow_style=False)
-
-rule rescan_nextcloud:
-    input:
-        "logs/{config_id}/project_link_{config_id}---{project}.log"
-    output:
-        touch("logs/{config_id}/nextcloud_scan_{config_id}---{project}.done")
-    log:
-        "logs/{config_id}/rescan_nextcloud_{config_id}_{project}.log"
-    benchmark:
-        "benchmarks/rescan_nextcloud_{config_id}_{project}.bench"
-    wildcard_constraints:
-        # Relaxed to accept any lane-prefixed config with additional underscore-separated tokens
-        config_id = "[^/]+",
-        project = ".+"
-    params:
-        nc_path = lambda wildcards: f"/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{wildcards.config_id}/{wildcards.project}",
-        enable_nextcloud = ENABLE_NEXTCLOUD,
-        ssh_host = NEXTCLOUD_SSH_HOST
-    shell:
-        """
-        if [ "{params.enable_nextcloud}" != "True" ]; then
-            echo "Status: SKIPPED" > {log}
-            echo "Reason: Nextcloud scan disabled for this workflow run." >> {log}
-            exit 0
-        fi
-
-        # Read NC_PATH from the project_link log (written by project_link rule) and use that for scanning.
-        nc_log={input}
-        nc_path=$(grep '^NC_PATH:' "$nc_log" | sed 's/^NC_PATH: //') || true
-        nc_owner=$(grep '^NC_OWNER:' "$nc_log" | sed 's/^NC_OWNER: //') || true
-        nc_internal=$(grep '^NC_INTERNAL_PATH:' "$nc_log" | sed 's/^NC_INTERNAL_PATH: //') || true
-
-        # Prefer owner+internal_path if available (construct users/<owner>/files/<internal>)
-        if [ -n "$nc_owner" ] && [ -n "$nc_internal" ]; then
-            # strip leading slashes from internal
-            internal=$(echo "$nc_internal" | sed 's@^/*@@')
-            # OCC expects "<user>/files/<path>", not "users/<user>/files/<path>".
-            # Normalize if internal path already includes a user/files prefix.
-            internal=$(echo "$internal" | sed "s@^users/${{nc_owner}}/files/@@")
-            internal=$(echo "$internal" | sed 's@^files/@@')
-            occ_path="$nc_owner/files/$internal"
-        elif [ -n "$nc_path" ]; then
-            occ_path="$nc_path"
-        else
-            echo "NC path information not found in $nc_log" > {log}
-            exit 1
-        fi
-
-        ssh {params.ssh_host} "docker exec --user www-data nextcloud-aio-nextcloud php occ files:scan --path='$occ_path'" > {log} 2>&1
-
-        # OCC can report malformed --path usage while still returning quickly.
-        if grep -q "Unknown user" {log}; then
-            echo "ERROR: files:scan used an invalid user path: $occ_path" >> {log}
-            exit 1
-        fi
-        """
-
-
-
-rule verify_project_links:
-    input:
-        project_link_log = "logs/{config_id}/project_link_{config_id}---{project}.log",
-        scan_done = "logs/{config_id}/nextcloud_scan_{config_id}---{project}.done"
-    output:
-        report = "logs/{config_id}/verify_project_link_{config_id}---{project}.txt"
-    log:
-        "logs/{config_id}/verify_project_link_{config_id}---{project}.log"
-    benchmark:
-        "benchmarks/verify_project_link_{config_id}---{project}.bench"
-    wildcard_constraints:
-        # Relaxed to accept any lane-prefixed config with additional underscore-separated tokens
-        config_id = "[^/]+",
-        project = ".+"
-    run:
-        import subprocess
-        import re
-        import os
-
-        if not ENABLE_NEXTCLOUD:
-            msg = [
-                "Project Link Verification Report",
-                f"Config ID: {wildcards.config_id}",
-                f"Project: {wildcards.project}",
-                "Status: SKIPPED",
-                "Reason: Nextcloud verification disabled for this workflow run.",
-            ]
-            os.makedirs(os.path.dirname(output.report), exist_ok=True)
-            with open(output.report, 'w') as f:
-                f.write('\n'.join(msg))
-            with open(log[0], 'w') as f:
-                f.write('\n'.join(msg))
-            return
-        
-        config_id = wildcards.config_id
-        project = wildcards.project
-        local_dir = f"output/{config_id}/{project}"
-        
-        # Read the project_link log to extract the share URL
-        share_url = None
-        with open(input.project_link_log, 'r') as f:
-            content = f.read()
-            match = re.search(r'Share link: (https://.*)', content)
-            if match:
-                share_url = match.group(1).strip()
-        
-        report = []
-        report.append(f"Project Link Verification Report")
-        report.append(f"Config ID: {config_id}")
-        report.append(f"Project: {project}")
-        report.append(f"Local Directory: {local_dir}")
-        report.append(f"Share URL: {share_url if share_url else 'NOT FOUND'}")
-        report.append("")
-        
-        # Get local fastq.gz files
-        local_fastqs = []
-        if os.path.isdir(local_dir):
-            try:
-                local_fastqs = sorted([f for f in os.listdir(local_dir) if f.endswith('.fastq.gz')])
-            except Exception as e:
-                report.append(f"ERROR reading local directory: {e}")
-        else:
-            report.append(f"Local directory does not exist: {local_dir}")
-        
-        report.append(f"Local FASTQ files ({len(local_fastqs)}):")
-        for f in local_fastqs:
-            report.append(f"  - {f}")
-        report.append("")
-        
-        # Query Nextcloud share for files if URL is available
-        remote_fastqs = []
-        if share_url:
-            try:
-                # Extract the share token from the URL
-                # URL format: https://precision.biochem.uci.edu/s/SHARETOKEN
-                match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
-                if match:
-                    share_token = match.group(1)
-                    
-                    # Query the WebDAV API to list files in the share
-                    # Using curl to query the share with basic auth
-                    cmd = [
-                        'curl', '-s',
-                        '-u', f'{NEXTCLOUD_USER}:{NEXTCLOUD_PASSWORD}',
-                        '-X', 'PROPFIND',
-                        '-H', 'Depth: 1',
-                        f'{NEXTCLOUD_URL}/remote.php/dav/files/{NEXTCLOUD_USER}/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{config_id}/{project}/'
-                    ]
-                    
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                    
-                    # Parse XML response to extract filenames
-                    if result.stdout:
-                        # Extract hrefs from the PROPFIND response
-                        hrefs = re.findall(r'<d:href>(.*?)</d:href>', result.stdout)
-                        for href in hrefs:
-                            # Extract just the filename from the full path
-                            filename = href.split('/')[-1]
-                            if filename and filename.endswith('.fastq.gz'):
-                                remote_fastqs.append(filename)
-                        remote_fastqs = sorted(set(remote_fastqs))
-            except Exception as e:
-                report.append(f"ERROR querying Nextcloud: {e}")
-        
-        if remote_fastqs:
-            report.append(f"Remote FASTQ files ({len(remote_fastqs)}):")
-            for f in remote_fastqs:
-                report.append(f"  - {f}")
-            report.append("")
-        
-        # Compare files
-        local_set = set(local_fastqs)
-        remote_set = set(remote_fastqs)
-        
-        report.append("VERIFICATION RESULTS:")
-        if local_set == remote_set:
-            report.append("✓ SUCCESS: Local and remote files match perfectly")
-            report.append(f"  Total files: {len(local_set)}")
-        else:
-            report.append("✗ MISMATCH: Local and remote files differ")
-            
-            missing_remote = local_set - remote_set
-            if missing_remote:
-                report.append(f"\n  Files in local but NOT in remote ({len(missing_remote)}):")
-                for f in sorted(missing_remote):
-                    report.append(f"    - {f}")
-            
-            missing_local = remote_set - local_set
-            if missing_local:
-                report.append(f"\n  Files in remote but NOT in local ({len(missing_local)}):")
-                for f in sorted(missing_local):
-                    report.append(f"    - {f}")
-            
-            common = local_set & remote_set
-            if common:
-                report.append(f"\n  Files in both ({len(common)}):")
-                for f in sorted(common):
-                    report.append(f"    - {f}")
-        
-        # Write report
-        os.makedirs(os.path.dirname(output.report), exist_ok=True)
-        with open(output.report, 'w') as f:
-            f.write('\n'.join(report))
-        
-        # Also write to log
-        with open(log[0], 'w') as f:
-            f.write('\n'.join(report))
-
-
-# Diagnostic rule: print expected and actual .done and .log files for project_link
-rule debug_project_link_files:
-    benchmark:
-        "benchmarks/debug_project_link_files.bench"
-    run:
-        import os
-        print("\n=== DIAGNOSTIC: CONFIG_PROJECT_PAIRS ===")
-        for config_id, project in CONFIG_PROJECT_PAIRS:
-            print(f"PAIR: config_id={config_id}, project={project}")
-        print("\n=== DIAGNOSTIC: Expected .done files ===")
-        for config_id, project in CONFIG_PROJECT_PAIRS:
-            done_path = f".output/{config_id}/.done"
-            print(f"{done_path}: {'EXISTS' if os.path.exists(done_path) else 'MISSING'}")
-        print("\n=== DIAGNOSTIC: Expected .log files ===")
-        for config_id, project in CONFIG_PROJECT_PAIRS:
-            log_path = f"logs/{config_id}/project_link_{config_id}_{project}.log"
-            print(f"{log_path}: {'EXISTS' if os.path.exists(log_path) else 'MISSING'}")
-        print("\n=== DIAGNOSTIC: All files in logs/ matching project_link_*.log ===")
-        for fname in sorted(os.listdir('logs')):
-                if fname.startswith('project_link_') and fname.endswith('.log'):
-                    print(fname)
-
-
-rule rsync_to_external_drive:
-    input:
-        # Ensure all reports are generated before running rsync
-        reports = ORDER_ID_REPORTS,
-        md5s = ORDER_ID_MD5S,
-    output:
-        touch("logs/rsync_to_external_drive.done")
-    log:
-        "logs/rsync_to_external_drive.log"
-    benchmark:
-        "benchmarks/rsync_to_external_drive.bench"
-    params:
-        dest_dir = EXTERNAL_DRIVE_PATH,
-        project_name = LIBRARY,
-        src_dir = lambda wildcards: os.getcwd()
-    run:
-        import sys
-        sys.stderr = sys.stdout = open(log[0], 'w')
-        if SKIP_RSYNC:
-            print(f"Working directory {WORKING_DIR} is on /mnt/ path. Skipping rsync.")
-            with open(output[0], 'w') as f:
-                f.write('SKIPPED: Already on /mnt/ path')
-            return
-        if not params.dest_dir:
-            print("No external_drive_path specified in config.yaml. Skipping rsync.")
-            with open(output[0], 'w') as f:
-                f.write('SKIPPED')
-            return
-        src = os.path.abspath(params.src_dir)
-        dest = os.path.join(params.dest_dir, params.project_name)
-        print(f"Rsyncing {src} to {dest}")
-        os.makedirs(dest, exist_ok=True)
-        # Use resume-friendly rsync flags so interrupted transfers can be resumed.
-        # --partial preserves partially transferred files; --append-verify resumes and verifies.
-        cmd = [
-            "rsync", "-aW", "--delete", "--exclude='.snakemake/'", src + "/", dest + "/", "--exclude", "*Undetermined*"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        print(result.stdout)
-        if result.stderr:
-            print("STDERR:", result.stderr)
-        with open(output[0], 'w') as f:
-            f.write('DONE')

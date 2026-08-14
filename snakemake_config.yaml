@@ -1,4 +1,10 @@
-# Snakemake configuration for HPC3 postprocess workflow (no email / no Nextcloud by default)
+# Snakemake configuration, shared by both halves of the pipeline.
+#
+# The conversion workflow (Snakefile, HPC3) reads only the conversion keys; it
+# has no Nextcloud or email rules at all. The delivery workflow
+# (Snakefile.delivery, dragen server) reads this file, then
+# snakemake_config_project.yaml, then snakemake_config_delivery.yaml, and gets
+# its Nextcloud/email/rsync settings from the last of those. See docs/handoff.md.
 
 # The container image the whole workflow runs inside — bcl-convert plus every
 # other tool, and the Snakemake driver itself. run_hpc3_container.sh reads this
@@ -7,8 +13,10 @@
 # directory", check `id | grep ucightf`. See README > Container image to rebuild.
 container_sif: "/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif"
 
+# Delivery-side only. There is no enable_nextcloud key any more: the delivery
+# workflow hard-fails without Nextcloud credentials rather than producing
+# empty-link YAMLs that later look up-to-date.
 send_emails: false
-enable_nextcloud: false
 num_reads: 2
 library_name: ""
 start_s: 1

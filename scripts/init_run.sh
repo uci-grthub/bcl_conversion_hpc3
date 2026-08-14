@@ -5,8 +5,9 @@
 # Idempotent: safe to re-run. It:
 #   1. creates snakemake_config_project.yaml from the base config (if missing),
 #   2. prefills metadata / library_name / data_dir in that project config.
-# Review the result and fill ~/.env (secrets) before running the workflow, if
-# enable_nextcloud/SEND_EMAILS are turned on.
+# Review the result before running the workflow. Secrets in ~/.env are only
+# needed for the delivery workflow on the dragen server (see docs/handoff.md);
+# the HPC3 conversion workflow needs only SLURM_ACCOUNT.
 #
 # Differences from the upstream (Nextcloud-staged) version:
 #   * No sequencer / Nextcloud staging branching. BCL run folders live in a
