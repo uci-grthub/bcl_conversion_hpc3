@@ -232,7 +232,9 @@ host or baked into the image. Two dependencies remain **system-level**:
 - **`scripts/verify_handoff.py`** - Reports every gap in the rsynced run in one pass
 - **`snakemake_config.yaml`** - Base configuration (paths, threads), shared by both halves
 - **`snakemake_config_project.yaml`** - Project-specific configuration (overrides base settings)
-- **`snakemake_config_delivery.yaml`** - Delivery-side settings (Nextcloud paths, email)
+- **`snakemake_config_delivery.yaml.example`** - Tracked template for the delivery-side
+  settings (Nextcloud paths, email); `run_delivery.sh` copies it to
+  `snakemake_config_delivery.yaml`, which is per run directory and untracked
 - **`run_hpc3_container.sh`** - Container entry point: runs Snakemake itself inside the
   image and generates the compute-node shim. The supported way to run the workflow
 - **`scripts/container_binds.sh`** - The bind list shared by the launcher and the shim

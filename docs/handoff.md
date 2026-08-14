@@ -156,10 +156,20 @@ back until every order has arrived, independently of any single order's state.
 layers `snakemake_config_project.yaml` then `snakemake_config_delivery.yaml` on
 top, and `--config` overrides win over all of them.
 
-Delivery-side settings live in `snakemake_config_delivery.yaml`
-(untracked, per run directory): `nextcloud_dir_name`, `nextcloud_dir_path`,
-`send_emails`, `email_sender`, `email_recipient`, `email_cc`,
-`external_drive_path`.
+Delivery-side settings live in `snakemake_config_delivery.yaml`:
+`nextcloud_dir_name`, `nextcloud_dir_path`, `send_emails`, `email_sender`,
+`email_recipient`, `email_cc`, `external_drive_path`.
+
+That file is per run directory and untracked, the same as
+`snakemake_config_project.yaml`; the tracked copy is
+`snakemake_config_delivery.yaml.example`. A freshly rsynced run therefore arrives
+without one, so `run_delivery.sh` creates it from the template on first use and
+stops for review rather than publishing on defaults nobody looked at:
+
+```
+Created snakemake_config_delivery.yaml from the template.
+Review it -- in particular send_emails and email_recipient -- then re-run:
+```
 
 Credentials stay in `~/.env` and never in a config file: `NEXTCLOUD_URL`,
 `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SSH_HOST` (optional),

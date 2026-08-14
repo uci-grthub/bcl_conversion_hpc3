@@ -23,6 +23,9 @@ Reports/
 RunInfo.xml
 src/RunInfo_nn.xml
 snakemake_config_*
+# ...but the delivery-config template is tracked, the way .env.example is. The
+# file it is copied to (snakemake_config_delivery.yaml) stays ignored above.
+!snakemake_config_delivery.yaml.example
 scripts/parse-upload-1.2.1.sh
 scripts/parse-upload-1.2.1.py
 .claude/

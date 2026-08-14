@@ -1,0 +1,32 @@
+# Template for snakemake_config_delivery.yaml, read only by Snakefile.delivery on
+# the dragen server. Layered last, over snakemake_config.yaml then
+# snakemake_config_project.yaml; `--config key=value` still overrides everything.
+#
+#   cp snakemake_config_delivery.yaml.example snakemake_config_delivery.yaml
+#
+# run_delivery.sh does that copy for you on first run and stops so you can review
+# it. This .example is the tracked copy; the file it produces is per run directory
+# and stays untracked (.gitignore has snakemake_config_*).
+#
+# Credentials do NOT go here -- NEXTCLOUD_URL / NEXTCLOUD_USER /
+# NEXTCLOUD_PASSWORD / GMAIL_APP_PASSWORD come from ~/.env (see .env.example).
+
+# Nextcloud share paths. nextcloud_dir_path is the segment of the local absolute
+# path that marks the Nextcloud data root; nextcloud_dir_name is what that root
+# is called in share URLs.
+nextcloud_dir_name: "dragenshare"
+nextcloud_dir_path: "nextcloud"
+
+# Set to true only when the reports have been reviewed. With false, the delivery
+# workflow still builds every share link and order report; it just does not mail
+# anyone, and no email sentinel is created, so flipping this to true later sends
+# without any files to delete first.
+send_emails: false
+
+email_sender: ""
+email_recipient: ""
+email_cc: ""
+
+# Optional: `snakemake -s Snakefile.delivery rsync_to_external_drive` copies the
+# run directory to <external_drive_path>/<library_name>. Empty disables it.
+external_drive_path: ""

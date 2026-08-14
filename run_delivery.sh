@@ -44,6 +44,19 @@ if [[ ! -d handoff/projects ]]; then
     exit 1
 fi
 
+# The delivery config is per run directory and untracked, so a freshly rsynced run
+# arrives without one. Create it from the tracked template and stop: this workflow
+# publishes data and mails customers, so the first run in a directory should not
+# proceed on defaults nobody looked at.
+if [[ ! -f snakemake_config_delivery.yaml ]]; then
+    cp "$here/snakemake_config_delivery.yaml.example" snakemake_config_delivery.yaml
+    echo "Created snakemake_config_delivery.yaml from the template."
+    echo "Review it -- in particular send_emails and email_recipient -- then re-run:"
+    echo "    \$EDITOR snakemake_config_delivery.yaml"
+    echo "    bash run_delivery.sh $*"
+    exit 1
+fi
+
 # Report every gap in the transfer at once. Snakemake would also catch a missing
 # file, but one at a time, after the DAG is built and possibly after some shares
 # have already been published.

@@ -136,10 +136,12 @@ bash scripts/container_exec.sh python scripts/test_nextcloud_token.py
   `bash scripts/init_run.sh` prefills `library_name`, `metadata`, `data_dir`; plus optional
   `external_drive_path`, `scratch_dir`, `tiles`, `flexbar_bin`.
 - `snakemake_config.yaml` — base defaults, layered under the project file. Rarely edited.
-- `snakemake_config_delivery.yaml` — delivery-side only, read on the dragen server
-  (gitignored): `send_emails`, `email_sender` / `email_recipient` / `email_cc`,
-  `nextcloud_dir_name` / `nextcloud_dir_path`, `external_drive_path`. Nothing on
-  HPC3 reads it. See [docs/handoff.md](docs/handoff.md).
+- `snakemake_config_delivery.yaml` — delivery-side only, read on the dragen server:
+  `send_emails`, `email_sender` / `email_recipient` / `email_cc`,
+  `nextcloud_dir_name` / `nextcloud_dir_path`, `external_drive_path`. Untracked and
+  per run directory; `run_delivery.sh` creates it from the tracked
+  `snakemake_config_delivery.yaml.example` on first use and stops for review.
+  Nothing on HPC3 reads it. See [docs/handoff.md](docs/handoff.md).
 - `profiles/hpc3/config.yaml` — the HPC3 executor profile: slurm executor,
   `standard` partition, account from `$SLURM_ACCOUNT` (never pinned in the file),
   `cores: 32` (must stay >= the largest rule `threads:`), up to 32 concurrent jobs,
