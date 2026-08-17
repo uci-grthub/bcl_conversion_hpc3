@@ -23,21 +23,24 @@ cd /path/to/your/runs          # e.g. /dfs9/ucightf-lab/$USER/runs
 git clone https://github.com/uci-grthub/bcl_conversion_hpc3 {RUN_NAME}
 cd {RUN_NAME}
 
-# 2. Set up the run: creates snakemake_config_project.yaml and prefills
+# 2. Copy the lab's SampleSheet .xlsx into metadata/ (REQUIRED before init:
+#    init_run.sh reads whatever .xlsx is there to fill in metadata and library_name)
+cp /path/to/{RUN_NAME}.xlsx metadata/
+
+# 3. Set up the run: creates snakemake_config_project.yaml and prefills
 #    metadata / library_name / data_dir from the newest run in the HPC3 staging dir
 #    Plain bash (find/sed/cp only) — no pixi and no container required
 bash scripts/init_run.sh      # or: bash scripts/init_run.sh --staging-dir /dfs3b/ucightf_lab/NSRaw
 
-# 3. Drop the metadata .xlsx into metadata/ (if not already there), then confirm
-#    the prefilled config
+# 4. Confirm the prefilled config
 $EDITOR snakemake_config_project.yaml         # confirm data_dir, library_name, metadata
 
-# 4. Validate metadata + preview the plan (no processing happens)
+# 5. Validate metadata + preview the plan (no processing happens)
 module load singularity
 bash scripts/container_exec.sh python run_validation.py
 bash run_hpc3_container.sh --dryrun
 
-# 5. Run the full workflow (singularity + slurm via profiles/hpc3)
+# 6. Run the full workflow (singularity + slurm via profiles/hpc3)
 bash run_hpc3_container.sh
 ```
 
@@ -48,7 +51,7 @@ Delivery — share links, order reports and customer emails — is a separate wo
 on the dragen server, because it needs a Nextcloud instance and a mail relay.
 
 ```bash
-# 6. Transfer the run to the delivery host. Copy these flags verbatim; see the
+# 7. Transfer the run to the delivery host. Copy these flags verbatim; see the
 #    notes below for what each one prevents.
 rsync -aWP --no-g \
     --exclude '.snakemake/' \
@@ -62,27 +65,27 @@ rsync -aWP --no-g \
     --exclude 'Reports/' \
     ./ {DELIVERY_HOST}:/staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}/
 
-# 7. On the delivery host, set up the delivery config. The first run creates it
+# 8. On the delivery host, set up the delivery config. The first run creates it
 #    from the tracked template and stops so you can review it.
 ssh {DELIVERY_HOST}
 cd /staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}
 bash run_delivery.sh --dry-run                 # creates snakemake_config_delivery.yaml, exits
 $EDITOR snakemake_config_delivery.yaml         # send_emails, email_sender/recipient/cc
 
-# 8. Preview, then publish. With send_emails: false this builds every share link
+# 9. Preview, then publish. With send_emails: false this builds every share link
 #    and order report and mails nobody — the intended review state.
 bash run_delivery.sh --dry-run
 bash run_delivery.sh
 
-# 9. Confirm Nextcloud actually indexed the files. Errors must be 0 and Files
+# 10. Confirm Nextcloud actually indexed the files. Errors must be 0 and Files
 #    non-zero; this is the one failure the workflow cannot detect for you.
 grep -h '^| [0-9]' logs/*/rescan_nextcloud_*.log
 
-# 10. Only once the reports look right: set send_emails: true and re-run to mail
+# 11. Only once the reports look right: set send_emails: true and re-run to mail
 #     the customers. Nothing needs deleting first — no sentinel was written.
 ```
 
-Three things about step 6 that are easy to get wrong, each of which fails *silently*
+Three things about step 7 that are easy to get wrong, each of which fails *silently*
 — every rule still reports success:
 
 - **`--no-g`.** Nextcloud serves the files over SMB as an account in the delivery
@@ -92,10 +95,10 @@ Three things about step 6 that are easy to get wrong, each of which fails *silen
   conversion/delivery split still holds the old skip-stubs; transferred over, they
   satisfy `project_link` and `report_order_id` and the empty links get published.
 - **`snakemake_config_delivery.yaml`.** Untracked but not transfer-ignored, so a
-  copy made on HPC3 overwrites the delivery host's own and suppresses the step 7
+  copy made on HPC3 overwrites the delivery host's own and suppresses the step 8
   review prompt.
 
-For a large run, submit step 6 as a batch job rather than running it on a login
+For a large run, submit step 7 as a batch job rather than running it on a login
 node — a few hundred GB will be throttled or killed there. Compute nodes have
 `/dfs9` and outbound ssh. See [docs/handoff.md](docs/handoff.md) for the full
 reference, including partial-run behaviour and how to recover a transfer that
@@ -130,7 +133,9 @@ ls /dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif        # need the cont
   you clone, and on the cron path).
 - Run has finished copying (a `CopyComplete.txt` exists in the run directory under
   `/dfs3b/ucightf_lab/NSRaw/...`).
-- A SampleSheet `.xlsx` from the lab, placed in `metadata/`.
+- A SampleSheet `.xlsx` from the lab, **copied into `metadata/` before `init_run.sh`**
+  (quickstart step 2) — that is the file `init_run.sh` reads to fill in `metadata` and
+  `library_name`.
 - **Singularity** available via `module load singularity`. The only host requirement
   for a run.
 - **The container.** Not in the repo. Lives at

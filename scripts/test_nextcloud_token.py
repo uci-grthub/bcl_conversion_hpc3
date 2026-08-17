@@ -17,6 +17,7 @@ Reads credentials from environment variables:
 """
 
 import argparse
+import getpass
 import os
 import re
 import subprocess
@@ -129,7 +130,9 @@ def main():
 
     load_env_file(args.env_file)
     nc_url = require_env("NEXTCLOUD_URL").rstrip("/")
-    user = require_env("NEXTCLOUD_USER")
+    # Defaults to the OS user, matching the delivery workflow: set NEXTCLOUD_USER
+    # only when the Nextcloud API account name differs from the local username.
+    user = os.environ.get("NEXTCLOUD_USER") or getpass.getuser()
     password = require_env("NEXTCLOUD_PASSWORD")
 
     share_id = args.share_id

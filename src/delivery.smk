@@ -476,6 +476,7 @@ rule rescan_nextcloud:
         project = ".+"
     params:
         nc_path = lambda wildcards: f"/{NEXTCLOUD_DIR_NAME}/{LIBRARY}/output/{wildcards.config_id}/{wildcards.project}",
+        nc_user = NEXTCLOUD_USER,
         ssh_host = NEXTCLOUD_SSH_HOST
     shell:
         """
@@ -495,7 +496,18 @@ rule rescan_nextcloud:
             internal=$(echo "$internal" | sed 's@^files/@@')
             occ_path="$nc_owner/files/$internal"
         elif [ -n "$nc_path" ]; then
-            occ_path="$nc_path"
+            # project_link failed before it could record NC_OWNER/NC_INTERNAL_PATH,
+            # so only NC_PATH is available. NC_PATH is relative to the API account's
+            # files root (same convention as the WebDAV URL), *not* a host filesystem
+            # path -- passing it to occ verbatim makes occ read its first segment as a
+            # username ("Unknown user 1 dragenshare"). Prefix it to form a valid
+            # "<user>/files/<path>" argument. Note this names the Nextcloud data owner,
+            # unrelated to the SSH login used to reach the host.
+            rel=$(echo "$nc_path" | sed 's@^/*@@')
+            rel=$(echo "$rel" | sed "s@^users/{params.nc_user}/files/@@")
+            rel=$(echo "$rel" | sed "s@^{params.nc_user}/files/@@")
+            rel=$(echo "$rel" | sed 's@^files/@@')
+            occ_path="{params.nc_user}/files/$rel"
         else
             echo "NC path information not found in $nc_log" > {log}
             exit 1
@@ -801,6 +813,20 @@ rule report_order_id:
             project_name_map.setdefault(_proj, _proj)
         project_name_map_json = _json.dumps(project_name_map)
 
+        # 10x/Parse/BD naming verdicts come from the fragments, not from a fresh
+        # look at the workbook: this host has no workbook, and generate_report.py
+        # has to look for the same filenames the conversion run produced. Both the
+        # renamed folder and the original project name are listed, since the report
+        # resolves either one. See src/single_cell.py.
+        _single_cell_names = sorted({
+            name
+            for e in handoff_entries_for_order(order_id) if e.get("single_cell")
+            for name in (e["project"], e.get("orig_project", ""))
+            if name
+        })
+        _report_env = dict(os.environ)
+        _report_env["PIPELINE_SINGLE_CELL_PROJECTS"] = ";".join(_single_cell_names)
+
         # Open log file
         with open(log_file, 'w') as lf:
             lf.write(f"Generating report for order_id: {order_id}\n")
@@ -817,7 +843,7 @@ rule report_order_id:
 
             # Call generate_report.py for this project
             cmd = [
-                "python3", "src/generate_report.py",
+                sys.executable, "src/generate_report.py",
                 project,
                 params.output_base,
                 params.fastp_plots_base,
@@ -834,7 +860,7 @@ rule report_order_id:
                 project_name_map_json, # full renamed→original map for report display
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, env=_report_env)
             with open(log_file, 'a') as f:
                 f.write(f"\n=== Report generation for project {project} ===\n")
                 f.write(result.stdout)
@@ -870,7 +896,7 @@ rule report_order_id:
         # Always generate Download Instructions PDF so rule outputs are complete,
         # even when project discovery returns an empty set.
         pdf_file = os.path.join(report_dir, "Download_Instructions.pdf")
-        pdf_cmd = ["python3", "src/generate_download_instructions_pdf.py", pdf_file]
+        pdf_cmd = [sys.executable, "src/generate_download_instructions_pdf.py", pdf_file]
         pdf_result = subprocess.run(pdf_cmd, capture_output=True, text=True)
         with open(log_file, 'a') as f:
             f.write("\n=== Download Instructions PDF generation ===\n")
@@ -884,6 +910,25 @@ rule report_order_id:
         if not os.path.exists(output.html):
             with open(output.html, 'w') as f:
                 f.write(f"<html><body><h1>Order {order_id}</h1><p>No project report entries were generated.</p></body></html>\n")
+
+def rc_orientation_tag(order_id):
+    """Subject-line tag naming the RC flavours applied to an order, or ''.
+
+    Built from this order's handoff fragments, not from a run-level summary: an
+    order's email must not wait on lanes belonging to other orders.
+
+    Operator-facing only: the manager needs to know an RC workflow ran so he can
+    add his own wording for the client, and the report body the client reads is
+    deliberately left untouched.
+    """
+    flipped = set()
+    for entry in handoff_entries_for_order(order_id):
+        for column in RC_ORIENTATION_COLUMNS.get(str(entry.get("orientation", "")), ()):
+            flipped.add('i5' if column == 'index2' else 'i7')
+    if not flipped:
+        return ""
+    return f" [{'+'.join(sorted(flipped))} reverse-complement applied]"
+
 
 rule send_order_email:
     input:
@@ -906,7 +951,10 @@ rule send_order_email:
         sender   = EMAIL_SENDER,
         receiver = EMAIL_RECIPIENT,
         cc_email = EMAIL_CC,
-        subject  = lambda wildcards: f"Sequencing Report for Order {wildcards.order_id}"
+        subject  = lambda wildcards: (
+            f"Sequencing Report for Order {wildcards.order_id}"
+            f"{rc_orientation_tag(wildcards.order_id)}"
+        )
     run:
         import subprocess, os
         order_id = wildcards.order_id
@@ -930,6 +978,8 @@ rule send_order_email:
 rule send_read_counts_email:
     input:
         csv = f"results/{LIBRARY}-count.csv",
+        # Written by the conversion run and rsynced here; see src/handoff.smk.
+        rc_summary = f"{HANDOFF_DIR}/rc_orientation_summary.csv",
         order_reports = ORDER_ID_REPORTS
     output:
         touch(f"Reports/{LIBRARY}_read_counts_email.done")
@@ -943,14 +993,21 @@ rule send_read_counts_email:
         sender = EMAIL_SENDER,
         receiver = EMAIL_RECIPIENT,
         subject = f"Read counts for {LIBRARY}",
-        body = lambda wildcards: f"Attached: per-lane read counts for {LIBRARY}.",
+        body = lambda wildcards: (
+            f"Attached: per-lane read counts for {LIBRARY}, and the "
+            f"reverse-complement orientation summary. Any project listed in the "
+            f"latter was delivered on a reverse-complemented barcode because the "
+            f"submitted i5 (or i7) did not match the index reads — the FASTQ "
+            f"filenames carry the sequence actually observed."
+        ),
         cc_email = EMAIL_CC
     run:
         import subprocess
         with open(log[0], "w") as logf:
             result = subprocess.run(
                 ["python3", params.script, params.sender, params.receiver,
-                 params.subject, params.body, input.csv, params.cc_email],
+                 params.subject, params.body,
+                 f"{input.csv};{input.rc_summary}", params.cc_email],
                 stdout=logf, stderr=logf
             )
         if result.returncode != 0:

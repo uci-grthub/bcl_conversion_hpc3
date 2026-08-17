@@ -252,6 +252,16 @@ host or baked into the image. Two dependencies remain **system-level**:
   length from observed Undetermined reads, adds decoy entries, and derives fqtk's matching thresholds
 - **`scripts/validate_barcode_hamming_distance.py`** - Sample-sheet barcode distance check
   (prefix-aware; can auto-fix `BarcodeMismatchesIndex`)
+- **`src/single_cell.py`** - 10x/Parse/BD detection: project name *or* the Summary
+  "Sample sheet tab", so a single-cell order whose name carries no `10x`/`parse`/`bd`
+  token still keeps Illumina default FASTQ naming
+- **`scripts/backfill_rc_barcode_names.py`** - Repairs a run that already shipped with
+  workbook barcodes where a reverse-complement orientation had won (dry-run by default)
+- **`scripts/relabel_library.sh`** - Repairs a run produced under the wrong `library_name`:
+  renames every path and rewrites the text artifacts that reference them (dry-run by default)
+- **`tests/`** - Unit tests for the barcode/orientation logic: `bash
+  scripts/container_exec.sh python tests/run_tests.py` (or `pixi run test`). Plain
+  pytest-style functions with a bundled runner, so no pytest dependency is needed
 
 ## Platforms & Auto-Detection
 
@@ -376,7 +386,28 @@ bash run_hpc3.sh output/lane1
 - Creates project subdirectories
 - Renames FASTQ files using renaming map: `{Run}-L{Lane}-G{Group}-P{Position}-{Barcode}`
 - Index reads (I1/I2) are deleted per project unless the project name contains one of
-  `10x`, `BD`, `parse`, `SMK`, `CITE`, `Hashtag` (case variants included), or `no_demux` is set
+  `10x`, `BD`, `parse`, `SMK`, `CITE`, `Hashtag` (case variants included), the project sits
+  on a single-cell Summary tab (`src/single_cell.py`), or `no_demux` is set
+
+### 2b. Delivered barcode names (reverse-complement orientations)
+- When a project's submitted i5 (or i7) does not match the index reads, the RC pass wins
+  and bcl-convert demultiplexes against the reverse complement. The delivered filenames
+  then have to carry the sequence actually observed, or the client cannot match our FASTQs
+  against their own barcode list.
+- `generate_effective_renaming_map` writes
+  `results/lane{N}/renaming_map_lane{N}_effective.csv`: the same map plus
+  `orientation`, `index_workbook` and `index2_workbook` columns. Everything downstream
+  (fastp targets, plots, md5sums, read counts) reads the *effective* map.
+- `pick_orientation` is a **checkpoint**: any target whose filename embeds a barcode waits
+  for it (`await_orientation_decision()` in `src/workflow_defs.smk`).
+- `normalize_project_fastq_names` re-stems already-staged files onto the delivered barcode.
+  Matching is on the barcode-free prefix `{Run}-L{Lane}-G{Group}-P{Position}`, so a file can
+  only ever be renamed onto itself.
+- `handoff/rc_orientation_summary.csv` records every flipped project (order, lane, workbook
+  vs delivered barcodes, `rc_fraction`); the delivery workflow attaches it to the read-counts
+  email and tags the order's subject line from the per-project handoff fragments.
+- For a run that already shipped with workbook barcodes: `python3
+  scripts/backfill_rc_barcode_names.py --config-id lane{N}` (dry-run), then `--apply`.
 
 ### 3. Post-hoc Demultiplexing (fqtk)
 ```bash

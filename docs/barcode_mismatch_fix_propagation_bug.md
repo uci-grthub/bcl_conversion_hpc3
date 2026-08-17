@@ -29,12 +29,11 @@ were never touched and stayed at `1`. bcl-convert rejects that mismatch since
 it treats identical index values as one group that must share one tolerance
 value.
 
-The generating rule (`validate_barcode_hamming_distances`, `Snakefile:2940`)
-also declares the script only as a `params`, not an `input`, so editing the
-script doesn't invalidate the already-produced
-`SampleSheet_{config_id}_validated.csv`. The first fix attempt therefore
-required manually forcing a rerun of that rule — Snakemake had no way to know
-the fix logic itself had changed.
+The generating rule (`validate_barcode_hamming_distances`) also declared the
+script only as a `params`, not an `input`, so editing the script did not
+invalidate the already-produced `SampleSheet_{config_id}_validated.csv`. The
+first fix attempt therefore required manually forcing a rerun of that rule —
+Snakemake had no way to know the fix logic itself had changed.
 
 ## Fix
 
@@ -45,14 +44,15 @@ before writing `BarcodeMismatchesIndex1 = 0`, and likewise for `index2` /
 value end up with matching tolerance, satisfying bcl-convert's per-index
 consistency requirement.
 
-## Note for future runs
+## Second fix: make the script an input
 
-Because the script is a `params:` dependency rather than an `input:` of
-`validate_barcode_hamming_distances`, changing the script does not by itself
-trigger Snakemake to regenerate stale `SampleSheet_{config_id}_validated.csv`
-files. After changing this script, force a rerun of the affected
-`validate_barcode_hamming_distances` job(s) (delete the stale
-`results/{config_id}/SampleSheet_{config_id}_validated.csv` and
-`logs/{config_id}/barcode_hamming_validation_{config_id}.*`, or pass
-`-R validate_barcode_hamming_distances` to snakemake) rather than assuming a
-rerun will pick it up automatically.
+`scripts/validate_barcode_hamming_distance.py` is now an `input:` of both
+`validate_barcode_hamming_distances` and `validate_barcode_hamming_distances_rc`
+rather than a `params:`. The profile sets `rerun-triggers: mtime`, so with the
+script as a declared input, editing the fix logic invalidates every
+`SampleSheet_{config_id}_validated.csv` and Snakemake regenerates them on its own.
+
+Before this change, a fix to the fixer left every stale validated sheet in place
+and the operator had to know to delete them (or pass
+`-R validate_barcode_hamming_distances`) — which is exactly what went wrong the
+first time this bug was fixed.

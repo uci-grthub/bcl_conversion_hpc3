@@ -74,6 +74,10 @@ container-exec = "bash scripts/container_exec.sh"
 init = "bash scripts/init_run.sh"
 # Validate the metadata workbook before a real run
 validate = "python run_validation.py"
+# Unit tests (tests/). Plain pytest functions, run by a bundled runner so the
+# suite works without adding pytest to the environment: `pixi run test backfill`
+# limits it to matching files. In the container: `pixi run container-exec python tests/run_tests.py`
+test = "python tests/run_tests.py"
 # BCL conversion for a single lane, e.g. `pixi run convert output/lane1`
 convert = "bash run_hpc3.sh"
 # Rule/dependency graphs

@@ -2,6 +2,7 @@
 import os
 import re
 import subprocess
+import sys
 import glob
 import yaml
 import pandas as pd
@@ -15,13 +16,34 @@ configfile: "snakemake_config.yaml"
 # After merge, all values (including library_name, data_dir, metadata) come from the merged config
 _PROJECT_CONFIG = f"snakemake_config_project.yaml"
 
+# `--config key=value` is merged into `config` by Snakemake before this point, so
+# the project-config merge below would silently overwrite any CLI override whose
+# key also appears in snakemake_config_project.yaml. Capture the CLI values and
+# re-apply them last, so precedence is: base < project < --config.
+_CLI_CONFIG = dict(getattr(workflow.config_settings, "config", {}) or {})
+
 if os.path.exists(_PROJECT_CONFIG):
     import yaml as _yaml
     with open(_PROJECT_CONFIG, 'r') as _f:
         _project_config = _yaml.safe_load(_f) or {}
     # Merge: project-specific config overrides default config
     config.update(_project_config)
+
+config.update(_CLI_CONFIG)
 # All config values read AFTER merge - project-specific config takes priority
+
+
+def _cfg_truthy(value):
+    """Coerce a config flag to bool.
+
+    A value from `--config dryrun=false` arrives as the *string* "false",
+    which is truthy. Anything read as an on/off switch must go through this.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 # Fail fast if required config values are missing or empty
 _required = {"library_name", "metadata", "data_dir"}
@@ -33,11 +55,11 @@ SAMPLE_SHEET = config.get("sample_sheet", "src/SampleSheet_default.csv")
 NUM_READS = config.get("num_reads", 2)
 LIBRARY = config.get("library_name", "xR079")  # From merged config (project-specific if exists)
 START_S = config.get("start_s", 1)
-DRYRUN = config.get("dryrun", False)
+DRYRUN = _cfg_truthy(config.get("dryrun", False))
 DATA_DIR = config.get("data_dir", "/staging/nextcloud/NovaseqX/20260115_LH00626_0088_A233NM2LT4")  # From merged config
 TILES = config.get("tiles", "1_1101")
 FLEXBAR_BIN = config.get("flexbar_bin", "")
-USE_ANCIENT = config.get("use_ancient", True)
+USE_ANCIENT = _cfg_truthy(config.get("use_ancient", True))
 REPORT_UNDETERMINED_CONFIGS = config.get("report_undetermined_configs", [])
 _effective_keep = list(config.get("keep_undetermined_configs", []))
 for _c in REPORT_UNDETERMINED_CONFIGS:
@@ -58,7 +80,7 @@ SCRATCH_DIR = config.get("scratch_dir", "")
 
 # When true, force CreateFastqForIndexReads=1 in every generated SampleSheet so DRAGEN
 # emits index reads as FASTQs (no index-based demultiplexing). Default: false.
-NO_DEMUX = bool(config.get("no_demux", False))
+NO_DEMUX = _cfg_truthy(config.get("no_demux", False))
 
 LOW_READS_THRESHOLD = config.get("low_reads_threshold", 1_000)
 
@@ -106,6 +128,10 @@ if _restrict_lanes:
 # Metadata path from merged config (project-specific if exists, otherwise base config)
 metadata = config.get("metadata", "metadata/SampleSheet.xlsx")
 METADATA_FILE = config.get("metadata")  # From merged config
+# Exported so helper scripts spawned by rules (rename_fastqs.py, rename_pipeline_outputs.py, …)
+# read single-cell "Sample sheet tab" entries from the same workbook.
+if METADATA_FILE:
+    os.environ["PIPELINE_METADATA_FILE"] = os.path.abspath(METADATA_FILE)
 VALIDATION_XLSX = f"metadata/metadata_validation_{os.path.splitext(os.path.basename(metadata))[0]}.xlsx" if metadata else None
 LANE_CONFIGS = []
 PROJECT_LOOKUP = {}
@@ -736,6 +762,7 @@ rule all:
         ([VALIDATION_XLSX] if VALIDATION_XLSX else []),
         expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
         expand("results/{config_id}/fqtk_{config_id}.done", config_id=FQTK_CONFIGS),
+        f"{HANDOFF_DIR}/rc_orientation_summary.csv",
         # Written last: its presence is what tells the delivery host the run is complete.
         f"{HANDOFF_DIR}/manifest.yaml",
         # "results/check_index_rc_swap.txt"
@@ -792,7 +819,7 @@ rule fastp_sample:
 rule normalize_project_fastq_names:
     input:
         done = "output/{config_id}/{project}/.project_done",
-        renaming_map = "results/{config_id}/renaming_map_{config_id}.csv"
+        renaming_map = "results/{config_id}/renaming_map_{config_id}_effective.csv"
     output:
         sentinel = touch("output/{config_id}/{project}/.fastq_names_done")
     wildcard_constraints:
@@ -921,6 +948,14 @@ rule normalize_project_fastq_names:
                     if not os.path.exists(legacy_path):
                         continue
                     os.rename(legacy_path, canonical_path)
+
+            # The staging renames ran before pick_orientation, so files may still
+            # carry the workbook barcode where an RC orientation won. Re-stem them
+            # onto the delivered barcode. Matching is on the barcode-free prefix,
+            # so this can only ever rename a sample onto itself.
+            restemmed = restem_by_position(project_dir, project_rows.to_dict("records"))
+            for _src, _dst in restemmed:
+                _logf.write(f"Re-stemmed {os.path.basename(_src)} -> {os.path.basename(_dst)}\n")
         except Exception:
             _logf.write(traceback.format_exc())
             raise
@@ -1122,7 +1157,7 @@ rule compile_read_counts:
             config_id=[c for c, p in CONFIG_PROJECT_PAIRS],
             project=[p for c, p in CONFIG_PROJECT_PAIRS],
         ),
-        maps = expand("results/{config_id}/renaming_map_{config_id}.csv", config_id=CONFIG_IDS),
+        maps = expand("results/{config_id}/renaming_map_{config_id}_effective.csv", config_id=CONFIG_IDS),
         flexbar_done = expand("results/{config_id}/flexbar_{config_id}.done", config_id=FLEXBAR_CONFIGS),
         fqtk_done    = expand("results/{config_id}/fqtk_{config_id}.done", config_id=FQTK_CONFIGS)
     output:
@@ -1146,7 +1181,10 @@ rule compile_read_counts:
                 print(f"Skipping missing renaming map {map_path}")
                 continue
 
-            config_id = os.path.basename(map_path).replace("renaming_map_", "").replace(".csv", "")
+            config_id = (os.path.basename(map_path)
+                         .replace("renaming_map_", "")
+                         .replace("_effective", "")
+                         .replace(".csv", ""))
             
             # Read Demultiplex_Stats.csv for this config_id.
             # Prefer the renamed/organized copy under output/, but fall back to the
@@ -1250,7 +1288,7 @@ rule compile_read_counts:
 
                 # Determine display label: use Illumina sample name for 10x/Parse/BD; otherwise use stem (includes barcode)
                 try:
-                    is_special = is_parse_or_10x(project)
+                    is_special = is_parse_or_10x(project, lane=lane, group=group)
                 except Exception:
                     is_special = False
                 label = sample_name if is_special else stem
@@ -1975,7 +2013,7 @@ rule fqtk_stage_project:
             s_num   = _s_num_offset + _fqtk_i + 1
             src_r1  = os.path.abspath(f"output/{config_id}/fqtk/{name}.R1.fq.gz")
             src_r2  = os.path.abspath(f"output/{config_id}/fqtk/{name}.R2.fq.gz")
-            if is_parse_or_10x(project_orig):
+            if is_parse_or_10x(project_orig, lane=lane, group=group):
                 dst_r1 = os.path.abspath(f"{proj_dir}/{name}_S{s_num}_L{lane:03d}_R1_001.fastq.gz")
                 dst_r2 = os.path.abspath(f"{proj_dir}/{name}_S{s_num}_L{lane:03d}_R2_001.fastq.gz")
             else:
@@ -2353,7 +2391,12 @@ rule validate_barcode_hamming_distances:
     With --fix: sets BarcodeMismatchesIndex1/2 to 0 for conflicting samples and retries.
     """
     input:
-        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}.csv")
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}.csv"),
+        # An input, not a params: the --fix logic lives in this script, so a change
+        # to it must invalidate the validated sheet. As a params it did not, and a
+        # fix to the fixer silently left every stale
+        # SampleSheet_{config_id}_validated.csv in place until someone forced a rerun.
+        script = "scripts/validate_barcode_hamming_distance.py"
     output:
         report = "logs/{config_id}/barcode_hamming_validation_{config_id}.txt",
         marker = touch("logs/{config_id}/barcode_hamming_validation_{config_id}.done"),
@@ -2365,13 +2408,12 @@ rule validate_barcode_hamming_distances:
     wildcard_constraints:
         config_id = VALIDATE_CONFIG_ID_PATTERN
     params:
-        script = "scripts/validate_barcode_hamming_distance.py",
         tolerance = 1
     shell:
         """
         (
         echo "Validating barcode Hamming distances for {wildcards.config_id}..."
-        python3 {params.script} \
+        python3 {input.script} \
             --samplesheets {input.samplesheet} \
             --mismatch-tolerance {params.tolerance} \
             --output {output.report} \
@@ -2430,10 +2472,17 @@ rule bcl_convert:
     shell:
         """
         (
+        cleanup_done=0
         cleanup() {{
-            pkill -P $$ 2>/dev/null || true
+            [ "$cleanup_done" = "1" ] && return 0
+            cleanup_done=1
+            trap - INT TERM
+            # $BASHPID, not $$: inside this subshell $$ expands to the PARENT
+            # shell's PID, so `pkill -P $$` matches this subshell itself and
+            # re-enters the trap in an endless signal loop.
+            pkill -P "$BASHPID" 2>/dev/null || true
         }}
-        trap cleanup INT TERM
+        trap 'cleanup; exit 143' INT TERM
 
         run_bcl_convert() {{
             local sample_sheet_path="$1"
@@ -2470,12 +2519,13 @@ rule bcl_convert:
         find "$dragen_out" -name "*.fastq.gz" -delete 2>/dev/null || true
         mkdir -p "$dragen_out"
 
-        run_bcl_convert {input.sample_sheet}
-
-        dragen_status=$?
-        if [ $dragen_status -ne 0 ]; then
+        # `|| bcl_status=$?` is required: under `set -e` a bare call would abort
+        # the shell before $? could be inspected, making the check below dead code.
+        bcl_status=0
+        run_bcl_convert {input.sample_sheet} || bcl_status=$?
+        if [ "$bcl_status" -ne 0 ]; then
             cleanup
-            exit $dragen_status
+            exit $bcl_status
         fi
 
         if [ ! -z "{params.scratch_dir}" ]; then
@@ -3112,7 +3162,10 @@ rule validate_barcode_hamming_distances_rc:
     dual-indexed samples, and checks i7 alone for single-indexed samples.
     """
     input:
-        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}_rc.csv")
+        samplesheet = maybe_ancient("results/{config_id}/SampleSheet_{config_id}_rc.csv"),
+        # See validate_barcode_hamming_distances: an input so that editing the
+        # fix logic invalidates the validated sheet.
+        script = "scripts/validate_barcode_hamming_distance.py"
     output:
         report = "logs/{config_id}/barcode_hamming_validation_rc_{config_id}.txt",
         marker = touch("logs/{config_id}/barcode_hamming_validation_rc_{config_id}.done"),
@@ -3124,13 +3177,12 @@ rule validate_barcode_hamming_distances_rc:
     wildcard_constraints:
         config_id = "[^/]+"
     params:
-        script = "scripts/validate_barcode_hamming_distance.py",
         tolerance = 1
     shell:
         """
         (
         echo "Validating RC sample sheet barcode Hamming distances for {wildcards.config_id}..."
-        python3 {params.script} \
+        python3 {input.script} \
             --samplesheets {input.samplesheet} \
             --mismatch-tolerance {params.tolerance} \
             --output {output.report} \
@@ -3232,10 +3284,15 @@ rule bcl_convert_rc:
             if rename_result.returncode != 0:
                 raise RuntimeError(f"RC FASTQ rename failed for {wildcards.config_id}")
 
-rule pick_orientation:
+checkpoint pick_orientation:
     """Compare first-pass and RC-pass Demultiplex_Stats for each suspect project
     and write a JSON decision file mapping old Sample_Project name -> 'original' or 'rc'.
     Non-suspect projects are omitted (callers default to 'original').
+
+    A checkpoint, not a plain rule: the winning orientation decides the barcode
+    that appears in every delivered filename, and fastp/plot targets carry that
+    barcode in their wildcards. Those targets therefore cannot be expanded until
+    this has run. See await_orientation_decision() in src/workflow_defs.smk.
     """
     input:
         done_orig = maybe_ancient(".output/{config_id}/.done"),
@@ -3357,6 +3414,131 @@ rule pick_orientation:
                     elif os_mod.path.isdir(item_path) and item in rc_projects:
                         lf.write(f"Removing original staging dir for RC-winning project: {item_path}\n")
                         _shutil_rc.rmtree(item_path)
+
+rule generate_effective_renaming_map:
+    """Rewrite the renaming map with the barcodes bcl-convert actually demultiplexed with.
+
+    The workbook map holds what the client submitted. When an RC orientation wins,
+    the sequence present in the index reads is the reverse complement of that, and
+    the delivered filename has to say so — otherwise the client cannot match our
+    FASTQs against their own barcode list. Projects with no RC decision are copied
+    through unchanged, so for a run with no suspects this is a faithful copy plus
+    the three provenance columns.
+    """
+    input:
+        map = "results/{config_id}/renaming_map_{config_id}.csv",
+        decision = "logs/{config_id}/orientation_decision_{config_id}.json"
+    output:
+        map = "results/{config_id}/renaming_map_{config_id}_effective.csv"
+    log:
+        "logs/{config_id}/generate_effective_renaming_map_{config_id}.log"
+    wildcard_constraints:
+        config_id = "[^/]+"
+    run:
+        import json as json_mod
+
+        with open(input.decision) as f:
+            decision = json_mod.load(f)
+
+        map_df = pd.read_csv(input.map, dtype=str, keep_default_na=False)
+        effective = apply_orientation_to_map(map_df, decision)
+        # Atomic, like the workbook map: this file is read at parse time by
+        # _fastp_rows_for_config in every spawned job, so a reader must never see
+        # a partially written copy.
+        atomic_to_csv(effective, output.map, index=False)
+
+        with open(log[0], 'w') as lf:
+            changed = effective[effective['orientation'] != 'original']
+            lf.write(f"Orientation decision: {decision or '{}'}\n")
+            lf.write(f"{len(effective)} rows, {len(changed)} with a non-original orientation\n")
+            for _, row in changed.iterrows():
+                lf.write(
+                    f"{row['Sample_Project']} {row['Position']} {row['orientation']}: "
+                    f"i7 {row['index_workbook']}->{row['index']}, "
+                    f"i5 {row['index2_workbook']}->{row['index2']}\n"
+                )
+
+rule rc_orientation_summary:
+    """Run-level record of every project delivered on a reverse-complemented barcode.
+
+    Written under handoff/ rather than Reports/: Reports/ belongs to the delivery
+    workflow, and this is conversion-side evidence the delivery host consumes (it
+    attaches the file to the read-counts email). Per-order orientation flags reach
+    delivery through the project fragments in src/handoff.smk, so an order's email
+    never has to wait on another order's lanes.
+    """
+    input:
+        decisions = expand("logs/{config_id}/orientation_decision_{config_id}.json", config_id=CONFIG_IDS),
+        candidates = expand("logs/{config_id}/rc_candidates_{config_id}.json", config_id=CONFIG_IDS),
+        maps = expand("results/{config_id}/renaming_map_{config_id}_effective.csv", config_id=CONFIG_IDS)
+    output:
+        csv = f"{HANDOFF_DIR}/rc_orientation_summary.csv"
+    log:
+        "logs/rc_orientation_summary.log"
+    run:
+        import json as json_mod
+
+        COLUMNS = ["order_id", "config_id", "project", "group", "orientation",
+                   "workbook_i7", "delivered_i7", "workbook_i5", "delivered_i5",
+                   "rc_fraction", "n_samples"]
+        rows = []
+
+        for decision_path in input.decisions:
+            config_id = os.path.basename(os.path.dirname(decision_path))
+            with open(decision_path) as f:
+                decision = json_mod.load(f)
+            rc_projects = {p: o for p, o in decision.items() if str(o).startswith("rc")}
+            if not rc_projects:
+                continue
+
+            # rc_fraction is the evidence behind the decision, carried per index pair.
+            # Keep the strongest pair per project.
+            fractions = {}
+            candidates_path = f"logs/{config_id}/rc_candidates_{config_id}.json"
+            if os.path.exists(candidates_path):
+                with open(candidates_path) as f:
+                    for record in json_mod.load(f):
+                        project = record.get("project")
+                        try:
+                            fraction = float(record.get("rc_fraction", 0) or 0)
+                        except (TypeError, ValueError):
+                            fraction = 0.0
+                        fractions[project] = max(fractions.get(project, 0.0), fraction)
+
+            map_df = pd.read_csv(f"results/{config_id}/renaming_map_{config_id}_effective.csv",
+                                 dtype=str, keep_default_na=False)
+            for project, orientation in sorted(rc_projects.items()):
+                project_rows = map_df[map_df["Sample_Project"].str.strip() == project]
+                if project_rows.empty:
+                    continue
+                first = project_rows.iloc[0]
+                group = str(first.get("Group", "")).strip()
+                try:
+                    lane = int(float(first.get("Lane", 0)))
+                    order_id = ORDER_ID_LOOKUP.get((lane, int(float(group))), "")
+                except (TypeError, ValueError):
+                    order_id = ""
+                rows.append({
+                    "order_id": order_id,
+                    "config_id": config_id,
+                    "project": project,
+                    "group": group,
+                    "orientation": orientation,
+                    "workbook_i7": first.get("index_workbook", ""),
+                    "delivered_i7": first.get("index", ""),
+                    "workbook_i5": first.get("index2_workbook", ""),
+                    "delivered_i5": first.get("index2", ""),
+                    "rc_fraction": f"{fractions.get(project, 0.0):.4f}",
+                    "n_samples": len(project_rows),
+                })
+
+        os.makedirs(os.path.dirname(output.csv) or ".", exist_ok=True)
+        pd.DataFrame(rows, columns=COLUMNS).to_csv(output.csv, index=False)
+        with open(log[0], "w") as lf:
+            lf.write(f"{len(rows)} project(s) delivered on a reverse-complemented barcode\n")
+            for row in rows:
+                lf.write(f"{row['config_id']} {row['project']} (order {row['order_id']}): "
+                         f"{row['orientation']}, {row['n_samples']} samples\n")
 
 rule update_validation_workbook:
     """Regenerate the metadata validation workbook after all orientation decisions

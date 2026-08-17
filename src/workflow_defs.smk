@@ -16,6 +16,7 @@ except Exception:
 # Import shared validation function
 from metadata_validation import validate_metadata_and_write_report
 from barcode_collisions import select_projects_for_fqtk
+from rename_pipeline_outputs import restem_by_position
 
 
 # Re-export for backward compatibility (in case it's called as workflow_defs.validate_metadata_and_write_report)
@@ -52,6 +53,80 @@ def atomic_to_csv(df, path, **kwargs):
     """DataFrame.to_csv(path) with the atomic publish of atomic_output."""
     with atomic_output(path) as fh:
         df.to_csv(fh, **kwargs)
+
+
+def revcomp(seq):
+    """Reverse complement a barcode. Non-ACGTN characters pass through unchanged."""
+    comp = str.maketrans('ATGCNatgcn', 'TACGNtacgn')
+    return str(seq).translate(comp)[::-1]
+
+
+# How an orientation decision from pick_orientation maps onto the two index
+# columns. Keys are the values written to orientation_decision_{config_id}.json.
+RC_ORIENTATION_COLUMNS = {
+    'rc_i7': ('index',),
+    'rc_i5': ('index2',),
+    'rc_both': ('index', 'index2'),
+}
+
+
+def apply_orientation_to_map(map_df, decision):
+    """Return a copy of a renaming map carrying the *delivered* barcodes.
+
+    `decision` is the {original Sample_Project: orientation} mapping written by
+    the pick_orientation checkpoint. Projects it does not mention keep the
+    workbook barcodes (pick_orientation only records suspects). The workbook
+    values are preserved alongside so the report and the operator summary can
+    show both.
+    """
+    out = map_df.copy()
+    out['index_workbook'] = out['index']
+    out['index2_workbook'] = out['index2']
+    out['orientation'] = out['Sample_Project'].astype(str).str.strip().map(
+        lambda p: str(decision.get(p, 'original'))
+    )
+
+    for orientation, columns in RC_ORIENTATION_COLUMNS.items():
+        rows = out['orientation'] == orientation
+        if not rows.any():
+            continue
+        for column in columns:
+            # Blank/NaN index cells stay blank — single-index and 10x rows have no i5.
+            values = out.loc[rows, column]
+            filled = values.notna() & (values.astype(str).str.strip() != '') \
+                & (values.astype(str).str.strip().str.lower() != 'nan')
+            out.loc[rows & filled, column] = values[filled].map(revcomp)
+
+    return out
+
+
+def effective_renaming_map_path(config_id, results_base="results"):
+    """Path to the map that names delivered files for `config_id`.
+
+    The effective map carries the barcodes DRAGEN actually demuxed with; the
+    workbook map carries what the client submitted. They differ only for
+    projects where an RC orientation won. Falls back to the workbook map when
+    the orientation decision has not landed yet — callers that build DAG
+    targets must gate on the pick_orientation checkpoint first, via
+    await_orientation_decision().
+    """
+    effective = os.path.join(results_base, config_id, f"renaming_map_{config_id}_effective.csv")
+    if os.path.exists(effective):
+        return effective
+    return os.path.join(results_base, config_id, f"renaming_map_{config_id}.csv")
+
+
+def await_orientation_decision(config_id):
+    """Force the pick_orientation checkpoint before expanding barcode-bearing targets.
+
+    Barcodes are only final once pick_orientation has compared the two demux
+    passes, so any target whose filename embeds a barcode has to wait for it.
+    No-ops outside a Snakemake workflow (unit tests, standalone scripts).
+    """
+    checkpoints_obj = globals().get('checkpoints')
+    if checkpoints_obj is None or not hasattr(checkpoints_obj, 'pick_orientation'):
+        return
+    checkpoints_obj.pick_orientation.get(config_id=config_id)
 
 
 # Sanitize Masking strings for filenames: strip appended project-like suffixes
@@ -205,12 +280,17 @@ def get_project_links_from_yaml(yaml_path, project, lane=None, order_id=None):
         return "https://precision.biochem.uci.edu/"
 
 # 10x/Parse/BD naming: keep Illumina default (<sample>_S<num>_L00<lane>_R<read>_001.fastq.gz)
-def is_parse_or_10x(project_name):
-    try:
-        p = str(project_name or "").lower()
-    except Exception:
-        p = ""
-    return ("10x" in p) or ("parse" in p) or ("bd" in p)
+# Detection matches the project name OR the Summary "Sample sheet tab" entry, so
+# single-cell orders whose name lacks a 10x/Parse/BD token are still recognized.
+try:
+    from single_cell import is_single_cell_project as is_parse_or_10x
+except Exception:
+    def is_parse_or_10x(project_name, lane=None, group=None):
+        try:
+            p = str(project_name or "").lower()
+        except Exception:
+            p = ""
+        return ("10x" in p) or ("parse" in p) or ("bd" in p)
 
 
 def is_special_atac_project_or_sheet(name):
@@ -1266,13 +1346,6 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
                     print(f"Error parsing compact masking '{masking_str}' for lane {lane}: {e}")
 
             masking_for_cycles = masking_str
-            if strip_i2:
-                try:
-                    parts = [p.strip() for p in masking_str.split(',') if p and str(p).strip()]
-                    parts = [p for p in parts if not p.strip().upper().startswith('I2:')]
-                    masking_for_cycles = ', '.join(parts)
-                except Exception:
-                    masking_for_cycles = masking_str
             try:
                 parts = [p.strip() for p in masking_for_cycles.split(',')]
                 cycles = []
@@ -1334,9 +1407,7 @@ def generate_lane_samplesheets(metadata_file, lane_configs, project_lookup, mask
         # not in physical index reads. DRAGEN cannot use I in non-index reads, so these
         # samples cannot be demultiplexed by DRAGEN. Generate barcode FASTA then exclude
         # them from the DRAGEN sheet; src/inline_demux.py processes Undetermined reads post-hoc.
-        def _revcomp(seq):
-            comp = str.maketrans('ATGCNatgcn', 'TACGNtacgn')
-            return str(seq).translate(comp)[::-1]
+        _revcomp = revcomp
 
         if 'Sample_Project' in ss_data.columns:
             flexbar_mask = ss_data['Sample_Project'].str.contains('flexbar|pareseq', case=False, na=False, regex=True)
@@ -1725,10 +1796,13 @@ def get_project_plot_targets(project, lane_filter=None, order_id=None):
     targets = []
     
     for config_id in CONFIG_IDS:
+        # Kept outside the try: _fastp_rows_for_config forces the pick_orientation
+        # checkpoint, and that exception is Snakemake's signal to defer expanding
+        # this target. Swallowing it here would silently yield an empty target list.
+        df = _fastp_rows_for_config(config_id)
+        if df is None:
+            continue
         try:
-            df = _fastp_rows_for_config(config_id)
-            if df is None:
-                continue
             df['Sample_Project'] = df['Sample_Project'].astype(str)
             # Resolve renamed project name -> original name for CSV lookup
             orig_project = PROJECT_RENAME_MAP_INV.get((config_id, project), project)
@@ -1772,7 +1846,7 @@ def get_project_plot_targets(project, lane_filter=None, order_id=None):
                 position = str(row.get('Position', f"P{idx+1:03d}")).strip()
 
                 output_project = PROJECT_RENAME_MAP.get((config_id, orig_project), orig_project)
-                if is_parse_or_10x(orig_project):
+                if is_parse_or_10x(orig_project, lane=lane_val, group=group):
                     if not sample_name or sample_name.lower() == 'nan':
                         continue
                     path = f"{output_project}/{sample_name}"
@@ -1838,7 +1912,7 @@ def _fastp_row_path(row, idx):
 
     position = str(row.get('Position', f"P{idx+1:03d}")).strip()
 
-    if is_parse_or_10x(project):
+    if is_parse_or_10x(project, lane=lane, group=group):
         if not sample_name or sample_name.lower() == 'nan':
             return None
         return f"{output_project}/{sample_name}" if output_project and output_project.lower() != 'nan' else sample_name
@@ -1848,7 +1922,10 @@ def _fastp_row_path(row, idx):
 
 def _fastp_rows_for_config(config_id):
     frames = []
-    map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
+    # Every caller of this function builds a filename containing a barcode, so
+    # the delivered orientation has to be settled before the DAG is expanded.
+    await_orientation_decision(config_id)
+    map_path = effective_renaming_map_path(config_id)
     if os.path.exists(map_path):
         try:
             frames.append(pd.read_csv(map_path))
@@ -1898,7 +1975,9 @@ def get_fastp_sample_input(wildcards):
     sample_path = wildcards.sample_path
 
     # Try to use renaming map first, then injected flexbar rows.
-    map_path = f"results/{config_id}/renaming_map_{config_id}.csv"
+    # The resolved FASTQ names embed a barcode, so wait for the orientation decision.
+    await_orientation_decision(config_id)
+    map_path = effective_renaming_map_path(config_id)
     import time as _time
     df = None
     if os.path.exists(map_path):
@@ -1949,7 +2028,7 @@ def get_fastp_sample_input(wildcards):
                     output_project = PROJECT_RENAME_MAP.get((config_id, project), project)
                     prefix = f"{prefix}/{output_project}"
                 
-                if is_parse_or_10x(project):
+                if is_parse_or_10x(project, lane=lane, group=group):
                     import glob as _glob
                     matches = _glob.glob(f"{prefix}/{sample_name}_S*_L{lane:03d}_R1_001.fastq.gz")
                     if not matches:
@@ -2011,10 +2090,13 @@ def get_project_fastp_targets(wildcards):
     targets = []
     
     for config_id in CONFIG_IDS:
+        # Kept outside the try: _fastp_rows_for_config forces the pick_orientation
+        # checkpoint, and that exception is Snakemake's signal to defer expanding
+        # this target. Swallowing it here would silently yield an empty target list.
+        df = _fastp_rows_for_config(config_id)
+        if df is None:
+            continue
         try:
-            df = _fastp_rows_for_config(config_id)
-            if df is None:
-                continue
             df['Sample_Project'] = df['Sample_Project'].astype(str)
 
             # Filter for this project, allowing flexbar projects to resolve via
