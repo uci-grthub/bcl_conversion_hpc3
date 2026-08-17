@@ -923,11 +923,11 @@ def rc_orientation_tag(order_id):
     """
     flipped = set()
     for entry in handoff_entries_for_order(order_id):
-        for column in RC_ORIENTATION_COLUMNS.get(str(entry.get("orientation", "")), ()):
-            flipped.add('i5' if column == 'index2' else 'i7')
+        label = rc_index_label(entry.get("orientation", ""))
+        flipped.update(tag for tag in label.split('+') if tag)
     if not flipped:
         return ""
-    return f" [{'+'.join(sorted(flipped))} reverse-complement applied]"
+    return f" [{rc_tags_label(flipped)} reverse-complement applied]"
 
 
 rule send_order_email:
@@ -995,10 +995,15 @@ rule send_read_counts_email:
         subject = f"Read counts for {LIBRARY}",
         body = lambda wildcards: (
             f"Attached: per-lane read counts for {LIBRARY}, and the "
-            f"reverse-complement orientation summary. Any project listed in the "
-            f"latter was delivered on a reverse-complemented barcode because the "
-            f"submitted i5 (or i7) did not match the index reads — the FASTQ "
-            f"filenames carry the sequence actually observed."
+            f"reverse-complement orientation summary.\n\n"
+            f"The read-count table now carries an 'index_rc' column alongside "
+            f"'counts' in each lane/group block. It is blank when the project was "
+            f"demultiplexed and delivered on the barcodes as submitted, and reads "
+            f"'i7', 'i5', or 'i7+i5' when that index had to be reverse-complemented "
+            f"to match the index reads. The FASTQ filenames for those projects carry "
+            f"the sequence actually observed, not the submitted one.\n\n"
+            f"The orientation summary lists only the flagged projects, with the "
+            f"submitted and delivered barcode for each."
         ),
         cc_email = EMAIL_CC
     run:

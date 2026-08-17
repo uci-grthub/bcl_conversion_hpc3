@@ -459,8 +459,10 @@ bash run_delivery.sh Reports/order_0626I-08/index.html
 pixi run snakemake --profile profiles/hpc3 --cores 1 results/iR011-count.csv
 ```
 - Aggregates read counts across all lanes
-- Formats as CSV with lane/group/sample/counts columns
-- Sorted by read count (descending) per lane
+- Formats as CSV with one `lane/group/sample/counts/index_rc` column block per lane-group
+- Samples keep their metadata order within each block
+- `index_rc` flags the submitted index(es) that had to be reverse-complemented to match
+  the index reads (`i7`, `i5`, `i7+i5`); blank means delivered on the barcodes as submitted
 - fqtk-demultiplexed samples never appear in `Demultiplex_Stats.csv`; their counts are read
   from `output/{config_id}/fqtk/demux-metrics.txt` and placed in their real lane/group column
 
@@ -471,7 +473,9 @@ Delivery side.
 ```bash
 bash run_delivery.sh Reports/iR011_read_counts_email.done
 ```
-- Sends read count CSV as attachment
+- Sends the read count CSV and `handoff/rc_orientation_summary.csv` as attachments — the
+  latter is written by the conversion run and rsynced here (see `docs/handoff.md`)
+- `SEND_EMAIL_DRY_RUN=1` composes the message without sending it
 - Uses SMTP over SSL (`smtp.gmail.com:465`, see `src/send_email.py`); authenticates as
   `email_sender` with `GMAIL_APP_PASSWORD` from `.env`
 
