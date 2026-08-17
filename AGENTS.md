@@ -15,4 +15,7 @@ never add a nextcloud/email/share rule to the conversion Snakefile — a rule th
 the delivery side must not parse metadata workbooks or SampleSheets; if it needs a value, add it to a handoff fragment in src/handoff.smk
 partial runs: share links are per project and publish as soon as a fragment lands; order reports and emails wait until every project handoff/manifest.yaml names for that order has arrived — never widen that to "whatever fragments are on disk", it mails customers a partial delivery
 B only executes where nextcloud creds + a mail relay exist, but its DAG dry-runs anywhere with throwaway NEXTCLOUD_* vars
+delivered filenames carry the barcode bcl-convert actually demuxed with: read `renaming_map_{config_id}_effective.csv`, never the workbook map, for anything whose name embeds a barcode. `pick_orientation` is a checkpoint for exactly that reason — call `await_orientation_decision(config_id)` before expanding such targets, and never swallow the exception it raises (that exception is snakemake deferring the expansion)
+single-cell (10x/Parse/BD) detection may need the Summary "Sample sheet tab", so the verdict is decided on the conversion side and shipped in the handoff fragment; the delivery side gets it via `PIPELINE_SINGLE_CELL_PROJECTS`, never by reading the workbook
+
 no `benchmark:` on target-only rules (all, links_only, bcl_convert_only, …) — snakemake counts the benchmark file as an output, so a leftover one makes the target a silent no-op

@@ -37,6 +37,7 @@ That is also why order routing can no longer disagree between the halves.
 ```
 handoff/
   manifest.yaml                              run-level: library, run dir, lanes, orders
+  rc_orientation_summary.csv                 run-level: every project delivered on an RC barcode
   projects/{config_id}---{project}.yaml      one per deliverable project
   flexbar/{config_id}.yaml                   one per flexbar-only config
   alerts/{config_id}---{project}.json        low-reads alert payload (empty list = nothing to report)
@@ -45,6 +46,24 @@ handoff/
 A project fragment carries `order_id`, `group`, `lane`, the original metadata
 project name, the paths of `md5sums.txt`, the read-counts CSV and every fastp
 plot, plus a name/size inventory of the delivered FASTQs.
+
+Two verdicts the conversion side owns, because reaching them needs the metadata
+workbook, travel in the fragment as well:
+
+- `orientation` (plus `workbook_i7`/`delivered_i7`, `workbook_i5`/`delivered_i5`) —
+  whether this project was delivered on a reverse-complemented barcode. The delivery
+  side tags the order's email subject from the fragments of *that order*, never from
+  the run-level `rc_orientation_summary.csv`, so one order's email is never held up
+  by another order's lanes.
+- `single_cell` — whether the project keeps Illumina default FASTQ naming. The answer
+  can depend on the Summary sheet's "Sample sheet tab" (see `src/single_cell.py`), so
+  `report_order_id` passes the order's single-cell project names down to
+  `generate_report.py` in `PIPELINE_SINGLE_CELL_PROJECTS` instead of letting it look
+  for a workbook that is not on this host.
+
+`handoff/rc_orientation_summary.csv` is run-level (it needs every lane's orientation
+decision) and is attached to the read-counts email, which is already a whole-run
+aggregate.
 
 Fragments are written per project, as soon as that project's md5sums, read counts,
 plots and low-reads check are final — not at the end of the run. The delivery

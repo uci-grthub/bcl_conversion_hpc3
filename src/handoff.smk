@@ -9,6 +9,7 @@
 #
 # Layout:
 #   handoff/manifest.yaml                       run-level: library, lanes, orders
+#   handoff/rc_orientation_summary.csv          run-level: projects delivered on an RC barcode
 #   handoff/projects/{config_id}---{project}.yaml   one per deliverable project
 #   handoff/flexbar/{config_id}.yaml            one per flexbar-only config
 #   handoff/alerts/{config_id}---{project}.json low-reads alert payloads
@@ -85,6 +86,38 @@ def _handoff_fastq_inventory(fastq_dir):
     return entries
 
 
+def _handoff_orientation(config_id, orig_project):
+    """Which barcode orientation this project was delivered on.
+
+    Read from the effective renaming map, which generate_effective_renaming_map
+    stamps with the pick_orientation decision. The delivery side flags an order's
+    email subject from this, so it must travel per project: deriving it there from
+    a run-level summary would make one order's email wait on another order's lanes.
+    """
+    empty = {"orientation": "original", "workbook_i7": "", "delivered_i7": "",
+             "workbook_i5": "", "delivered_i5": ""}
+    map_path = f"results/{config_id}/renaming_map_{config_id}_effective.csv"
+    if not os.path.exists(map_path):
+        return empty
+    try:
+        map_df = pd.read_csv(map_path, dtype=str, keep_default_na=False)
+    except Exception:
+        return empty
+    if "orientation" not in map_df.columns:
+        return empty
+    rows = map_df[map_df["Sample_Project"].astype(str).str.strip() == str(orig_project).strip()]
+    if rows.empty:
+        return empty
+    first = rows.iloc[0]
+    return {
+        "orientation": str(first.get("orientation", "original") or "original"),
+        "workbook_i7": str(first.get("index_workbook", "")),
+        "delivered_i7": str(first.get("index", "")),
+        "workbook_i5": str(first.get("index2_workbook", "")),
+        "delivered_i5": str(first.get("index2", "")),
+    }
+
+
 def build_handoff_entry(config_id, project):
     """Everything the delivery workflow needs about one deliverable project."""
     order_id = _handoff_order_id(config_id, project)
@@ -113,6 +146,14 @@ def build_handoff_entry(config_id, project):
         "plots_dir": f"results/{config_id}/{project}",
         "plot_targets": sorted(plot_targets),
         "fastqs": _handoff_fastq_inventory(fastq_dir),
+        # 10x/Parse/BD naming verdict. Decided here because it can depend on the
+        # Summary "Sample sheet tab" (see src/single_cell.py), which only the
+        # conversion host reads; the delivery side would otherwise fall back to
+        # name-only detection and disagree about which FASTQs it is looking for.
+        "single_cell": bool(is_parse_or_10x(orig_project,
+                                           lane=_handoff_lane_for_config(config_id),
+                                           group=_handoff_group(config_id, project))),
+        **_handoff_orientation(config_id, orig_project),
     }
 
 
@@ -126,6 +167,9 @@ rule project_handoff_manifest:
         md5 = "output/{config_id}/{project}/md5sums.txt",
         counts = "results/{config_id}/{project}/read_counts_{project}.csv",
         plots_copied = "output/{config_id}/{project}/.plots_copied",
+        # The orientation columns in the fragment come from this map, so the
+        # fragment must not be written before it exists.
+        renaming_map = "results/{config_id}/renaming_map_{config_id}_effective.csv",
         # The alert payload rather than the .low_reads_checked sentinel: the
         # delivery side reads the payload, and requesting the sentinel alone lets
         # a fragment ship for a project whose payload was never written.
@@ -193,6 +237,7 @@ rule run_handoff_manifest:
         fragments = [handoff_fragment(c, p) for c, p in CONFIG_PROJECT_PAIRS],
         flexbar = expand("handoff/flexbar/{config_id}.yaml", config_id=FLEXBAR_CONFIGS),
         counts = f"results/{LIBRARY}-count.csv",
+        rc_summary = f"{HANDOFF_DIR}/rc_orientation_summary.csv",
     output:
         manifest = f"{HANDOFF_DIR}/manifest.yaml"
     run:
@@ -232,6 +277,7 @@ rule run_handoff_manifest:
             "config_ids": list(CONFIG_IDS),
             "orders": orders,
             "counts_csv": f"results/{LIBRARY}-count.csv",
+            "rc_orientation_summary": f"{HANDOFF_DIR}/rc_orientation_summary.csv",
             "validation_xlsx": VALIDATION_XLSX or "",
             "generated_at": datetime.datetime.now().astimezone().isoformat(),
             "workflow_commit": _rev,
