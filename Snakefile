@@ -1175,6 +1175,11 @@ rule compile_read_counts:
         import pandas as pd
 
         lane_group_counts = {}
+        # (lane, group) -> set of flipped index tags ('i7'/'i5'), for the index_rc column.
+        lane_group_rc = {}
+        # (lane, group) -> set of raw orientation values seen, to catch a block whose
+        # rows disagree (two projects sharing one lane/group with different decisions).
+        lane_group_orientations = {}
 
         for map_path in input.maps:
             if not os.path.exists(map_path):
@@ -1234,6 +1239,16 @@ rule compile_read_counts:
 
                 if not group or group.lower() == "nan":
                     group = "Undetermined"
+
+                # Which submitted index(es) bcl-convert had to reverse-complement for
+                # this project. The effective map carries the pick_orientation
+                # decision; the workbook map (fallback for runs predating it) has no
+                # such column, so every row then reads as delivered-as-submitted.
+                orientation = str(row.get("orientation", "")).strip()
+                rc_label = rc_index_label(orientation)
+                if rc_label:
+                    lane_group_rc.setdefault((lane, group), set()).update(rc_label.split("+"))
+                    lane_group_orientations.setdefault((lane, group), set()).add(orientation)
 
                 index1 = str(row.get("index", "")).strip()
                 if index1.lower() == "nan":
@@ -1426,10 +1441,23 @@ rule compile_read_counts:
 
         max_rows = max(len(v) for v in per_lane_group.values())
 
-        # Include explicit column headers: lane, group, sample, counts for each lane-group pair
+        # One index_rc value per lane/group block. A block maps 1:1 to a project, so
+        # its rows should all agree; say so in the log if they ever don't rather than
+        # silently merging two projects' decisions into one flag.
+        for key, orientations in sorted(lane_group_orientations.items()):
+            if len(orientations) > 1:
+                print(f"Warning: lane/group {key} carries mixed orientations "
+                      f"{sorted(orientations)}; index_rc reports their union")
+        lane_group_rc_label = {
+            key: rc_tags_label(tags) for key, tags in lane_group_rc.items()
+        }
+
+        # Include explicit column headers: lane, group, sample, counts, index_rc for
+        # each lane-group pair. index_rc names the submitted index(es) that had to be
+        # reverse-complemented ('i7', 'i5', 'i7+i5'); blank means delivered as submitted.
         header = [""]
         for (lane, group) in lane_group_pairs_sorted:
-            header.extend(["lane", "group", "sample", "counts"])
+            header.extend(["lane", "group", "sample", "counts", "index_rc"])
 
         rows = []
         for i in range(max_rows):
@@ -1438,9 +1466,10 @@ rule compile_read_counts:
                 entries = per_lane_group.get((lane, group), [])
                 if i < len(entries):
                     name, grp, count = entries[i]
-                    row.extend([str(lane), grp, name, f"{int(count):,}"])
+                    row.extend([str(lane), grp, name, f"{int(count):,}",
+                                lane_group_rc_label.get((lane, group), "")])
                 else:
-                    row.extend(["", "", "", ""])
+                    row.extend(["", "", "", "", ""])
             rows.append(row)
 
         os.makedirs(os.path.dirname(output.csv), exist_ok=True)
