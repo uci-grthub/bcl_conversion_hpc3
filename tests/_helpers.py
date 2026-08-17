@@ -57,14 +57,17 @@ def load_function(source_file, name, end_marker, extra_globals=None):
 
     `source_file` is repo-relative, since the pipeline is split across the
     conversion Snakefile and the delivery include (src/delivery.smk).
+
+    Both Snakefiles see everything workflow_defs.smk defines via `include:`, so
+    the whole helper namespace is injected rather than a hand-picked subset.
     """
     import pandas as pd
 
     with open(os.path.join(REPO, source_file)) as handle:
         source = handle.read()
     start = source.index(f"def {name}(")
-    helpers = load_workflow_defs_helpers()
-    namespace = {"pd": pd, "RC_ORIENTATION_COLUMNS": helpers["RC_ORIENTATION_COLUMNS"]}
+    namespace = {"pd": pd}
+    namespace.update(load_workflow_defs_helpers())
     namespace.update(extra_globals or {})
     return _exec_source(source[start:source.index(end_marker, start)], namespace)[name]
 
