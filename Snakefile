@@ -2198,7 +2198,14 @@ rule generate_samplesheets:
                     old_hash = old_hashes.get(config_id)
                     
                     if new_hash != old_hash:
-                        # Content changed, update done marker and invalidate stale validated sheet
+                        # Content changed, update done marker and invalidate stale validated sheet.
+                        #
+                        # This deletion only has an effect on the DAG because the
+                        # launchers run generate_samplesheets in its own pass first
+                        # (scripts/samplesheet_prepass.sh). Inside the main run the
+                        # DAG is already frozen, so the purge would strand
+                        # bcl_convert on a validated sheet deleted after its
+                        # producing rule had been pruned. Keep the pre-pass.
                         os.makedirs(os.path.dirname(done_marker), exist_ok=True)
                         open(done_marker, 'w').close()
                         print(f"Updated done marker for {config_id} (content changed)")
@@ -2464,10 +2471,15 @@ rule validate_barcode_hamming_distances:
 
 rule bcl_convert:
     input:
-        sample_sheet=lambda wildcards: f"results/{wildcards.config_id}/SampleSheet_{wildcards.config_id}_validated.csv",
+        # Plain wildcard templates, not lambdas returning f-strings: a lambda hands
+        # Snakemake a bare `str`, which its missing-input reporter cannot format
+        # ("AttributeError: 'str' object has no attribute 'is_storage'" out of
+        # fmt_iofile). That crash replaced the real "(missing locally)" message and
+        # made a deleted validated sheet look like an unexplained SLURM failure.
+        sample_sheet = "results/{config_id}/SampleSheet_{config_id}_validated.csv",
         renaming_map = maybe_ancient("results/{config_id}/renaming_map_{config_id}.csv"),
         data_dir=DATA_DIR,
-        _sheet_done=lambda wildcards: maybe_ancient(f"logs/{wildcards.config_id}/generate_samplesheets_{wildcards.config_id}.done"),
+        _sheet_done = maybe_ancient("logs/{config_id}/generate_samplesheets_{config_id}.done"),
         run_info = "src/RunInfo_nn.xml",
         prev_done = get_prev_bcl_done
     output:

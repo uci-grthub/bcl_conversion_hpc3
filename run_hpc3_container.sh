@@ -33,6 +33,8 @@ source "$here/scripts/container_binds.sh"
 source "$here/scripts/read_config_key.sh"
 # shellcheck source=scripts/require_slurm_account.sh
 source "$here/scripts/require_slurm_account.sh"
+# shellcheck source=scripts/samplesheet_prepass.sh
+source "$here/scripts/samplesheet_prepass.sh"
 # Secrets. Singularity passes the host environment through (no --cleanenv
 # below), and SLURM's default --export=ALL carries it on to the compute nodes,
 # so sourcing here is enough for every rule in the DAG.
@@ -140,6 +142,16 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 fi
 if [[ ${#PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
     SNAKEMAKE_ARGS+=("${PASSTHROUGH_ARGS[@]}")
+fi
+
+# Pass 1: regenerate sample sheets and let that rule purge the validation
+# artifacts a changed metadata workbook invalidated -- before the real DAG below
+# is built. See scripts/samplesheet_prepass.sh for why this cannot be a rule
+# dependency or an onstart hook (onstart also fires after DAG construction).
+if [[ "$DRY_RUN" -eq 0 ]] && samplesheet_prepass_wanted "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"; then
+    # shellcheck disable=SC2086  # $BINDS is a deliberately word-split flag list
+    "$SINGULARITY" exec --writable-tmpfs $BINDS \
+        --pwd "$here" "$SIF" "${SNAKEMAKE_ARGS[@]}" "${SAMPLESHEET_PREPASS_ARGS[@]}"
 fi
 
 # shellcheck disable=SC2086  # $BINDS is a deliberately word-split flag list
