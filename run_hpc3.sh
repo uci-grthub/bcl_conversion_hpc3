@@ -40,9 +40,20 @@ source "$(cd "$(dirname "$0")" && pwd)/scripts/require_slurm_account.sh"
 require_slurm_account
 SNAKEMAKE_ARGS+=("${SLURM_ACCOUNT_ARGS[@]}")
 
+# shellcheck source=scripts/samplesheet_prepass.sh
+source "$(cd "$(dirname "$0")" && pwd)/scripts/samplesheet_prepass.sh"
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
     SNAKEMAKE_ARGS+=(--dry-run)
 fi
-SNAKEMAKE_ARGS+=("${PASSTHROUGH_ARGS[@]}")
+SNAKEMAKE_ARGS+=("${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}")
+
+# Pass 1: regenerate sample sheets and let that rule purge the validation
+# artifacts a changed metadata workbook invalidated -- before the real DAG below
+# is built. See scripts/samplesheet_prepass.sh for why this cannot be a rule
+# dependency or an onstart hook (onstart also fires after DAG construction).
+if [[ "$DRY_RUN" -eq 0 ]] && samplesheet_prepass_wanted "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"; then
+    "${SNAKEMAKE_ARGS[@]}" "${SAMPLESHEET_PREPASS_ARGS[@]}"
+fi
 
 "${SNAKEMAKE_ARGS[@]}"
