@@ -30,9 +30,16 @@ CONTAINER_DATA_BINDS=(
 #   /var/run/munge          the munge socket the auth plugin talks to
 #   /etc/slurm              slurm.conf and friends
 # This is the full set the snakemake slurm executor plugin shells out to, taken
-# from the plugin source rather than guessed -- sacctmgr in particular is called
-# during submission to resolve the account, and its absence fails every job with
-# a bare "[Errno 2] No such file or directory: 'sacctmgr'".
+# from the plugin source rather than guessed -- account validation in particular
+# runs on every submission, and a missing binary there fails every job with a
+# bare "[Errno 2] No such file or directory: '<binary>'".
+#
+# sacctmgr AND sshare, not either one: validate_account() tries sacctmgr first
+# and falls back to sshare whenever sacctmgr comes back empty. On HPC3 it always
+# does -- sacctmgr wants a direct slurmdbd connection and the compute/interactive
+# nodes get "Connection refused ... slurm-i14:6819" -- so sshare is the call that
+# actually decides, and the plugin only catches CalledProcessError, not the
+# FileNotFoundError a missing binary raises.
 CONTAINER_SLURM_BINDS=(
     /usr/bin/sbatch
     /usr/bin/srun
@@ -40,6 +47,7 @@ CONTAINER_SLURM_BINDS=(
     /usr/bin/scancel
     /usr/bin/sacct
     /usr/bin/sacctmgr
+    /usr/bin/sshare
     /usr/bin/scontrol
     /usr/bin/sinfo
     /usr/bin/sstat

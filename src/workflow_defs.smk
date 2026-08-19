@@ -118,33 +118,52 @@ def apply_orientation_to_map(map_df, decision):
     return out
 
 
-def effective_renaming_map_path(config_id, results_base="results"):
+def effective_renaming_map_path(config_id, results_base="results", logs_base="logs"):
     """Path to the map that names delivered files for `config_id`.
 
     The effective map carries the barcodes DRAGEN actually demuxed with; the
     workbook map carries what the client submitted. They differ only for
-    projects where an RC orientation won. Falls back to the workbook map when
-    the orientation decision has not landed yet — callers that build DAG
-    targets must gate on the pick_orientation checkpoint first, via
-    await_orientation_decision().
+    projects where an RC orientation won. Falls back to the workbook map only
+    before any orientation decision exists — once the decision has landed, the
+    workbook map is the wrong answer for an RC project, and returning it names
+    targets after barcodes that were never demultiplexed. Callers that build
+    DAG targets must gate on the generate_effective_renaming_map checkpoint
+    first, via await_orientation_decision().
     """
     effective = os.path.join(results_base, config_id, f"renaming_map_{config_id}_effective.csv")
     if os.path.exists(effective):
         return effective
+
+    decision = os.path.join(logs_base, config_id, f"orientation_decision_{config_id}.json")
+    if os.path.exists(decision):
+        raise RuntimeError(
+            f"Orientation decision for {config_id} exists ({decision}) but the effective "
+            f"renaming map does not ({effective}). Falling back to the workbook map here "
+            f"would name targets after pre-RC barcodes. The caller must gate on "
+            f"await_orientation_decision({config_id!r}) before resolving this path."
+        )
+
     return os.path.join(results_base, config_id, f"renaming_map_{config_id}.csv")
 
 
 def await_orientation_decision(config_id):
-    """Force the pick_orientation checkpoint before expanding barcode-bearing targets.
+    """Force the effective renaming map before expanding barcode-bearing targets.
 
     Barcodes are only final once pick_orientation has compared the two demux
-    passes, so any target whose filename embeds a barcode has to wait for it.
-    No-ops outside a Snakemake workflow (unit tests, standalone scripts).
+    passes AND generate_effective_renaming_map has written the decision into the
+    map, so any target whose filename embeds a barcode has to wait for the
+    second of those, not the first. Gating on pick_orientation alone re-expands
+    the DAG in the window where the decision file exists but the effective map
+    does not, and every barcode-bearing target then gets named off the workbook
+    map. No-ops outside a Snakemake workflow (unit tests, standalone scripts).
     """
     checkpoints_obj = globals().get('checkpoints')
-    if checkpoints_obj is None or not hasattr(checkpoints_obj, 'pick_orientation'):
+    if checkpoints_obj is None:
         return
-    checkpoints_obj.pick_orientation.get(config_id=config_id)
+    for name in ('generate_effective_renaming_map', 'pick_orientation'):
+        if hasattr(checkpoints_obj, name):
+            getattr(checkpoints_obj, name).get(config_id=config_id)
+            return
 
 
 # Sanitize Masking strings for filenames: strip appended project-like suffixes
@@ -1814,9 +1833,10 @@ def get_project_plot_targets(project, lane_filter=None, order_id=None):
     targets = []
     
     for config_id in CONFIG_IDS:
-        # Kept outside the try: _fastp_rows_for_config forces the pick_orientation
-        # checkpoint, and that exception is Snakemake's signal to defer expanding
-        # this target. Swallowing it here would silently yield an empty target list.
+        # Kept outside the try: _fastp_rows_for_config forces the
+        # generate_effective_renaming_map checkpoint, and that exception is
+        # Snakemake's signal to defer expanding this target. Swallowing it here
+        # would silently yield an empty target list.
         df = _fastp_rows_for_config(config_id)
         if df is None:
             continue
@@ -1941,7 +1961,7 @@ def _fastp_row_path(row, idx):
 def _fastp_rows_for_config(config_id):
     frames = []
     # Every caller of this function builds a filename containing a barcode, so
-    # the delivered orientation has to be settled before the DAG is expanded.
+    # the effective map has to be on disk before the DAG is expanded.
     await_orientation_decision(config_id)
     map_path = effective_renaming_map_path(config_id)
     if os.path.exists(map_path):
@@ -1993,7 +2013,7 @@ def get_fastp_sample_input(wildcards):
     sample_path = wildcards.sample_path
 
     # Try to use renaming map first, then injected flexbar rows.
-    # The resolved FASTQ names embed a barcode, so wait for the orientation decision.
+    # The resolved FASTQ names embed a barcode, so wait for the effective map.
     await_orientation_decision(config_id)
     map_path = effective_renaming_map_path(config_id)
     import time as _time
@@ -2108,9 +2128,10 @@ def get_project_fastp_targets(wildcards):
     targets = []
     
     for config_id in CONFIG_IDS:
-        # Kept outside the try: _fastp_rows_for_config forces the pick_orientation
-        # checkpoint, and that exception is Snakemake's signal to defer expanding
-        # this target. Swallowing it here would silently yield an empty target list.
+        # Kept outside the try: _fastp_rows_for_config forces the
+        # generate_effective_renaming_map checkpoint, and that exception is
+        # Snakemake's signal to defer expanding this target. Swallowing it here
+        # would silently yield an empty target list.
         df = _fastp_rows_for_config(config_id)
         if df is None:
             continue

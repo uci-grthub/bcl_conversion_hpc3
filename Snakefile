@@ -783,7 +783,13 @@ rule fastp_sample:
     input:
         done = lambda wildcards: (
             lambda orig: f"output/{wildcards.config_id}/{PROJECT_RENAME_MAP.get((wildcards.config_id, orig), orig)}/.fastq_names_done"
-        )(wildcards.sample_path.split('/')[0])
+        )(wildcards.sample_path.split('/')[0]),
+        # params.fastqs and resources.mem_mb resolve the FASTQ names out of this
+        # map, which is a checkpoint output. Snakemake refuses a params function
+        # that reaches a checkpoint the rule does not take as input, and each
+        # spawned Slurm job rebuilds the DAG, so leaving it off fails every fastp
+        # job remotely even when the driver's DAG is already past the checkpoint.
+        renaming_map = "results/{config_id}/renaming_map_{config_id}_effective.csv"
     output:
         json = "results/{config_id}/{sample_path}.fastp.json",
         html = "results/{config_id}/{sample_path}.fastp.html"
@@ -3333,7 +3339,9 @@ checkpoint pick_orientation:
     A checkpoint, not a plain rule: the winning orientation decides the barcode
     that appears in every delivered filename, and fastp/plot targets carry that
     barcode in their wildcards. Those targets therefore cannot be expanded until
-    this has run. See await_orientation_decision() in src/workflow_defs.smk.
+    this has run — and, because the decision only reaches filenames through the
+    effective renaming map, not until generate_effective_renaming_map has run
+    either. See await_orientation_decision() in src/workflow_defs.smk.
     """
     input:
         done_orig = maybe_ancient(".output/{config_id}/.done"),
@@ -3456,8 +3464,15 @@ checkpoint pick_orientation:
                         lf.write(f"Removing original staging dir for RC-winning project: {item_path}\n")
                         _shutil_rc.rmtree(item_path)
 
-rule generate_effective_renaming_map:
+checkpoint generate_effective_renaming_map:
     """Rewrite the renaming map with the barcodes bcl-convert actually demultiplexed with.
+
+    A checkpoint, not a plain rule: pick_orientation only decides the orientation,
+    this writes it into the map that every barcode-bearing filename is built from.
+    Re-expanding the DAG on pick_orientation alone lands in the window where the
+    decision exists but this map does not, and effective_renaming_map_path then
+    hands back the workbook map — naming targets after barcodes bcl-convert never
+    demultiplexed. See await_orientation_decision() in src/workflow_defs.smk.
 
     The workbook map holds what the client submitted. When an RC orientation wins,
     the sequence present in the index reads is the reverse complement of that, and

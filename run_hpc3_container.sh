@@ -149,9 +149,12 @@ fi
 # is built. See scripts/samplesheet_prepass.sh for why this cannot be a rule
 # dependency or an onstart hook (onstart also fires after DAG construction).
 if [[ "$DRY_RUN" -eq 0 ]] && samplesheet_prepass_wanted "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"; then
+    echo "=== [1/2] sample sheet pre-pass (generate_samplesheets only) ==="
     # shellcheck disable=SC2086  # $BINDS is a deliberately word-split flag list
     "$SINGULARITY" exec --writable-tmpfs $BINDS \
         --pwd "$here" "$SIF" "${SNAKEMAKE_ARGS[@]}" "${SAMPLESHEET_PREPASS_ARGS[@]}"
+    echo "=== [1/2] done. 'total 0' here just means the sheets were current. ==="
+    echo "=== [2/2] main workflow ==="
 fi
 
 # shellcheck disable=SC2086  # $BINDS is a deliberately word-split flag list

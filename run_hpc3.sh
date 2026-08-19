@@ -53,7 +53,10 @@ SNAKEMAKE_ARGS+=("${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}")
 # is built. See scripts/samplesheet_prepass.sh for why this cannot be a rule
 # dependency or an onstart hook (onstart also fires after DAG construction).
 if [[ "$DRY_RUN" -eq 0 ]] && samplesheet_prepass_wanted "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"; then
+    echo "=== [1/2] sample sheet pre-pass (generate_samplesheets only) ==="
     "${SNAKEMAKE_ARGS[@]}" "${SAMPLESHEET_PREPASS_ARGS[@]}"
+    echo "=== [1/2] done. 'total 0' here just means the sheets were current. ==="
+    echo "=== [2/2] main workflow ==="
 fi
 
 "${SNAKEMAKE_ARGS[@]}"
