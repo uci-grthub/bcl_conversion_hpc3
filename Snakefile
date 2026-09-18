@@ -2491,8 +2491,9 @@ rule bcl_convert:
     wildcard_constraints:
         config_id = "[^/]+"
     priority: 100
-    # Measured peak RSS across all 8 lanes is ~23GB (benchmarks/bcl_convert_lane6);
-    # 48GB keeps 2x headroom without waiting on a 144GB block to free up.
+    # Measured peak RSS across all 8 lanes is ~23GB per parallel tile
+    # (benchmarks/bcl_convert_lane6); 96GB keeps 2x headroom at bcl_parallel_tiles=2
+    # without waiting on a 144GB block to free up.
     # Measured wall time is ~47 min on a full NovaSeqX lane (benchmarks/bcl_convert_lane2),
     # which the profile's 60 min default would clip on a busier lane. A 25B flowcell
     # (6272 tiles, 8 lanes converted concurrently) blew past a 2 h in-shell ceiling with
