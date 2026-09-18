@@ -95,9 +95,10 @@ bcl_compression_threads: 8
 bcl_decompression_threads: 8
 
 # How many tiles bcl-convert pipelines at once (--bcl-num-parallel-tiles).
-# bcl_conversion_threads is a total that gets split across parallel tiles, so raising
-# this does not raise CPU use: it overlaps decompress/convert/compress so tiles stop
-# stalling on I/O. It does cost memory — one tile's buffers each, ~23GB per tile
-# measured — so raise the rules' mem_mb alongside it. 1 was too slow to finish a 25B
-# lane inside the old 2 h ceiling.
+# bcl_conversion_threads is PER TILE, not a total: at 2 parallel tiles bcl-convert
+# logs "Parallel Tiles: 2. Threads Per Tile: 8" and runs 16 conversion threads. So
+# this multiplies both CPU and memory — conversion threads and the ~23GB/tile RSS
+# both scale with it. Keep (bcl_conversion_threads * bcl_parallel_tiles) + compression
+# + decompression within the rules' `threads:`, and raise mem_mb to match.
+# 1 was too slow to finish a 25B lane inside the old 2 h ceiling.
 bcl_parallel_tiles: 2
