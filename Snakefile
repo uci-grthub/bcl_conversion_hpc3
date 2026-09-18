@@ -2494,11 +2494,15 @@ rule bcl_convert:
     # Measured peak RSS across all 8 lanes is ~23GB (benchmarks/bcl_convert_lane6);
     # 48GB keeps 2x headroom without waiting on a 144GB block to free up.
     # Measured wall time is ~47 min on a full NovaSeqX lane (benchmarks/bcl_convert_lane2),
-    # which the profile's 60 min default would clip on a busier lane; the in-shell
-    # `timeout 7200` is the real ceiling, so match it here.
+    # which the profile's 60 min default would clip on a busier lane. A 25B flowcell
+    # (6272 tiles, 8 lanes converted concurrently) blew past a 2 h in-shell ceiling with
+    # zero FASTQ output, so the `timeout` below is now 27000 s: under this 480 min Slurm
+    # limit, with ~30 min left for the rename/sync that follows conversion in the same job.
+    # mem_mb tracks bcl_parallel_tiles: bcl-convert holds one tile's buffers per parallel
+    # tile, so the ~23GB measured at 1 tile roughly doubles at 2.
     resources:
         serial_operation=1,
-        mem_mb=48000,
+        mem_mb=96000,
         runtime=480
     threads: 24
     params:
@@ -2507,6 +2511,7 @@ rule bcl_convert:
         tiles = TILES,
         scratch_dir = SCRATCH_DIR,
         keep_undetermined_configs = KEEP_UNDETERMINED_CONFIGS,
+        parallel_tiles = config.get("bcl_parallel_tiles", 2),
         conversion_threads = config.get("bcl_conversion_threads", 8),
         compression_threads = config.get("bcl_compression_threads", 8),
         decompression_threads = config.get("bcl_decompression_threads", 8)
@@ -2527,7 +2532,7 @@ rule bcl_convert:
 
         run_bcl_convert() {{
             local sample_sheet_path="$1"
-            timeout 7200 bcl-convert \
+            timeout 27000 bcl-convert \
             --bcl-input-directory {input.data_dir} \
             --output-directory "$dragen_out" \
             --force \
@@ -2536,7 +2541,7 @@ rule bcl_convert:
             --sample-sheet "$sample_sheet_path" \
             --strict-mode false \
             --bcl-only-lane {params.lane} \
-            --bcl-num-parallel-tiles 1 \
+            --bcl-num-parallel-tiles {params.parallel_tiles} \
             --bcl-num-conversion-threads {params.conversion_threads} \
             --bcl-num-compression-threads {params.compression_threads} \
             --bcl-num-decompression-threads {params.decompression_threads} \
@@ -3267,16 +3272,18 @@ rule bcl_convert_rc:
     priority: 90
     # The RC pass converts a whole lane with the same bcl-convert thread counts as
     # the primary pass, so it needs the same footprint. Under the profile's 8000MB
-    # default every attempt was OOM-killed within a minute.
+    # default every attempt was OOM-killed within a minute. Keep mem_mb, the tile
+    # count and the subprocess timeout in step with the primary rule above.
     resources:
         serial_operation=1,
-        mem_mb=48000,
+        mem_mb=96000,
         runtime=480
     threads: 24
     params:
         lane = lambda wildcards: wildcards.config_id.split('_')[0].replace('lane', ''),
         run_info_path = "src/RunInfo_nn.xml",
         tiles = TILES,
+        parallel_tiles = config.get("bcl_parallel_tiles", 2),
         conversion_threads = config.get("bcl_conversion_threads", 8),
         compression_threads = config.get("bcl_compression_threads", 8),
         decompression_threads = config.get("bcl_decompression_threads", 8)
@@ -3301,14 +3308,14 @@ rule bcl_convert_rc:
                 "--strict-mode", "false",
                 "--bcl-only-lane", str(params.lane),
                 "--run-info", str(params.run_info_path),
-                "--bcl-num-parallel-tiles", "1",
+                "--bcl-num-parallel-tiles", str(params.parallel_tiles),
                 "--bcl-num-conversion-threads", str(params.conversion_threads),
                 "--bcl-num-compression-threads", str(params.compression_threads),
                 "--bcl-num-decompression-threads", str(params.decompression_threads),
             ] + tiles_args
             lf.write(f"Running: {' '.join(cmd)}\n")
             lf.flush()
-            result = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=7200)
+            result = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=27000)
             if result.returncode != 0:
                 raise RuntimeError(f"DRAGEN RC run failed for {wildcards.config_id}")
 
