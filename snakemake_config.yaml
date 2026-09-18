@@ -102,3 +102,10 @@ bcl_decompression_threads: 8
 # + decompression within the rules' `threads:`, and raise mem_mb to match.
 # 1 was too slow to finish a 25B lane inside the old 2 h ceiling.
 bcl_parallel_tiles: 2
+
+# Override the instrument's IsReverseComplement flag for Read 3 (index2) to "N" in
+# src/RunInfo_nn.xml. Leave false to use the orientation the sequencer recorded, which
+# is what matches workbook index2 values on a NovaSeqX that wrote "Y".
+# Set true only for a run whose sheet index2 values are already reverse-complemented
+# relative to the instrument's flag — otherwise every read lands in Undetermined.
+force_index2_forward: false

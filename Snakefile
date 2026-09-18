@@ -71,6 +71,7 @@ def maybe_ancient(path):
     return ancient(path) if USE_ANCIENT else path
 
 SCRATCH_DIR = config.get("scratch_dir", "")
+FORCE_INDEX2_FORWARD = _cfg_truthy(config.get("force_index2_forward", False))
 
 # No `singularity exec` anywhere in this file, by design: run_hpc3_container.sh
 # runs the whole workflow — Snakemake driver included — inside the image, so
@@ -403,7 +404,15 @@ def project_keeps_index_reads(config_id, project):
 # Helper definitions are sourced from src/workflow_defs.smk
 
 
-# Function: Copy RunInfo.xml from data_dir to src/RunInfo_nn.xml and set IsReverseComplement="N" for Read Number="3"
+# Function: Copy RunInfo.xml from data_dir to src/RunInfo_nn.xml, honouring the
+# instrument's IsReverseComplement flag for Read Number="3" (index2) unless
+# force_index2_forward asks for it to be overridden to "N".
+#
+# This used to force "N" on every run. That is only right when the sheet's index2
+# values are already in forward orientation: on 20260915_LH00626_0131_B25G5Y3LT4 the
+# instrument wrote "Y" and the workbook indexes matched it, so forcing "N" made
+# bcl-convert match raw index2 bases against revcomp'd sheet values and sent 100% of
+# every lane to Undetermined — 228GB per lane of it, with all 36 sample FASTQs empty.
 def fix_runinfo_reverse_complement():
     import re, os
     src = os.path.join(DATA_DIR, "RunInfo.xml")
@@ -412,21 +421,28 @@ def fix_runinfo_reverse_complement():
         raise FileNotFoundError(f"Source RunInfo.xml not found: {src}")
     with open(src, "r") as f:
         content = f.read()
-    pattern = r'(<Read[^>]*Number="3"[^>]*IsReverseComplement=")[YN]"'
-    replacement = r'\1N"'
-    new_content = re.sub(pattern, replacement, content)
+    if FORCE_INDEX2_FORWARD:
+        pattern = r'(<Read[^>]*Number="3"[^>]*IsReverseComplement=")[YN]"'
+        content = re.sub(pattern, r'\1N"', content)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    # Only write on a real content change. dest is an input of bcl_convert, so
+    # rewriting it unconditionally would bump its mtime and force a full
+    # re-conversion on every launch; skipping the write when nothing changed is
+    # what makes it safe to call this on every parse instead of guessing from
+    # mtimes, which cannot see a force_index2_forward flip at all.
+    existing = None
+    if os.path.exists(dest):
+        with open(dest, "r") as f:
+            existing = f.read()
+    if existing == content:
+        return
     with open(dest, "w") as f:
-        f.write(new_content)
-    # Optionally, log to a file
+        f.write(content)
     with open("logs/fix_runinfo_reverse_complement.log", "w") as lf:
-        lf.write("RunInfo.xml copied and IsReverseComplement set to N for Read Number=3\n")
+        state = "N (forced by force_index2_forward)" if FORCE_INDEX2_FORWARD else "as written by the instrument"
+        lf.write(f"RunInfo.xml copied; Read Number=3 IsReverseComplement left {state}\n")
 
-# Only fix RunInfo_nn.xml if source is newer than the existing copy
-_src_runinfo = os.path.join(DATA_DIR, "RunInfo.xml")
-_dest_runinfo = "src/RunInfo_nn.xml"
-if not os.path.exists(_dest_runinfo) or (os.path.exists(_src_runinfo) and os.path.getmtime(_src_runinfo) > os.path.getmtime(_dest_runinfo)):
-    fix_runinfo_reverse_complement()
+fix_runinfo_reverse_complement()
 
 # Generate sample sheets during parse time (needed for function calls below)
 # Rule generate_samplesheets will also ensure they're created as explicit dependencies
