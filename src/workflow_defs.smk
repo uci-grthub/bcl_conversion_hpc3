@@ -134,13 +134,29 @@ def effective_renaming_map_path(config_id, results_base="results"):
     return os.path.join(results_base, config_id, f"renaming_map_{config_id}.csv")
 
 
+def orientation_decision_path(config_id, logs_base="logs"):
+    """Path to the decision file pick_orientation writes for `config_id`."""
+    return os.path.join(logs_base, config_id, f"orientation_decision_{config_id}.json")
+
+
 def await_orientation_decision(config_id):
     """Force the pick_orientation checkpoint before expanding barcode-bearing targets.
 
     Barcodes are only final once pick_orientation has compared the two demux
     passes, so any target whose filename embeds a barcode has to wait for it.
     No-ops outside a Snakemake workflow (unit tests, standalone scripts).
+
+    When the decision file is already on disk the orientation is settled, so
+    there is nothing left to wait for and the checkpoint is not consulted. That
+    is not a swallowed deferral: `.get()` is still called, and still allowed to
+    raise, whenever the decision is genuinely outstanding. The check is what
+    makes this callable from a rule's `run:` block. A remote job builds a
+    single-job DAG containing no pick_orientation job, so `.get()` there raises
+    IncompleteCheckpointException even for a decision written hours earlier --
+    which is how all 8 project_handoff_manifest jobs died on xR115.
     """
+    if os.path.exists(orientation_decision_path(config_id)):
+        return
     checkpoints_obj = globals().get('checkpoints')
     if checkpoints_obj is None or not hasattr(checkpoints_obj, 'pick_orientation'):
         return
