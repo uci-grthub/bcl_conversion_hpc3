@@ -516,6 +516,63 @@ pixi run snakemake --profile profiles/hpc3 --rulegraph | dot -Tpdf > rulegraph.p
 pixi run snakemake --profile profiles/hpc3 --dag | dot -Tpdf > dag.pdf
 ```
 
+**Transfer a finished run to the delivery host:**
+```bash
+bash scripts/transfer_to_delivery.sh --dry-run dragen:/staging/runs/xR115/
+bash scripts/transfer_to_delivery.sh --lan     dragen:/staging/runs/xR115/
+```
+
+## Transferring to the Delivery Host
+
+`scripts/transfer_to_delivery.sh` pushes a finished conversion run to the dragen
+server. It refuses to run until `handoff/manifest.yaml` exists, since that file is
+what the delivery workflow consumes -- without it a transfer only moves a
+half-built run into place.
+
+| flag | effect |
+|---|---|
+| `--dry-run` | passes `-n`; nothing is written |
+| `--lan` | adds `-W` (whole-file). Delta encoding is wasted on already-compressed FASTQs. Never add `-z`, same reason |
+| `--list-excluded` | prints what would transfer, via `rsync -an --out-format='%n'` |
+
+The flag list lives in the script rather than being retyped, because both ways of
+getting it wrong report success from every rule:
+
+- **`--no-g`.** Nextcloud reads the delivered files over SMB as a service account
+  in the delivery host's group (`grthcloud`), not the conversion host's
+  (`ucightf`). Plain `rsync -a` preserves the source group and *succeeds* at it
+  whenever a same-named group exists on the destination -- so nothing errors, but
+  `occ files:scan` fails with a permission error and the share link resolves to an
+  empty folder.
+- **The exclusions.** A run directory predating the conversion/delivery split
+  still holds skip-stubs (`Status: SKIPPED`, `link: ''`) and the stale reports
+  built from them. Transferred, Snakemake accepts those as satisfying
+  `project_link` and `report_order_id` and publishes the empty links instead of
+  rebuilding -- the exact failure the split removed.
+
+The link-log exclusions are bare basename globs on purpose. The logs sit one level
+down at `logs/{config_id}/project_link_*.log`, and a single `*` does not cross a
+`/`, so `--exclude 'logs/*link*'` matches nothing. A pattern with no `/` matches
+the basename at any depth. Verify any change with `--list-excluded`.
+
+After the transfer, on the delivery host:
+
+```bash
+bash run_delivery.sh --dry-run
+bash run_delivery.sh
+```
+
+Then check `logs/{config_id}/rescan_nextcloud_*.log`: `Errors` must be 0 and
+`Files` non-zero. The group-permission failure above is silent from the
+workflow's side, so this is the only place it shows up.
+
+Do **not** run `pixi run init` in the transferred directory -- that is
+`scripts/init_run.sh`, the HPC3 run-setup task, and it rewrites `metadata` /
+`library_name` / `data_dir` unguarded. The transferred run is already configured.
+
+See [docs/handoff.md](docs/handoff.md) for the full rationale behind each
+exclusion.
+
 ## Output Structure
 
 ```

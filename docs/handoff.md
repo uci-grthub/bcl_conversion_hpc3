@@ -83,7 +83,12 @@ bash run_hpc3_container.sh handoff         # same thing, named explicitly
 ```
 
 **Transfer** (from the dragen server, or push from HPC3 — `-a` to preserve mtimes,
-otherwise everything looks newer than its inputs on arrival):
+otherwise everything looks newer than its inputs on arrival).
+
+`scripts/transfer_to_delivery.sh <destination>` runs exactly the command below,
+with `--dry-run`, `--lan` (adds `-W`) and `--list-excluded` on top, and refuses to
+start before `handoff/manifest.yaml` exists. Prefer it; the raw command is kept
+here because the reasoning under it is what makes each flag load-bearing:
 
 ```bash
 rsync -aP --no-g \
@@ -122,12 +127,14 @@ Each exclusion is load-bearing:
   from any run directory. If a delivery host already received them, move the link
   logs and `Reports/` aside there once and re-run.
 
-  These are written as bare basename globs on purpose. The obvious
-  `--exclude 'logs/**/*link*'` does **not** match them: the logs live one level
-  down at `logs/{config_id}/project_link_*.log`, and that pattern silently lets
-  every one of them through. A pattern with no `/` matches the basename at any
-  depth, which is what is wanted here. Verify any change with
-  `rsync -an --out-format='%n'` rather than assuming the pattern bit.
+  These are written as bare basename globs on purpose. The logs live one level
+  down at `logs/{config_id}/project_link_*.log`, and a single `*` does not cross a
+  `/`, so the obvious `--exclude 'logs/*link*'` matches nothing and silently lets
+  every one of them through. (`logs/**/*link*` does work on rsync 3.2.5, where
+  `**` crosses slashes — but a pattern with no `/` matches the basename at any
+  depth and needs no reasoning about the rsync version or the directory layout.)
+  Verify any change with `scripts/transfer_to_delivery.sh --list-excluded`, or
+  `rsync -an --out-format='%n'`, rather than assuming the pattern bit.
 
 Add `-W` (whole-file) for a LAN transfer: delta encoding is wasted work on
 already-compressed FASTQs. Do not add `-z` for the same reason.
