@@ -2985,9 +2985,16 @@ rule calculate_md5sums:
         "logs/{config_id}/calculate_md5sums_{config_id}_{project}.log"
     benchmark:
         "benchmarks/calculate_md5sums_{config_id}_{project}.bench"
-    # Matches the `xargs -P 8` in the shell; without it SLURM hands 8 md5sum
+    # Matches the `xargs -P 8 -n 1` in the shell; without it SLURM hands 8 md5sum
     # processes a single CPU.
     threads: 8
+    # A 25B lane's project directory is ~535GB and md5sum is I/O-bound on BeeGFS:
+    # measured 17-33 MiB/s per stream with conversion running alongside, i.e. 4.6-9.0h
+    # for one project single-streamed. The profile's 60 min default killed every job at
+    # exactly 01:00:19. 480 matches bcl_convert and covers the slow end even if the
+    # parallelism below buys less than hoped.
+    resources:
+        runtime=480
     wildcard_constraints:
         # Relaxed to accept any lane-prefixed config with additional underscore-separated tokens
         config_id = "[^/]+",
@@ -2996,7 +3003,10 @@ rule calculate_md5sums:
         """
         (
         cd output/{wildcards.config_id}/{wildcards.project}
-        find . -name '*.fastq.gz' \\( -type f -o -type l \\) -print0 | xargs -0 -P 8 md5sum | sort -k2 > md5sums.txt
+        # -n 1 is what makes -P 8 real: without it xargs packs all 36 filenames onto
+        # one command line, runs a single md5sum, and leaves 7 of the 8 reserved CPUs
+        # idle. `sort -k2` already normalises the order the parallel workers finish in.
+        find . -name '*.fastq.gz' \\( -type f -o -type l \\) -print0 | xargs -0 -P 8 -n 1 md5sum | sort -k2 > md5sums.txt
         count=$(wc -l < md5sums.txt)
         echo "Generated md5sums.txt with $count entries for {wildcards.project}"
         if [ "$count" -eq 0 ]; then
