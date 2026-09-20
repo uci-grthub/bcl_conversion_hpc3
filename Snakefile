@@ -799,7 +799,12 @@ rule fastp_sample:
     input:
         done = lambda wildcards: (
             lambda orig: f"output/{wildcards.config_id}/{PROJECT_RENAME_MAP.get((wildcards.config_id, orig), orig)}/.fastq_names_done"
-        )(wildcards.sample_path.split('/')[0])
+        )(wildcards.sample_path.split('/')[0]),
+        # params.fastqs resolves a barcode-bearing filename, so get_fastp_sample_input
+        # calls await_orientation_decision(). Snakemake requires the checkpoint's own
+        # output among the inputs of any rule whose params reach it -- without this the
+        # job aborts rebuilding its DAG on the compute node, before fastp ever runs.
+        decision = "logs/{config_id}/orientation_decision_{config_id}.json"
     output:
         json = "results/{config_id}/{sample_path}.fastp.json",
         html = "results/{config_id}/{sample_path}.fastp.html"

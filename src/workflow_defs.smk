@@ -2078,14 +2078,19 @@ def get_fastp_sample_input(wildcards):
 def get_fastp_mem_mb(wildcards):
     # HPC3-specific: scale fastp memory by input FASTQ size (DRAGEN instrument has fixed RAM,
     # HPC3 jobs request mem dynamically). Kept on top of upstream igb_transition.
+    #
+    # get_fastp_sample_input reaches the pick_orientation checkpoint, and Snakemake
+    # signals a deferred expansion by raising out of it. That must propagate: a blanket
+    # `except Exception` here silently pinned every sample at the 8000 default instead.
+    # Only the size lookup is guarded, for a FASTQ that is not on disk yet.
+    fastqs = get_fastp_sample_input(wildcards)
+    if not fastqs:
+        return 8000
     try:
-        fastqs = get_fastp_sample_input(wildcards)
-        if fastqs and os.path.exists(fastqs[0]):
-            size_mb = os.path.getsize(fastqs[0]) / (1024 * 1024)
-            return max(8000, int(size_mb // 2) + 4000)
-    except Exception:
-        pass
-    return 8000
+        size_mb = os.path.getsize(fastqs[0]) / (1024 * 1024)
+    except OSError:
+        return 8000
+    return max(8000, int(size_mb // 2) + 4000)
 
 def get_fastp_plots_targets(wildcards):
     config_id = wildcards.config_id
