@@ -75,6 +75,13 @@ fi
 EXCLUDES=(
     --exclude '.snakemake/'
     --exclude '.container/'
+    # Built on HPC3, for HPC3. docs/handoff.md assumes no host .pixi/ exists on the
+    # conversion side (the workflow runs in the container), but run_hpc3.sh's fallback
+    # path creates one. A pixi env embeds its own absolute prefix, so shipping this
+    # one gives the delivery host an environment naming a path that does not exist
+    # there -- which run_delivery.sh may then accept as already installed instead of
+    # building from pixi.lock. 1575 paths and 244 symlinks, none of them data.
+    --exclude '.pixi/'
     --exclude 'snakemake_config_delivery.yaml'
     --exclude 'project_link*'
     --exclude 'flexbar_project_link*'

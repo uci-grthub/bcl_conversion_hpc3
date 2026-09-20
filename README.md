@@ -535,6 +535,25 @@ half-built run into place.
 | `--lan` | adds `-W` (whole-file). Delta encoding is wasted on already-compressed FASTQs. Never add `-z`, same reason |
 | `--list-excluded` | prints what would transfer, via `rsync -an --out-format='%n'` |
 
+A multi-TB run does not belong in an interactive allocation — it outlives the
+terminal, and `nohup`/`setsid` do not detach it from the slurm cgroup, so it dies
+with that allocation anyway. Submit it instead:
+
+```bash
+sbatch --account="$SLURM_ACCOUNT" scripts/transfer_to_delivery.sbatch \
+    kstachel@<delivery-host>:/mnt/jbod_localdisk/nextshare/bcl_convert/NovaSeqX/xR115/
+tail -f logs/transfer_to_delivery_<jobid>.log
+```
+
+`--partition=standard`, not `free`: rsync resumes cleanly but has no automatic
+restart, so a preemption needs a manual resubmit. `--time=24:00:00` against a
+measured 110 MiB/s, at which 4.3TiB lands in ~11h. Resubmitting after a timeout
+continues rather than restarting.
+
+`.pixi/` is excluded along with the rest: it is built on HPC3, for HPC3, and a pixi
+env embeds its own absolute prefix, so the delivery host must build its own from
+`pixi.lock` (which `run_delivery.sh` does automatically).
+
 The flag list lives in the script rather than being retyped, because both ways of
 getting it wrong report success from every rule:
 
