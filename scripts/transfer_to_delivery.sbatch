@@ -20,6 +20,10 @@
 #   sbatch --account="$SLURM_ACCOUNT" scripts/transfer_to_delivery.sbatch \
 #       kstachel@128.195.12.34:/mnt/jbod_localdisk/nextshare/bcl_convert/NovaSeqX/xR115/
 #
+# Submit from the run directory: the job takes its root from $SLURM_SUBMIT_DIR, and
+# --output=logs/... is relative to it. Pass --dry-run before the destination to
+# exercise the whole path as a job without transferring anything.
+#
 # Then poll with squeue/sacct, not ps:
 #
 #   squeue -j <jobid> -o "%.10i %.9P %.10M %.10l %.10L"
@@ -36,16 +40,33 @@
 
 set -euo pipefail
 
-DEST="${1:-}"
+DRY_RUN_ARG=()
+DEST=""
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN_ARG=(--dry-run) ;;
+        *)         DEST="$arg" ;;
+    esac
+done
+
 if [[ -z "$DEST" ]]; then
     echo "ERROR: no destination given." >&2
-    echo "Usage: sbatch --account=\"\$SLURM_ACCOUNT\" $0 <user@host:/path/to/RUN/>" >&2
+    echo "Usage: sbatch --account=\"\$SLURM_ACCOUNT\" $0 [--dry-run] <user@host:/path/to/RUN/>" >&2
     exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# NOT ${BASH_SOURCE[0]}: slurm runs a COPY of this file from its spool directory
+# (/export/spool/slurm/slurmd.spool/job<id>/slurm_script), so resolving the run
+# directory from the script's own path lands in a read-only system directory.
+# $SLURM_SUBMIT_DIR is where sbatch was invoked, which is also the job's cwd.
+ROOT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$ROOT_DIR"
+
+if [[ ! -f "scripts/transfer_to_delivery.sh" ]]; then
+    echo "ERROR: $ROOT_DIR is not a run directory (no scripts/transfer_to_delivery.sh)." >&2
+    echo "Submit from the run directory you want to transfer." >&2
+    exit 1
+fi
 
 # The account guard that require_slurm_account.sh applies at submit time cannot run
 # here -- by now slurm has already chosen one. Catch the failure it exists to
@@ -67,7 +88,7 @@ mkdir -p logs
 
 # Reuse the one place the flags live, rather than restating them. --lan adds -W:
 # delta encoding is wasted work on already-compressed FASTQs over a LAN.
-bash scripts/transfer_to_delivery.sh --lan "$DEST"
+bash scripts/transfer_to_delivery.sh --lan "${DRY_RUN_ARG[@]}" "$DEST"
 
 echo ""
 echo "Finished:    $(date)"
