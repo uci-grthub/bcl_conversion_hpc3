@@ -304,7 +304,8 @@ data_dir: "/dfs3b/ucightf_lab/NSRaw/20260115_LH00626_0088_A233NM2LT4"
 lanes: [1,2,3,4,5,6,7,8]                 # Lanes to process (auto-detected from BaseCalls)
 ```
 
-`email_sender`/`email_recipient` only need setting if `send_emails: true`.
+`email_sender`/`email_recipient` are required unless `send_emails: false`; `true` is
+the default, and the delivery workflow refuses to start with an empty recipient.
 
 `bcl_convert_order` defaults to `[]` (empty) — lanes are already serialized by the
 `bcl_convert` DAG chain, so an explicit order is only needed to force a non-default sequence.
@@ -699,10 +700,10 @@ Delivery side only; the HPC3 conversion workflow sends nothing. `src/send_email.
 uses Gmail SMTP (`smtp.gmail.com`), authenticated with `GMAIL_APP_PASSWORD` from
 `.env` — see `.env.example`.
 
-With `send_emails: false` in `snakemake_config_delivery.yaml` the delivery workflow
-still builds every share link and order report; it just drops the email targets, so
-no sentinel is created and flipping the flag to `true` later sends without anything
-to delete first.
+`send_emails` defaults to `true`. With `send_emails: false` in
+`snakemake_config_delivery.yaml` the delivery workflow still builds every share link
+and order report; it just drops the email targets, so no sentinel is created and
+flipping the flag back to `true` later sends without anything to delete first.
 
 ## Troubleshooting
 

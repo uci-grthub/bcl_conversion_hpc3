@@ -13,10 +13,13 @@
 # directory", check `id | grep ucightf`. See README > Container image to rebuild.
 container_sif: "/dfs9/ucightf-lab/containers/bcl_convert_docker_v2.sif"
 
-# Delivery-side only. There is no enable_nextcloud key any more: the delivery
-# workflow hard-fails without Nextcloud credentials rather than producing
-# empty-link YAMLs that later look up-to-date.
-send_emails: false
+# Delivery-side only; no rule on the conversion side reads it. This is the value
+# in force when snakemake_config_delivery.yaml omits the key, so mailing is the
+# default -- set send_emails: false there to build links and reports without it.
+# There is no enable_nextcloud key any more: the delivery workflow hard-fails
+# without Nextcloud credentials rather than producing empty-link YAMLs that later
+# look up-to-date.
+send_emails: true
 num_reads: 2
 library_name: ""
 start_s: 1

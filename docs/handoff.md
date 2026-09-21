@@ -288,9 +288,10 @@ Two things fail fast at parse time rather than producing empty output:
   could only write the empty-link stubs this split exists to eliminate.
 - `send_emails: true` with an empty `email_recipient`.
 
-`send_emails: false` is a supported review mode: links and reports are built,
-nothing is mailed, and no email sentinel is created — so flipping it to `true`
-later sends without anything to delete first.
+`send_emails` defaults to `true`, so a delivery run mails the customers as soon as
+the reports build. `send_emails: false` is a supported review mode: links and
+reports are built, nothing is mailed, and no email sentinel is created — so
+flipping it back to `true` later sends without anything to delete first.
 
 ## Notes
 

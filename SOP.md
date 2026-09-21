@@ -72,8 +72,9 @@ cd /staging/nextcloud/testing_illumina/NovaSeqX/{RUN_NAME}
 bash run_delivery.sh --dry-run                 # creates snakemake_config_delivery.yaml, exits
 $EDITOR snakemake_config_delivery.yaml         # send_emails, email_sender/recipient/cc
 
-# 9. Preview, then publish. With send_emails: false this builds every share link
-#    and order report and mails nobody — the intended review state.
+# 9. Preview, then publish. send_emails defaults to true, so this run mails the
+#    customers. To review first, set send_emails: false in step 8: that builds
+#    every share link and order report and mails nobody.
 bash run_delivery.sh --dry-run
 bash run_delivery.sh
 
@@ -81,8 +82,9 @@ bash run_delivery.sh
 #    non-zero; this is the one failure the workflow cannot detect for you.
 grep -h '^| [0-9]' logs/*/rescan_nextcloud_*.log
 
-# 11. Only once the reports look right: set send_emails: true and re-run to mail
-#     the customers. Nothing needs deleting first — no sentinel was written.
+# 11. If step 9 ran with send_emails: false, set it back to true once the reports
+#     look right and re-run to mail the customers. Nothing needs deleting first —
+#     no sentinel was written.
 ```
 
 Three things about step 7 that are easy to get wrong, each of which fails *silently*

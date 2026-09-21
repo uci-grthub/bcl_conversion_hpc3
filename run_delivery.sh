@@ -62,7 +62,9 @@ fi
 if [[ ! -f snakemake_config_delivery.yaml ]]; then
     cp "$here/snakemake_config_delivery.yaml.example" snakemake_config_delivery.yaml
     echo "Created snakemake_config_delivery.yaml from the template."
-    echo "Review it -- in particular send_emails and email_recipient -- then re-run:"
+    echo "Review it -- send_emails defaults to true, so the next run mails"
+    echo "email_recipient. Set it to false to build links and reports only."
+    echo "Then re-run:"
     echo "    \$EDITOR snakemake_config_delivery.yaml"
     echo "    bash run_delivery.sh $*"
     exit 1

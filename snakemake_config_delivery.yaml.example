@@ -17,11 +17,12 @@
 nextcloud_dir_name: "dragenshare"
 nextcloud_dir_path: "nextcloud"
 
-# Set to true only when the reports have been reviewed. With false, the delivery
-# workflow still builds every share link and order report; it just does not mail
-# anyone, and no email sentinel is created, so flipping this to true later sends
-# without any files to delete first.
-send_emails: false
+# Default. A full `bash run_delivery.sh` therefore mails the customers once the
+# reports build. Set it to false to review first: the delivery workflow still
+# builds every share link and order report, it just does not mail anyone, and no
+# email sentinel is created -- so flipping it back to true later sends without any
+# files to delete first.
+send_emails: true
 
 email_sender: ""
 email_recipient: ""
