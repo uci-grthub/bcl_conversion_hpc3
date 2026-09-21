@@ -88,7 +88,14 @@ EXCLUDES=(
     --exclude 'verify_project_link*'
     --exclude 'nextcloud_scan*'
     --exclude 'rescan_nextcloud*'
-    --exclude 'Reports/'
+    # Leading slash on purpose: it anchors the pattern to the root of the
+    # transfer, so this is the run's own Reports/ (the order reports, which the
+    # delivery host rebuilds and which must not arrive pre-made and looking up to
+    # date). Without it the pattern has no internal '/' and matches the basename
+    # at any depth -- which drops every output/{config_id}/Reports/ from
+    # bcl-convert, and with them Demultiplex_Stats.csv, leaving the order report
+    # with "N/A" in every Paired Reads cell and nothing failing.
+    --exclude '/Reports/'
 )
 
 if $LIST_EXCLUDED; then
@@ -97,7 +104,8 @@ if $LIST_EXCLUDED; then
     rsync -an --out-format='%n' "${EXCLUDES[@]}" --no-g -a "$ROOT_DIR/" "$DEST"
     echo ""
     echo "Check that no project_link*, nextcloud_scan*, rescan_nextcloud* or"
-    echo "Reports/ path appears above."
+    echo "top-level Reports/ path appears above -- and that every"
+    echo "output/*/Reports/Demultiplex_Stats.csv DOES."
     exit 0
 fi
 

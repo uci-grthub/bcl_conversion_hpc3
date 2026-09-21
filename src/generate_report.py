@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import glob
 import shutil
 import json
@@ -772,9 +773,8 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
             undetermined_reads_cache[config_id] = None
             if os.path.exists(demux_csv):
                 try:
-                    import csv as _csv
                     with open(demux_csv, 'r') as _f:
-                        for _row in _csv.DictReader(_f):
+                        for _row in csv.DictReader(_f):
                             _proj = _row.get('Sample_Project', '').strip()
                             _idx = _row.get('Index', '').strip().rstrip('-')
                             _reads = _row.get('# Reads', '').strip()
@@ -794,8 +794,18 @@ def generate_report(project, output_base_dir, fastp_plots_base_dir, fastp_base_d
                                     demux_stats_cache[config_id][(_proj, _idx)] = int(_reads)
                                 except ValueError:
                                     pass
-                except Exception as _e:
+                except (OSError, ValueError, KeyError, csv.Error) as _e:
                     print(f"Warning: Could not load demux stats from {demux_csv}: {_e}")
+            else:
+                # Absent stats file and a genuinely unassigned sample both end up
+                # as "N/A" in the report, so say which one this is. On the
+                # delivery host the usual cause is the rsync dropping
+                # output/{config_id}/Reports/ (an unanchored --exclude 'Reports/'
+                # matches that basename at any depth).
+                print(f"Warning: {demux_csv} not found -- every Paired Reads cell "
+                      f"for {config_id} will read N/A unless another source "
+                      f"supplies the count. If this is the delivery host, the "
+                      f"transfer dropped output/{config_id}/Reports/.")
 
         lane_val = parse_lane_from_config(config_id)
         if lane_filter is not None:

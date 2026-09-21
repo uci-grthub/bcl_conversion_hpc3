@@ -118,6 +118,20 @@ def main():
     for missing in sorted(expected_projects - present_projects):
         problems.append(f"manifest lists project {missing} but no fragment is present")
 
+    # bcl-convert's per-lane demux stats. No rule declares this file as an input,
+    # so its absence costs no rule a failure -- but src/generate_report.py reads
+    # the per-sample read count from it, and without it every "Paired Reads" cell
+    # in the delivered order report silently reads N/A. This is the gate that
+    # catches it, before any share link is published or anything is mailed.
+    for config_id in sorted({e["config_id"] for e in entries if e.get("config_id")}):
+        demux_csv = os.path.join("output", config_id, "Reports", "Demultiplex_Stats.csv")
+        if not os.path.exists(demux_csv):
+            problems.append(
+                f"{config_id}: missing {demux_csv} -- the order report would show "
+                f"N/A for every Paired Reads cell (check the transfer's Reports/ "
+                f"exclusion)"
+            )
+
     counts_csv = manifest.get("counts_csv")
     if counts_csv and not os.path.exists(counts_csv):
         problems.append(f"missing run-level read counts {counts_csv}")
