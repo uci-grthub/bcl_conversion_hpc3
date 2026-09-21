@@ -62,8 +62,7 @@ workbook, travel in the fragment as well:
   for a workbook that is not on this host.
 
 `handoff/rc_orientation_summary.csv` is run-level (it needs every lane's orientation
-decision) and is attached to the read-counts email, which is already a whole-run
-aggregate.
+decision). It is an operator-facing record only -- no email attaches it.
 
 Fragments are written per project, as soon as that project's md5sums, read counts,
 plots and low-reads check are final — not at the end of the run. The delivery

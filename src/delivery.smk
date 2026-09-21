@@ -978,8 +978,6 @@ rule send_order_email:
 rule send_read_counts_email:
     input:
         csv = f"results/{LIBRARY}-count.csv",
-        # Written by the conversion run and rsynced here; see src/handoff.smk.
-        rc_summary = f"{HANDOFF_DIR}/rc_orientation_summary.csv",
         order_reports = ORDER_ID_REPORTS
     output:
         touch(f"Reports/{LIBRARY}_read_counts_email.done")
@@ -994,16 +992,13 @@ rule send_read_counts_email:
         receiver = EMAIL_RECIPIENT,
         subject = f"Read counts for {LIBRARY}",
         body = lambda wildcards: (
-            f"Attached: per-lane read counts for {LIBRARY}, and the "
-            f"reverse-complement orientation summary.\n\n"
+            f"Attached: per-lane read counts for {LIBRARY}.\n\n"
             f"The read-count table now carries an 'index_rc' column alongside "
             f"'counts' in each lane/group block. It is blank when the project was "
             f"demultiplexed and delivered on the barcodes as submitted, and reads "
             f"'i7', 'i5', or 'i7+i5' when that index had to be reverse-complemented "
             f"to match the index reads. The FASTQ filenames for those projects carry "
-            f"the sequence actually observed, not the submitted one.\n\n"
-            f"The orientation summary lists only the flagged projects, with the "
-            f"submitted and delivered barcode for each."
+            f"the sequence actually observed, not the submitted one."
         ),
         cc_email = EMAIL_CC
     run:
@@ -1012,7 +1007,7 @@ rule send_read_counts_email:
             result = subprocess.run(
                 ["python3", params.script, params.sender, params.receiver,
                  params.subject, params.body,
-                 f"{input.csv};{input.rc_summary}", params.cc_email],
+                 input.csv, params.cc_email],
                 stdout=logf, stderr=logf
             )
         if result.returncode != 0:

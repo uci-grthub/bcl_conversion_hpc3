@@ -404,8 +404,8 @@ bash run_hpc3.sh output/lane1
   Matching is on the barcode-free prefix `{Run}-L{Lane}-G{Group}-P{Position}`, so a file can
   only ever be renamed onto itself.
 - `handoff/rc_orientation_summary.csv` records every flipped project (order, lane, workbook
-  vs delivered barcodes, `rc_fraction`); the delivery workflow attaches it to the read-counts
-  email and tags the order's subject line from the per-project handoff fragments.
+  vs delivered barcodes, `rc_fraction`). It is written for the operator, not mailed out; the
+  delivery workflow tags the order's subject line from the per-project handoff fragments.
 - For a run that already shipped with workbook barcodes: `python3
   scripts/backfill_rc_barcode_names.py --config-id lane{N}` (dry-run), then `--apply`.
 
@@ -473,8 +473,7 @@ Delivery side.
 ```bash
 bash run_delivery.sh Reports/iR011_read_counts_email.done
 ```
-- Sends the read count CSV and `handoff/rc_orientation_summary.csv` as attachments — the
-  latter is written by the conversion run and rsynced here (see `docs/handoff.md`)
+- Sends the read count CSV as the only attachment
 - `SEND_EMAIL_DRY_RUN=1` composes the message without sending it
 - Uses SMTP over SSL (`smtp.gmail.com:465`, see `src/send_email.py`); authenticates as
   `email_sender` with `GMAIL_APP_PASSWORD` from `.env`
