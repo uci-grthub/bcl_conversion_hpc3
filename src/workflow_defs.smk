@@ -1954,6 +1954,38 @@ def _fastp_row_path(row, idx):
     stem = f"{run}-L{lane}-G{group}-{position}-{barcode}"
     return f"{output_project}/{stem}" if output_project and output_project.lower() != 'nan' else stem
 
+def _drop_excluded_projects(df, config_id):
+    """Remove rows of projects dropped by `exclude_order_ids`.
+
+    Without this the lane-level fastp targets still request every project on
+    the lane, excluded ones included. Their bcl_project_done then runs, fails
+    closed (the project is absent from CONFIG_PROJECT_PAIRS) and races the
+    in-scope projects' accessory copy, and fastp_plots_{config_id}.done -- which
+    plots copy and the handoff fragment wait on -- can never be produced.
+    """
+    excluded = globals().get('EXCLUDED_PROJECT_KEYS') or set()
+    keys = {(p, g) for cid, p, g in excluded if cid == config_id}
+    if not keys or df is None or 'Sample_Project' not in df.columns:
+        return df
+
+    def _group(value):
+        try:
+            return str(int(float(value)))
+        except (TypeError, ValueError):
+            return str(value).strip()
+
+    projects = df['Sample_Project'].astype(str).str.strip()
+    if 'Group' in df.columns:
+        groups = df['Group'].map(_group)
+    else:
+        groups = pd.Series([None] * len(df), index=df.index)
+    drop = [
+        (p, g) in keys or (p, None) in keys
+        for p, g in zip(projects, groups)
+    ]
+    # Index is kept as is: _fastp_row_path falls back to it for the position.
+    return df[[not d for d in drop]]
+
 def _fastp_rows_for_config(config_id):
     frames = []
     # Every caller of this function builds a filename containing a barcode, so
@@ -1976,7 +2008,7 @@ def _fastp_rows_for_config(config_id):
 
     if not frames:
         return None
-    return pd.concat(frames, ignore_index=True)
+    return _drop_excluded_projects(pd.concat(frames, ignore_index=True), config_id)
 
 def get_fastp_targets(wildcards):
     config_id = wildcards.config_id

@@ -585,10 +585,24 @@ ACTIVE_ORDER_IDS = [
 
 # Exclude order IDs (and their projects) from all targets in rule all.
 EXCLUDE_ORDER_IDS = set(config.get("exclude_order_ids", []))
+# (config_id, workbook project name, group or None) for every excluded project.
+# Lane-level target functions read renaming-map rows, which carry the workbook
+# project name and group rather than the output folder name, so the exclusion
+# has to be recorded in those terms too -- see _drop_excluded_projects in
+# src/workflow_defs.smk. Always defined; empty when nothing is excluded.
+EXCLUDED_PROJECT_KEYS = set()
 if EXCLUDE_ORDER_IDS:
     _exclude_projects = set()
     for _oid in EXCLUDE_ORDER_IDS:
         _exclude_projects.update(ORDER_ID_CONFIGS.pop(_oid, []))
+    for _cid, _renamed in CONFIG_PROJECT_PAIRS:
+        if _renamed in _exclude_projects:
+            _gm = re.search(r'_G(\d+)$', _renamed)
+            EXCLUDED_PROJECT_KEYS.add((
+                _cid,
+                PROJECT_RENAME_MAP_INV.get((_cid, _renamed), _renamed),
+                _gm.group(1) if _gm else None,
+            ))
     ACTIVE_ORDER_IDS = [oid for oid in ACTIVE_ORDER_IDS if oid not in EXCLUDE_ORDER_IDS]
     CONFIG_PROJECT_PAIRS = [(c, p) for c, p in CONFIG_PROJECT_PAIRS if p not in _exclude_projects]
     PROJECTS = [p for p in PROJECTS if p not in _exclude_projects]
