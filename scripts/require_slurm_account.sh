@@ -49,6 +49,10 @@ MSG
     # default-resources block rather than merging into it, so the other three
     # defaults have to be repeated here or they silently revert to snakemake's
     # built-ins (no partition, dynamic mem_mb, no runtime).
+    #
+    # --default-resources is nargs='+'. Callers must follow this array with
+    # another option, never with positional targets, or the first target is
+    # parsed as a resource ("ValueError: not enough values to unpack").
     SLURM_ACCOUNT_ARGS=(--default-resources
         "slurm_account=$SLURM_ACCOUNT"
         "slurm_partition=standard"

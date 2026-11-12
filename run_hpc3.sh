@@ -30,15 +30,19 @@ done
 # --workflow-profile none: without this, snakemake auto-merges profiles/default
 # (the dragen-server profile) and its settings win over --profile, silently
 # reimposing serial_operation=1 and blocking hpc3 job parallelism.
-SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3 --workflow-profile none)
-
+#
+# The account args sit BEFORE it on purpose: --default-resources takes any
+# number of values, so as the last option it would swallow a target passed by
+# the caller (`run_hpc3.sh output/lane1`) as a resource and die with
+# "ValueError: not enough values to unpack".
+#
 # Per-operator slurm account, from $SLURM_ACCOUNT (usually ~/.env). Hard error
 # when unset; see scripts/require_slurm_account.sh for why it is not a profile
 # default and why unset cannot mean "let slurm decide".
 # shellcheck source=scripts/require_slurm_account.sh
 source "$(cd "$(dirname "$0")" && pwd)/scripts/require_slurm_account.sh"
 require_slurm_account
-SNAKEMAKE_ARGS+=("${SLURM_ACCOUNT_ARGS[@]}")
+SNAKEMAKE_ARGS=(snakemake --profile profiles/hpc3 "${SLURM_ACCOUNT_ARGS[@]}" --workflow-profile none)
 
 # shellcheck source=scripts/samplesheet_prepass.sh
 source "$(cd "$(dirname "$0")" && pwd)/scripts/samplesheet_prepass.sh"

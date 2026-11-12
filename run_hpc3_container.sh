@@ -109,9 +109,21 @@ exec $SINGULARITY exec --writable-tmpfs $BINDS \\
 EOF
 chmod +x "$SHIM_DIR/python"
 
+# Per-operator slurm account, from $SLURM_ACCOUNT (usually ~/.env, sourced by
+# load_dotenv.sh above). Hard error when unset; see
+# scripts/require_slurm_account.sh for why it is not a profile default and why
+# unset cannot mean "let slurm decide".
+require_slurm_account
+
 SNAKEMAKE_ARGS=(
     snakemake
     --profile profiles/hpc3
+    # --default-resources takes any number of values, so it must not be the last
+    # thing before the targets the caller passes: `run_hpc3_container.sh
+    # output/lane1` would hand "output/lane1" to it as a resource and die with
+    # "ValueError: not enough values to unpack". Keep it ahead of an option
+    # that takes a fixed number of values.
+    "${SLURM_ACCOUNT_ARGS[@]}"
     # Without this, snakemake auto-merges profiles/default (the dragen-server
     # profile) and its settings win over --profile, silently reimposing
     # serial_operation=1 and blocking hpc3 job parallelism.
@@ -121,13 +133,6 @@ SNAKEMAKE_ARGS=(
                       storage-local-copies software-deployment-cache
     --precommand "export PATH=$SHIM_DIR:/usr/local/bin:/usr/bin:/bin"
 )
-
-# Per-operator slurm account, from $SLURM_ACCOUNT (usually ~/.env, sourced by
-# load_dotenv.sh above). Hard error when unset; see
-# scripts/require_slurm_account.sh for why it is not a profile default and why
-# unset cannot mean "let slurm decide".
-require_slurm_account
-SNAKEMAKE_ARGS+=("${SLURM_ACCOUNT_ARGS[@]}")
 
 DRY_RUN=0
 PASSTHROUGH_ARGS=()
